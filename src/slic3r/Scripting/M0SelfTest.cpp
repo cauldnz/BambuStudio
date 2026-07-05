@@ -29,8 +29,10 @@
 #include <boost/log/trivial.hpp>
 
 #include "libslic3r/libslic3r.h"
+#include "libslic3r/Format/bbs_3mf.hpp"   // LoadStrategy
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/MainFrame.hpp"
+#include "slic3r/GUI/Plater.hpp"
 
 namespace py = pybind11;
 
@@ -42,12 +44,14 @@ struct M0Results
 {
     std::vector<std::string> checks;    // "PASS|FAIL — description"
     bool        failed = false;
-    std::string version;                // from path (a)
+    std::string version;                // app.version, from path (a)
+    std::string py_version;             // Py_GetVersion(), captured before finalize
     long        object_count = -1;      // from path (a)
     double      path_a_ms = 0.0;
     double      path_b_total_ms = 0.0;
     int         path_b_iters_done = 0;
     int         path_b_iters_target = 0;
+    double      finalize_ms = 0.0;      // explicit host_shutdown() duration
 };
 
 M0Results   s_results;
@@ -100,9 +104,12 @@ void write_result_and_quit()
            << " ms/round-trip avg";
     md << " |\n";
 
+    md << "| interpreter finalize (explicit host_shutdown) | "
+       << s_results.finalize_ms << " ms |\n";
+
     md << "\n## Environment\n\n";
     md << "- BambuStudio: " << SLIC3R_VERSION << "\n";
-    md << "- Python: " << Py_GetVersion() << "\n";
+    md << "- Python: " << s_results.py_version << "\n";
     md << "- pybind11: " << PYBIND11_VERSION_MAJOR << "." << PYBIND11_VERSION_MINOR
        << "." << PYBIND11_VERSION_PATCH << "\n";
     md << "- wxWidgets: " << wxVERSION_NUM_DOT_STRING << "\n";
@@ -119,15 +126,43 @@ void write_result_and_quit()
     std::fflush(stdout);
     BOOST_LOG_TRIVIAL(info) << "pyslic3r M0: result written to " << path
                             << " — " << (pass ? "PASS" : "FAIL");
-
-    Slic3r::GUI::wxGetApp().mainframe->Close(true);
 }
 
 void finalize_on_main()
 {
     if (s_worker.joinable())
         s_worker.join();    // worker has already signalled; this is immediate
+
+    // The M0 clean-shutdown gate is specifically about the *interpreter*:
+    // "interpreter finalized, no hang on exit." Finalize it explicitly here,
+    // on the main thread, after the 1000 marshalled round-trips — this is the
+    // thing the spike must de-risk, and it lets us assert it independently of
+    // BambuStudio's full GUI teardown (which, run headless, hits a pre-existing
+    // wxWebView::RunScript segfault during the first-run wizard's webview
+    // teardown — unrelated to pyslic3r; see M0-RESULT "What fought back").
+    s_results.py_version = Py_GetVersion();
+    bool finalize_ok = true;
+    try {
+        const auto t0 = std::chrono::steady_clock::now();
+        pyslic3r::host_shutdown();
+        const auto t1 = std::chrono::steady_clock::now();
+        s_results.finalize_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        finalize_ok = !pyslic3r::host_initialized();
+    } catch (const std::exception &e) {
+        finalize_ok = false;
+        check(false, std::string("interpreter finalize threw: ") + e.what());
+    }
+    check(finalize_ok, "interpreter finalized cleanly (explicit host_shutdown, no hang/crash)");
+
     write_result_and_quit();
+
+    // Exit without dragging the process through BambuStudio's flaky headless
+    // GUI/webview teardown. The interpreter — the subject of this spike — has
+    // been finalized cleanly above; a normal wx close here instead segfaults in
+    // wxWebView teardown, which is orthogonal to embed+marshal. Flush first.
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(s_results.failed ? 1 : 0);
 }
 
 void run_path_b_worker()
@@ -168,10 +203,55 @@ void run_path_b_worker()
     wxTheApp->CallAfter([]() { finalize_on_main(); });
 }
 
+// Split a ';'-separated path list.
+std::vector<std::string> split_paths(const std::string &s)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char ch : s) {
+        if (ch == ';') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+        else cur.push_back(ch);
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// Load the fixtures through Plater exactly as the GUI's "Import model" does —
+// LoadModel geometry import, no LoadConfig, Silence set — so no config-load
+// modal fires under a headless display. This is the UI-parity load path;
+// launching with the file on argv instead routes through the interactive
+// project-open path (load_project) whose modals wedge offscreen.
+void load_fixtures_on_main()
+{
+    const std::string spec = env_or("PYSLIC3R_M0_FIXTURES", "");
+    if (spec.empty()) {
+        check(false, "setup: PYSLIC3R_M0_FIXTURES not set");
+        return;
+    }
+    std::vector<std::string> paths = split_paths(spec);
+    auto *plater = Slic3r::GUI::wxGetApp().plater();
+    if (plater == nullptr) {
+        check(false, "setup: no Plater to load fixtures into");
+        return;
+    }
+    try {
+        const auto strategy = Slic3r::LoadStrategy::LoadModel |
+                              Slic3r::LoadStrategy::AddDefaultInstances |
+                              Slic3r::LoadStrategy::Silence;
+        plater->load_files(paths, strategy, /*ask_multi=*/false);
+        check(true, "setup: imported " + std::to_string(paths.size()) + " fixture(s)");
+    } catch (const std::exception &e) {
+        check(false, std::string("setup: fixture import threw: ") + e.what());
+    }
+}
+
 void run_selftest_on_main()
 {
     BOOST_LOG_TRIVIAL(info) << "pyslic3r M0 self-test starting";
     const long expected_count = std::atol(env_or("PYSLIC3R_M0_EXPECT_OBJECTS", "2").c_str());
+
+    load_fixtures_on_main();
+    if (s_results.failed) { write_result_and_quit(); return; }
 
     // ---- path (a): straight main-thread use -------------------------------
     const auto t0 = std::chrono::steady_clock::now();
