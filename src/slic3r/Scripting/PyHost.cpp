@@ -48,8 +48,9 @@ void ensure_main_thread(const char *what)
 
 PYBIND11_EMBEDDED_MODULE(pyslic3r, m)
 {
-    m.doc() = "pyslic3r — read-only embedded object model over the running app";
+    m.doc() = "pyslic3r — embedded object model + cloud device plane over the running app";
     register_object_model(m);
+    register_device(m);
 }
 
 // ---------------------------------------------------------------------------

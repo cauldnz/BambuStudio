@@ -332,6 +332,21 @@ void run_selftest_on_main()
         }
     }
 
+    // ---- M4: cloud device plane (read-only) -------------------------------
+    if (std::getenv("PYSLIC3R_M4_TEST") != nullptr && !s_results.failed) {
+        const std::string script = env_or("PYSLIC3R_M4_SCRIPT", "");
+        try {
+            py::gil_scoped_acquire gil;
+            py::object ns = py::module_::import("__main__").attr("__dict__");
+            if (script.empty())
+                throw std::runtime_error("PYSLIC3R_M4_SCRIPT not set");
+            py::eval_file(script, ns);
+            check(true, "M4: device plane asserts passed (" + script + ")");
+        } catch (const std::exception &e) {
+            check(false, std::string("M4: device plane asserts failed: ") + e.what());
+        }
+    }
+
     if (s_results.failed) {
         // Path (b) would only hang on a broken foundation; report honestly
         // and exit cleanly (do not leave the app running).

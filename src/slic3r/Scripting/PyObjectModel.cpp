@@ -576,6 +576,12 @@ void register_object_model(py::module_ &m)
                 if (p.is_visible)
                     out.push_back(p.name);
             return out;
+        })
+        // Cloud device plane (M4). Registered in PyDevice.cpp; exposed here as
+        // app.device. Account/app-level (one logged-in account), so it hangs
+        // off Application, not Document.
+        .def_property_readonly("device", [](const PyApp &) {
+            return py::module_::import("pyslic3r").attr("_device_singleton");
         });
 
     m.attr("app") = py::cast(PyApp{});
