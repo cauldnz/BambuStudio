@@ -663,6 +663,10 @@ add_subdirectory(GUI/DeviceTab)
 add_subdirectory(GUI/fila_manager)
 add_subdirectory(GUI/DeviceWeb)
 
+if (BBS_PY_RUNTIME)
+    add_subdirectory(Scripting)
+endif ()
+
 if (WIN32)
     list(APPEND SLIC3R_GUI_SOURCES
             GUI/dark_mode/dark_mode.hpp
@@ -746,6 +750,14 @@ endif ()
 target_link_libraries(libslic3r_gui libslic3r cereal imgui imguizmo minilzo GLEW::GLEW OpenGL::GL hidapi
     ${HPDF_LIBRARY}
     ${wxWidgets_LIBRARIES} glfw libcurl OpenSSL::SSL OpenSSL::Crypto)
+
+if (BBS_PY_RUNTIME)
+    # GUI_App.cpp hooks host_init/host_shutdown; the bindings in libbambu_api
+    # call back into Plater. Static-library cycle, resolved at final link.
+    target_compile_definitions(libslic3r_gui PRIVATE BBS_PY_RUNTIME=1)
+    target_link_libraries(libslic3r_gui libbambu_api)
+    target_link_libraries(libbambu_api libslic3r_gui)
+endif ()
 #target_link_libraries(libslic3r_gui libslic3r cereal imgui imguizmo minilzo GLEW::GLEW OpenGL::GL hidapi libcurl OpenSSL::SSL OpenSSL::Crypto ${wxWidgets_LIBRARIES} glfw)
 
 if (MSVC)

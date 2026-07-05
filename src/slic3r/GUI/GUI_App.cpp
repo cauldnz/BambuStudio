@@ -1,5 +1,9 @@
 #include "libslic3r/Technologies.hpp"
 #include "GUI_App.hpp"
+
+#ifdef BBS_PY_RUNTIME
+#include "slic3r/Scripting/PyHost.hpp"
+#endif
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GUI_Factories.hpp"
@@ -1415,6 +1419,13 @@ void GUI_App::post_init()
            }
         }
     }
+#ifdef BBS_PY_RUNTIME
+    // pyslic3r: start the embedded Python runtime once the app, plater and
+    // any command-line documents exist. The init half of the only core hook
+    // pair; everything else lives in src/slic3r/Scripting/.
+    pyslic3r::host_init();
+#endif
+
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
 #ifdef _WIN32
     // Sets window property to mainframe so other instances can indentify it.
@@ -2852,6 +2863,12 @@ int GUI_App::OnExit()
     // Flush any config changes that were deferred by the idle-handler debounce.
     if (app_config && app_config->dirty())
         app_config->save();
+
+#ifdef BBS_PY_RUNTIME
+    // pyslic3r: finalize the embedded interpreter (shutdown half of the hook
+    // pair). Must run on the main thread, after workers are gone.
+    pyslic3r::host_shutdown();
+#endif
 
     return wxApp::OnExit();
 }
