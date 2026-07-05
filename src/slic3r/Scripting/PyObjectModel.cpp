@@ -201,21 +201,24 @@ void fill_slice_result(int plate_idx, PySliceResult &res)
 
     const GCodeProcessorResult *gr = plate->get_slice_result();
     if (gr != nullptr) {
-        const auto &mode = gr->print_statistics.modes[0];   // 0 = Normal
+        const auto &st   = gr->print_statistics;
+        const auto &mode = st.modes[0];   // 0 = Normal
         res.print_time_s = long(mode.time + 0.5f);
         res.layer_count  = long(mode.layers_times.size());
 
-        // mm per extruder from extruded volume; area from filament diameter
-        // (default 1.75 mm — refine from filament config later if needed).
-        const double area = M_PI * (1.75 / 2.0) * (1.75 / 2.0);
-        for (const auto &kv : gr->print_statistics.total_volumes_per_extruder)
-            res.filament_mm[int(kv.first)] = area > 0 ? kv.second / area : 0.0;
+        // total_volumes_per_extruder is mm^3 of extruded filament per extruder.
+        // length mm  = volume / filament cross-section (Ø1.75 mm default).
+        // weight g   = volume(cm^3) * density(g/cm^3), density per extruder.
+        const double area = M_PI * (1.75 / 2.0) * (1.75 / 2.0);   // mm^2
+        for (const auto &kv : st.total_volumes_per_extruder) {
+            const int    e       = int(kv.first);
+            const double vol_mm3 = kv.second;
+            res.filament_mm[e] = area > 0 ? vol_mm3 / area : 0.0;
+            const double density = (e >= 0 && e < int(gr->filament_densities.size()))
+                                       ? double(gr->filament_densities[e]) : 1.24;  // PLA fallback
+            res.filament_g[e]  = vol_mm3 / 1000.0 * density;      // mm^3 -> cm^3 * g/cm^3
+        }
     }
-
-    // grams per extruder from the Print statistics.
-    const Print &print = list.get_current_fff_print();
-    for (const auto &kv : print.print_statistics().filament_stats)
-        res.filament_g[int(kv.first)] = kv.second;
 }
 
 } // anonymous namespace
@@ -406,14 +409,26 @@ void register_object_model(py::module_ &m)
             return PyPlate{i};
         })
         // ---- M2 mutation --------------------------------------------------
-        .def("arrange", [](const PyPlateList &) {
-            // Auto-arrange, same as the toolbar button. NOTE: asynchronous —
-            // this starts a background ArrangeJob (which takes its own
-            // snapshot) and returns immediately; completion/progress events
-            // are M3 work. For scripts that need the finished layout, poll a
-            // read-back or wait for the M3 event.
-            plater_or_throw("PlateList.arrange")->arrange();
-        });
+        .def("arrange", [](const PyPlateList &, bool wait) {
+            // Auto-arrange, same as the toolbar button. Asynchronous — starts a
+            // background ArrangeJob (which snapshots itself). With wait=True,
+            // pump the event loop (GIL released) until no job is running, so a
+            // script can rely on the finished layout (same technique as
+            // SliceJob.wait; not a nested modal loop).
+            auto *plater = plater_or_throw("PlateList.arrange");
+            plater->arrange();
+            if (!wait) return;
+            main_thread("PlateList.arrange(wait=True)");
+            py::gil_scoped_release nogil;
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            for (;;) {
+                if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                if (!plater->is_any_job_running()) break;
+                if (clock::now() - t0 > std::chrono::seconds(120)) break;
+                wxMilliSleep(40);
+            }
+        }, py::arg("wait") = false);
 
     // ---- SliceResult ------------------------------------------------------
     py::class_<PySliceResult>(m, "SliceResult")

@@ -1,99 +1,106 @@
 # M3-RESULT — Slicing
 
-**RESULT: WIP / BLOCKED** — the slicing code is complete, builds clean, and the async
-wait design works; it is **blocked on provisioning a sliceable printer in the headless
-test environment**. Not yet a PASS. Documented here for review and a decision on the
-provisioning approach.
+**RESULT: PASS** — 10/10 checks, harness exit 0, clean interpreter finalize. The agent
+slices the fixture offscreen and reads back time / layers / filament / gcode path.
 
-Milestone M3 from `slic3r-automation/M3-PLAN.md`. Unlike M0–M2 (all green), M3 is the
-first milestone that actually runs the slicer offscreen, and it surfaced a real
-environment problem, not a code defect.
+Milestone M3 from `slic3r-automation/M3-PLAN.md`. This was the first milestone that
+actually runs the slicer headless; it took real integration work (see "What fought
+back"), unlike M1/M2 which passed first build.
 
 ---
 
-## What is DONE and working
+## Checks (latest run)
 
-- **Full slicing surface** (`PyObjectModel.cpp`), compiles and links clean:
-  ```
-  doc.slice(plate=None) -> SliceJob      # reslice current/selected plate
-  job.wait(timeout)     -> SliceResult   # blocks caller, pumps the event loop
-  job.done / job.progress / job.cancel()
-  result.success / print_time_s / layer_count / filament_g / filament_mm /
-         gcode_3mf_path / error
-  ```
-- **The async design is implemented and sound.** `job.wait()` runs on the wx main
-  thread (where Python runs in this model), releases the GIL, and pumps the event loop
-  (`wxTheApp->Yield` + poll `PartPlate::is_slice_result_valid()`) so the background
-  slicer's completion event is delivered — a *controlled event pump*, not a nested modal
-  loop (the M0 crash class). It distinguishes "never started", "started then errored",
-  and "timeout" and reports the reason in `result.error`.
-- **Result read-back is wired** to `GCodeProcessorResult::print_statistics` (time,
-  layer count, per-extruder volume→mm) and `Print::print_statistics().filament_stats`
-  (grams), plus `PartPlate::get_tmp_gcode_path()`.
-- **A latent harness bug was fixed** (valuable regardless of M3): on *any* failure the
-  self-test wrote the result but never reached `_Exit` (that lived only in the path-(b)
-  worker finale), so a failed milestone hung to the timeout. Terminal logic is now a
-  single `finalize_and_exit()` used by every pass/fail path. Confirmed: M3 now fails
-  cleanly (rc=1), no hang.
+- PASS — setup / path (a) / path (b) (M0 marshalling, 1000/1000 stable)
+- PASS — M1 read-only object model · PASS — M2 mutation
+- PASS — **M3: slicing asserts** (slice → wait → read-back)
+- PASS — interpreter finalized cleanly
 
-## The blocker (well-characterized)
+**Slice result (two 10 mm cubes, 0.28 mm layers, X1C / PLA):**
+643 s · 36 layers · **1.71 g / 564 mm** filament · gcode written. All internally
+consistent (36 × 0.28 mm ≈ 10 mm cube height; the 0.28 mm came from M2's
+`config.set("layer_height","0.28")` earlier in the same run).
 
-To slice, a plate needs a real printer + compatible process + filament (build volume,
-extruders, etc.). The **seed datadir has only the placeholder "Default Printer"** — it
-never went through the first-run wizard, which is what *installs* (makes visible) a
-vendor's machine presets. Diagnostics from the run:
+## Surface delivered
 
 ```
-selected_printer = 'Default Printer'
-printers         = ['Default Printer']
-plate0 is_sliceable = False
+doc.slice(plate=None) -> SliceJob      # reslice current/selected plate
+job.wait(timeout)     -> SliceResult   # blocks caller, pumps the event loop
+job.done / job.progress / job.cancel()
+result.success / print_time_s / layer_count / filament_g / filament_mm /
+       gcode_3mf_path / error
+plates.arrange(wait=True)              # M2's arrange, now optionally synchronous
 ```
 
-Two fixes were tried and ruled out:
+## The async design (the load-bearing part)
 
-1. **Runtime UI-parity path — `apply_preset(force=True)` → `Tab::select_preset`:**
-   **segfaults headless.** Backtrace: `Tab::select_preset → load_current_preset →
-   TabPrinter::on_preset_loaded → … → TabPrint::update →
-   ObjectList::part_selection_changed → ObjectSettings::update_settings_list →
-   TabPrintModel::update_model_config → variant_keys → SIGSEGV`. The Tab preset cascade
-   drives ObjectList/ObjectSettings widgets that aren't populated in an offscreen app.
-   So the GUI's own preset-selection path is **not headless-safe**. (This also means
-   M2's `apply_preset` — implemented but skipped in that run — is currently unverified;
-   corrected in M2-RESULT.)
+`job.wait()` runs on the wx main thread (where Python runs in this model), **releases the
+GIL**, and pumps the event loop (`wxTheApp->Yield` + poll
+`PartPlate::is_slice_result_valid()`) until the background slicer's completion event
+lands — a *controlled event pump*, not a nested modal loop (the M0 crash class). It
+classifies "never started" / "started then errored" / "timeout" into `result.error`.
+`plates.arrange(wait=True)` reuses the same pump, polling `Plater::is_any_job_running()`.
+Verified: the slice worker runs, its completion is delivered, and the main loop is never
+blocked.
 
-2. **Name the presets in the datadir config** (`presets.machine =
-   "Bambu Lab X1 Carbon 0.4 nozzle"`, etc.): **doesn't stick.** At load the app drops a
-   selected preset that isn't *installed/visible* back to "Default Printer". Selection by
-   name requires the preset to be installed, not just present in resources.
+## What fought back (the whole story — this milestone was the hard one)
 
-## Recommended next steps (a decision for review)
+1. **Nothing was sliceable because no printer was installed.** The seed datadir only had
+   the placeholder "Default Printer" (no build volume / extruders). Diagnostics made this
+   legible (`printers = ['Default Printer']`, `is_sliceable = False`).
+2. **The UI-parity path to fix it crashes headless.** `apply_preset(force=True)` →
+   `Tab::select_preset` SIGSEGVs offscreen — it drives ObjectList/ObjectSettings widgets
+   that aren't populated headless (`… → TabPrintModel::update_model_config → variant_keys
+   → SIGSEGV`). **`Tab`-driven preset selection is not headless-safe** — a finding that
+   matters for M5 and that also means M2's `apply_preset` (skipped in its run) is
+   unverified/unsafe via the Tab.
+3. **Naming a preset in the config doesn't install it.** Setting `presets.machine` to the
+   X1C name fell back to "Default Printer": at load the app drops a selected preset that
+   isn't *installed/visible*.
+4. **Fixed properly by replicating what the wizard persists** (`tests/m3/install_printer.py`,
+   committed and reproducible). A printer preset is visible iff
+   `AppConfig::get_variant(vendor_id, model, variant)` is true
+   (`Preset::set_visible_from_appconfig`); the JSON app config encodes that as a
+   `"models"` array (`{"vendor":"BBL","model":"Bambu Lab X1 Carbon","nozzle_diameter":"0.4"}`)
+   and installed filaments as a `"filaments"` array. `vendor_id` is the vendor profile's
+   filename stem ("BBL"); model/variant come from the machine preset's
+   `printer_model`/`printer_variant`. With the X1C installed + a compatible process
+   (`0.20mm Standard @BBL X1C`) and filament (`Bambu PLA Basic @BBL X1C`) selected, the
+   config is valid.
+5. **`is_sliceable` before slicing is a red herring.** `PartPlate::can_slice()` is
+   `m_ready_for_slice && !m_apply_invalid`, flags only computed once the background
+   process is applied — which `reslice()` itself does. So it reads False *before* the
+   first slice; don't gate on it.
+6. **Objects load off the printable area.** They come in at raw STL coordinates
+   (e.g. min (7,-12,0)); the plate wasn't ready until they were placed. `arrange(wait=True)`
+   onto the bed made the plate genuinely sliceable → `is_sliceable = True` → slice ran.
+7. **Filament units bug, caught by a sanity bound.** `PrintStatistics::filament_stats` is
+   actually **volume (mm³)**, not grams (`= model_volumes_per_extruder`). The first green
+   run reported "1357 g". Now computed correctly: grams = volume(cm³) × density(g/cm³)
+   (per-extruder `GCodeProcessorResult::filament_densities`), mm = volume / Ø1.75 mm
+   cross-section → **1.71 g / 564 mm**. `verify_m3.py` now bounds grams `< 100` so a
+   volume-vs-grams regression can't pass again.
 
-In rough order of preference:
+Also fixed a **latent harness bug** (valuable regardless of M3): every pass/fail path now
+routes through `finalize_and_exit()`. Previously a failed milestone wrote its result but
+never `_Exit`'d (that lived only in the path-(b) finale), hanging to the timeout.
 
-1. **Provision the seed datadir with an installed printer, properly.** Replicate what the
-   wizard persists: the enabled vendor/model/variant (`AppConfig::set_variant` →
-   `PresetBundle::load_installed_printers`) so "Bambu Lab X1 Carbon 0.4 nozzle" is
-   *visible*, then select it + a compatible process/filament. Need to pin how BBS stores
-   installed vendors in the **JSON** app config (the `[vendor:…]` INI path in
-   `AppConfig.cpp` appears to be a separate serialization; the JSON seed has no
-   models/vendor section). Cleanest and most UI-faithful.
-2. **One-time real datadir capture:** run the fork's GUI once on a desktop, complete the
-   wizard picking an X1C, and check the resulting datadir in as the test seed. Pragmatic,
-   unblocks immediately, but couples the test to a captured profile.
-3. **Low-level `PresetBundle::…select_preset_by_name(name, force, select_invisible=true)`
-   for all three collections**, bypassing the crashing Tab, then push to Plater via
-   `on_config_change`. Avoids the wizard but skips the Tab's compatibility cascade — must
-   select a mutually-compatible trio by hand and verify the plate turns sliceable.
+## Deferred to later milestones (documented)
 
-Once a printer is installed/selected, `verify_m3.py` (already written) should slice the
-two-cube fixture and read back time/layers/filament unchanged.
+- **Push progress/complete events** to Python callbacks / MCP notifications — M5. M3
+  progress is pollable (`job.progress`, `job.done`); the slice itself is fully synchronous
+  via `wait()`.
+- **Multi-plate "slice all"** — M3 slices the current/selected plate (the fixture is
+  single-plate). The plate-select plumbing is in `doc.slice(plate=idx)`.
 
-## Also flagged for the design
+## Follow-ups worth surfacing
 
-`Tab::select_preset` being headless-unsafe is a broader signal: **preset selection and
-anything that refreshes the object-settings UI can't be driven offscreen through the Tab
-layer.** M2's `apply_preset` should be re-pointed at a headless-safe path (option 3
-above) or gated. Worth resolving before M5 (the bridge will exercise these).
+- **`Tab`-driven preset selection is headless-unsafe.** `apply_preset` should be
+  re-pointed at a non-Tab path (low-level `PresetCollection::select_preset_by_name` +
+  `Plater::on_config_change`) or gated, before M5 exercises it. Tracked here and in
+  M2-RESULT.
+- The seed datadir is provisioned by `tests/m3/install_printer.py` against a base datadir
+  produced by a first app run; documented in that script.
 
 ## Environment
 

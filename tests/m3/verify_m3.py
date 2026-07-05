@@ -21,13 +21,24 @@ print("M3 diag: plate0 object_count =", p0.object_count,
       "is_sliceable =", p0.is_sliceable)
 
 # The seed datadir boots with a concrete X1C machine + compatible process +
-# filament selected (see tests/m3 seed notes), so the plate is sliceable
-# without any runtime preset switching. (Runtime Tab::select_preset is not
-# headless-safe — it drives ObjectList/ObjectSettings widgets that aren't
-# populated offscreen; see M3-RESULT.)
-assert p0.is_sliceable, (
-    "plate not sliceable — seed datadir needs a real printer/process/filament "
-    "selected (selected_printer=%r)" % app.selected_printer)
+# filament installed & selected (see tests/m3/install_printer.py), so slicing
+# has a valid config without any runtime preset switching (Tab::select_preset
+# is not headless-safe — see M3-RESULT).
+#
+# NOTE: plate.is_sliceable (PartPlate::can_slice -> m_ready_for_slice) only
+# becomes true AFTER the background process is applied/validated, which
+# reslice() itself does — so it reads False here, before the first slice.
+# Don't gate on it; call slice() and judge by the result.
+
+# Objects load at their raw STL coordinates, which may sit off the printable
+# area — arrange them onto the bed first (synchronously) so the plate is
+# actually sliceable, then slice.
+for o in doc.model.objects:
+    bb = o.bounding_box()
+    print("M3 diag: object", repr(o.name), "min", bb["min"], "max", bb["max"])
+print("M3 diag: arranging...")
+doc.plates.arrange(wait=True)
+print("M3 diag: after arrange, plate0 is_sliceable =", doc.plates[0].is_sliceable)
 
 job = doc.slice()                     # slice the current plate
 result = job.wait(timeout=240)        # blocks here, pumping events, until done
@@ -36,9 +47,15 @@ print("M3 diag: slice success =", result.success, "error =", repr(result.error))
 assert result.success, f"slice did not complete: {result.error}"
 assert result.print_time_s > 0, f"print_time_s = {result.print_time_s}"
 assert result.layer_count > 0, f"layer_count = {result.layer_count}"
-assert any(v > 0 for v in result.filament_g.values()), \
-    f"no filament used: {result.filament_g}"
 assert result.gcode_3mf_path, "no gcode path reported"
 
+total_g = sum(result.filament_g.values())
+total_mm = sum(result.filament_mm.values())
+# Two 10 mm cubes: a couple of grams / a few metres. Sanity-bound the units so a
+# volume-vs-grams regression can't pass (a 1 kg spool is 1000 g).
+assert 0 < total_g < 100, f"filament grams out of range: {result.filament_g}"
+assert total_mm > 0, f"filament mm not positive: {result.filament_mm}"
+
 print(f"M3 verify OK: {result.print_time_s}s, {result.layer_count} layers, "
-      f"filament_g={result.filament_g}, gcode={result.gcode_3mf_path!r}")
+      f"filament {total_g:.2f} g / {total_mm:.0f} mm (per-slot g={result.filament_g}), "
+      f"gcode={result.gcode_3mf_path!r}")
