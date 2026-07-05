@@ -299,6 +299,21 @@ void run_selftest_on_main()
         }
     }
 
+    // ---- M2: mutation, verified via read-back -----------------------------
+    if (std::getenv("PYSLIC3R_M2_TEST") != nullptr && !s_results.failed) {
+        const std::string script = env_or("PYSLIC3R_M2_SCRIPT", "");
+        try {
+            py::gil_scoped_acquire gil;
+            py::object ns = py::module_::import("__main__").attr("__dict__");
+            if (script.empty())
+                throw std::runtime_error("PYSLIC3R_M2_SCRIPT not set");
+            py::eval_file(script, ns);
+            check(true, "M2: mutation asserts passed (" + script + ")");
+        } catch (const std::exception &e) {
+            check(false, std::string("M2: mutation asserts failed: ") + e.what());
+        }
+    }
+
     if (s_results.failed) {
         // Path (b) would only hang on a broken foundation; report honestly.
         write_result_and_quit();

@@ -31,9 +31,13 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"   // LoadStrategy
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
+#include "slic3r/GUI/Tab.hpp"
+
+#include <boost/filesystem/path.hpp>
 
 namespace py = pybind11;
 using namespace Slic3r;
@@ -100,9 +104,42 @@ struct PyPlate    { int idx; };
 enum class ConfigSource { Global, Print, Filament, Printer, Plate };
 struct PyConfig { ConfigSource source; int plate_idx = 0; };
 
+// The PresetCollection backing a preset source, or nullptr for Global/Plate.
+PresetCollection *preset_collection(ConfigSource s)
+{
+    auto *pb = GUI::wxGetApp().preset_bundle;
+    switch (s) {
+    case ConfigSource::Print:    return &pb->prints;
+    case ConfigSource::Filament: return &pb->filaments;
+    case ConfigSource::Printer:  return &pb->printers;
+    default:                     return nullptr;
+    }
+}
+
+Preset::Type preset_type(ConfigSource s)
+{
+    switch (s) {
+    case ConfigSource::Print:    return Preset::TYPE_PRINT;
+    case ConfigSource::Filament: return Preset::TYPE_FILAMENT;
+    case ConfigSource::Printer:  return Preset::TYPE_PRINTER;
+    default:                     return Preset::TYPE_INVALID;
+    }
+}
+
+GUI::PartPlate *plate_or_throw(int plate_idx, const char *what)
+{
+    auto &list = plater_or_throw(what)->get_partplate_list();
+    if (plate_idx < 0 || plate_idx >= list.get_plate_count())
+        throw std::runtime_error("plate index out of range");
+    GUI::PartPlate *plate = list.get_plate(plate_idx);
+    if (plate == nullptr) throw std::runtime_error("plate gone");
+    return plate;
+}
+
+// Read view. For preset sources this is the *edited* preset — the working copy
+// the GUI reads and writes — so a value set via Config.set reads straight back.
 const ConfigBase *resolve_config(const PyConfig &c, const char *what)
 {
-    auto &app = GUI::wxGetApp();
     switch (c.source) {
     case ConfigSource::Global: {
         const DynamicPrintConfig *cfg = plater_or_throw(what)->config();
@@ -110,21 +147,14 @@ const ConfigBase *resolve_config(const PyConfig &c, const char *what)
         return cfg;
     }
     case ConfigSource::Print:
-        main_thread(what);
-        return &app.preset_bundle->prints.get_selected_preset().config;
     case ConfigSource::Filament:
+    case ConfigSource::Printer: {
         main_thread(what);
-        return &app.preset_bundle->filaments.get_selected_preset().config;
-    case ConfigSource::Printer:
-        main_thread(what);
-        return &app.preset_bundle->printers.get_selected_preset().config;
+        return &preset_collection(c.source)->get_edited_preset().config;
+    }
     case ConfigSource::Plate: {
-        auto &list = plater_or_throw(what)->get_partplate_list();
-        if (c.plate_idx < 0 || c.plate_idx >= list.get_plate_count())
-            throw std::runtime_error("plate index out of range");
-        GUI::PartPlate *plate = list.get_plate(c.plate_idx);
-        if (plate == nullptr || plate->config() == nullptr)
-            throw std::runtime_error("no plate config");
+        GUI::PartPlate *plate = plate_or_throw(c.plate_idx, what);
+        if (plate->config() == nullptr) throw std::runtime_error("no plate config");
         return plate->config();
     }
     }
@@ -158,7 +188,51 @@ void register_object_model(py::module_ &m)
         })
         .def("keys", [](const PyConfig &c) {
             return resolve_config(c, "Config.keys")->keys();   // -> list[str]
-        });
+        })
+        .def_property_readonly("is_dirty", [](const PyConfig &c) {
+            PresetCollection *col = preset_collection(c.source);
+            if (col == nullptr) return false;   // global/plate: not preset-dirty-tracked
+            main_thread("Config.is_dirty");
+            return col->current_is_dirty();
+        })
+        // ---- M2 mutation --------------------------------------------------
+        .def("set", [](const PyConfig &c, const std::string &key, const std::string &value) {
+            // GUI-parity: edit the working config the app watches, mark dirty,
+            // and let Plater invalidate slicing exactly as an on-screen edit.
+            if (c.source == ConfigSource::Global)
+                throw std::runtime_error(
+                    "the global config is derived and read-only; set on "
+                    "print_config / filament_config / printer_config, or a plate config");
+            auto *plater = plater_or_throw("Config.set");
+            if (c.source == ConfigSource::Plate) {
+                GUI::PartPlate *plate = plate_or_throw(c.plate_idx, "Config.set");
+                DynamicPrintConfig *cfg = plate->config();
+                if (cfg == nullptr) throw std::runtime_error("no plate config");
+                cfg->set_deserialize_strict(key, value);
+                plater->schedule_background_process();
+                return;
+            }
+            PresetCollection *col = preset_collection(c.source);
+            DynamicPrintConfig &cfg = col->get_edited_preset().config;
+            if (!cfg.has(key))
+                throw std::runtime_error("unknown config key for this preset: " + key);
+            cfg.set_deserialize_strict(key, value);
+            col->update_dirty();                 // mark preset dirty like the GUI
+            plater->on_config_change(cfg);        // diff + schedule reslice
+        }, py::arg("key"), py::arg("value"))
+        .def("apply_preset", [](const PyConfig &c, const std::string &name) {
+            // Select a named preset via the Tab — the same path the preset
+            // dropdown uses (compatibility checks, dependent tabs, dirty, and
+            // the Plater cascade).
+            Preset::Type t = preset_type(c.source);
+            if (t == Preset::TYPE_INVALID)
+                throw std::runtime_error("apply_preset only on print/filament/printer config");
+            main_thread("Config.apply_preset");
+            GUI::Tab *tab = GUI::wxGetApp().get_tab(t);
+            if (tab == nullptr) throw std::runtime_error("no tab for preset type");
+            if (!tab->select_preset(name))
+                throw std::runtime_error("preset not applied (not found or incompatible): " + name);
+        }, py::arg("name"));
 
     // ---- Volume -----------------------------------------------------------
     py::class_<PyVolume>(m, "Volume")
@@ -177,6 +251,7 @@ void register_object_model(py::module_ &m)
         .def_property_readonly("name", [](const PyObject &o) {
             return object_at(o.idx, "Object.name")->name;
         })
+        .def_property_readonly("index", [](const PyObject &o) { return o.idx; })
         .def_property_readonly("instance_count", [](const PyObject &o) {
             return object_at(o.idx, "Object.instance_count")->instances.size();
         })
@@ -195,6 +270,20 @@ void register_object_model(py::module_ &m)
             d["size"]   = vec3(bb.size());
             d["center"] = vec3(bb.center());
             return d;
+        })
+        // ---- M2 mutation (UI-parity: snapshot + Plater refresh) -----------
+        .def("translate", [](const PyObject &o, double dx, double dy, double dz) {
+            auto *plater = plater_or_throw("Object.translate");
+            ModelObject *obj = object_at(o.idx, "Object.translate");
+            GUI::Plater::TakeSnapshot snap(plater, "API: move object");
+            obj->translate_instances(Vec3d(dx, dy, dz));  // moves the placed instances
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));           // same refresh the GUI uses
+        }, py::arg("dx"), py::arg("dy"), py::arg("dz"))
+        .def("delete", [](const PyObject &o) {
+            auto *plater = plater_or_throw("Object.delete");
+            (void) object_at(o.idx, "Object.delete");     // bounds-check
+            plater->delete_object_from_model(o.idx);      // snapshots internally
         });
 
     // ---- Model ------------------------------------------------------------
@@ -208,7 +297,29 @@ void register_object_model(py::module_ &m)
             for (size_t i = 0; i < mo.objects.size(); ++i)
                 out.append(PyObject{i});
             return out;
-        });
+        })
+        // ---- M2 mutation --------------------------------------------------
+        .def("add", [](const PyModel &, const std::string &path) {
+            // Import geometry as object(s) via the same Plater path as GUI
+            // "Add" (LoadModel, no LoadConfig, Silence), under a snapshot.
+            auto *plater = plater_or_throw("Model.add");
+            const size_t before = plater->model().objects.size();
+            GUI::Plater::TakeSnapshot snap(plater, "API: add model");
+            std::vector<boost::filesystem::path> paths{ boost::filesystem::path(path) };
+            const auto strategy = LoadStrategy::LoadModel |
+                                  LoadStrategy::AddDefaultInstances |
+                                  LoadStrategy::Silence;
+            std::vector<size_t> idxs = plater->load_files(paths, strategy, /*ask_multi=*/false);
+            const size_t after = plater->model().objects.size();
+            if (after <= before)
+                throw std::runtime_error("no object added from: " + path);
+            return PyObject{ idxs.empty() ? after - 1 : idxs.back() };
+        }, py::arg("path"))
+        .def("remove", [](const PyModel &, const PyObject &o) {
+            auto *plater = plater_or_throw("Model.remove");
+            (void) object_at(o.idx, "Model.remove");       // bounds-check
+            plater->delete_object_from_model(o.idx);        // snapshots internally
+        }, py::arg("object"));
 
     // ---- Plate / PlateList ------------------------------------------------
     py::class_<PyPlate>(m, "Plate")
@@ -240,6 +351,15 @@ void register_object_model(py::module_ &m)
             int n = plater_or_throw("PlateList[]")->get_partplate_list().get_plate_count();
             if (i < 0 || i >= n) throw py::index_error("plate index out of range");
             return PyPlate{i};
+        })
+        // ---- M2 mutation --------------------------------------------------
+        .def("arrange", [](const PyPlateList &) {
+            // Auto-arrange, same as the toolbar button. NOTE: asynchronous —
+            // this starts a background ArrangeJob (which takes its own
+            // snapshot) and returns immediately; completion/progress events
+            // are M3 work. For scripts that need the finished layout, poll a
+            // read-back or wait for the M3 event.
+            plater_or_throw("PlateList.arrange")->arrange();
         });
 
     // ---- Document ---------------------------------------------------------
