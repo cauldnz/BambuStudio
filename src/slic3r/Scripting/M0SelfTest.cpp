@@ -76,8 +76,10 @@ void write_result_and_quit()
     const bool pass = !s_results.failed;
     const std::string path = env_or("PYSLIC3R_M0_RESULT", "M0-RESULT.md");
 
+    const std::string label = env_or("PYSLIC3R_TEST_LABEL", "M0");
+
     std::ostringstream md;
-    md << "# M0-RESULT — embed + marshal de-risk spike\n\n";
+    md << "# " << label << "-RESULT — pyslic3r self-test\n\n";
     md << "RESULT: " << (pass ? "PASS" : "FAIL") << "\n\n";
 
     std::time_t now = std::time(nullptr);
@@ -122,7 +124,7 @@ void write_result_and_quit()
     out.close();
 
     // Machine-readable line for the harness, independent of the file.
-    std::printf("PYSLIC3R_M0: %s\n", pass ? "PASS" : "FAIL");
+    std::printf("PYSLIC3R_%s: %s\n", label.c_str(), pass ? "PASS" : "FAIL");
     std::fflush(stdout);
     BOOST_LOG_TRIVIAL(info) << "pyslic3r M0: result written to " << path
                             << " — " << (pass ? "PASS" : "FAIL");
@@ -278,6 +280,24 @@ void run_selftest_on_main()
     }
     const auto t1 = std::chrono::steady_clock::now();
     s_results.path_a_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // ---- M1: read-only object model, verified from a Python script --------
+    // The surface under test is Python-visible, so the assertions are a Python
+    // file (PYSLIC3R_M1_SCRIPT) that walks app→document→model→objects→volumes,
+    // plates, and config. Raising there fails the milestone.
+    if (std::getenv("PYSLIC3R_M1_TEST") != nullptr && !s_results.failed) {
+        const std::string script = env_or("PYSLIC3R_M1_SCRIPT", "");
+        try {
+            py::gil_scoped_acquire gil;
+            py::object ns = py::module_::import("__main__").attr("__dict__");
+            if (script.empty())
+                throw std::runtime_error("PYSLIC3R_M1_SCRIPT not set");
+            py::eval_file(script, ns);
+            check(true, "M1: read-only object model asserts passed (" + script + ")");
+        } catch (const std::exception &e) {
+            check(false, std::string("M1: object model asserts failed: ") + e.what());
+        }
+    }
 
     if (s_results.failed) {
         // Path (b) would only hang on a broken foundation; report honestly.

@@ -1,4 +1,5 @@
 #include "PyHost.hpp"
+#include "PyBindings.hpp"
 
 #include <chrono>
 #include <future>
@@ -39,43 +40,16 @@ void ensure_main_thread(const char *what)
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// Embedded module. Deliberately tiny for M0: two read-only members, both
-// routed through the GUI's own controller (Plater), both main-thread-guarded.
-// Registered from this TU (which GUI_App references) so the static
-// initializer cannot be dropped by the linker.
+// Embedded module. Thin composition point: the read-only object-model surface
+// lives in PyObjectModel.cpp and is attached via register_object_model(). This
+// TU is referenced by GUI_App, so the static module initializer can't be
+// dropped by the linker.
 // ---------------------------------------------------------------------------
-
-namespace {
-struct PyApp {};
-struct PyActiveDocument {};
-} // anonymous namespace
 
 PYBIND11_EMBEDDED_MODULE(pyslic3r, m)
 {
-    m.doc() = "pyslic3r — embedded object model over the running app (M0 spike surface)";
-
-    py::class_<PyActiveDocument>(m, "ActiveDocument")
-        .def_property_readonly("object_count", [](const PyActiveDocument &) -> size_t {
-            ensure_main_thread("pyslic3r.app.active_document.object_count");
-            auto *plater = Slic3r::GUI::wxGetApp().plater();
-            if (plater == nullptr)
-                throw std::runtime_error("no active document");
-            return plater->model().objects.size();
-        });
-
-    py::class_<PyApp>(m, "Application")
-        .def_property_readonly("version", [](const PyApp &) -> std::string {
-            ensure_main_thread("pyslic3r.app.version");
-            return std::string(SLIC3R_VERSION);
-        })
-        .def_property_readonly("active_document", [](const PyApp &) -> py::object {
-            ensure_main_thread("pyslic3r.app.active_document");
-            if (Slic3r::GUI::wxGetApp().plater() == nullptr)
-                return py::none();
-            return py::cast(PyActiveDocument{});
-        });
-
-    m.attr("app") = py::cast(PyApp{});
+    m.doc() = "pyslic3r — read-only embedded object model over the running app";
+    register_object_model(m);
 }
 
 // ---------------------------------------------------------------------------

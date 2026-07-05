@@ -9,6 +9,8 @@
 add_library(libbambu_api STATIC
     PyHost.hpp
     PyHost.cpp
+    PyBindings.hpp
+    PyObjectModel.cpp
     M0SelfTest.cpp
 )
 
