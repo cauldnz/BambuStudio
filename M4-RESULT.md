@@ -17,15 +17,19 @@ half (blocked on a bound printer — a hardware/account step for the human).
 - PASS — **M4: device plane asserts** (verify_m4.py)
 - PASS — interpreter finalized cleanly
 
-Diagnostics (headless run against a copy of the logged-in datadir):
+Diagnostics (headless run against a copy of the logged-in datadir, **with a real
+printer bound** to the account):
 ```
 device.available   = True          # signed network plugin loaded offscreen
 is_logged_in       = True          # login PERSISTED to the datadir copy
-user_id            = 3007717786    # matches the logged-in test account
-user_name          = 'user_3007717786'
-bound printers     = []            # none bound to this account yet (valid)
-selected / status  = None          # correct with nothing bound
+user_id            = 3007717786
+refresh()          -> 1            # fetched the account's bound-printer list
+printers()         = [('22E8BJ5C0800039', 'p2s', online=True)]   # real P2S
+select(...) + status() = {online:True, print_status:'', progress:0,
+                          current_layer:0, total_layers:0, remaining_s:0}  # idle
 ```
+(An earlier run with no printer bound correctly returned `printers()==[]` — the
+enumeration is real, not a stub.)
 
 ## Two findings that de-risk the whole device plane
 
@@ -45,6 +49,7 @@ app.device.available          -> bool         # network plugin loaded?
 app.device.is_logged_in       -> bool
 app.device.user_id            -> str | None
 app.device.user_name          -> str | None
+app.device.refresh()          -> int          # fetch bound-printer list from cloud
 app.device.printers()         -> list[BoundPrinter]   # account-bound (+ local)
 app.device.selected           -> BoundPrinter | None
 app.device.select(dev_id)     -> None
@@ -80,20 +85,29 @@ Workaround: a **password-based** test account (`chris@auld.nz`, id `3007717786`)
 device plane on this OSS build. Worth investigating whether SSO is fixable or is an
 official-build-only capability.
 
-## Deferred — the M4 write half (needs a bound printer)
+## Update — a real printer is now bound (P2S)
 
-Not yet built/tested, because the fresh test account has **no bound printer**
-(Chris's printers are on his Apple-ID account). Once a printer is bound/shared to
-`3007717786`:
-- `device.status()` returns live temps / progress / layer / HMS (fields mapped:
-  `MachineObject` + `DeviceCore/Dev*.h` — bed/nozzle temps via
+A P2S (`22E8BJ5C0800039`) is bound to the test account, and `refresh()` +
+`printers()` + `select()` + `status()` are verified against it live. Added
+`device.refresh()` because being logged in isn't enough — `DeviceManager` only
+knows the bound printers after it fetches them from the cloud
+(`update_user_machine_list_info()` → `get_user_print_info`, then a deferred JSON
+parse); `refresh()` triggers that and pumps the loop until the list populates.
+
+## Deferred — the M4 write half
+
+Now unblocked by the bound printer; still to build/test:
+- **Fuller live `status()`** — temps / HMS / full print state come via the
+  printer's MQTT push (a `pushall` after select/subscribe). The idle printer
+  currently reports the direct fields (all zero = idle); the richer telemetry
+  needs the MQTT-connect + wait-for-push path (bed/nozzle via
   `GetBed()`/`GetExtderSystem()`, errors via `GetHMS()`).
-- `device.send(gcode_3mf, plate, ams_mapping)` — dispatch a sliced job (gated
-  behind explicit user intent).
+- `device.send(gcode_3mf, plate, ams_mapping)` — dispatch a sliced job. **Gated
+  behind explicit, per-print user approval** (hard rule — never dispatch a print
+  without asking).
 - **Push status/progress events** with reconnect + exponential backoff
-  (cadence-sensitive: an agent is exactly the traffic that gets rate-limited —
-  push-first, `pushall` only on reconnect). This is shared machinery with M5's
-  event → MCP-notification path.
+  (cadence-sensitive — push-first, `pushall` only on reconnect). Shared machinery
+  with M5's event → MCP-notification path.
 
 ## Environment
 

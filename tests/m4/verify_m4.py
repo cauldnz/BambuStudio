@@ -20,21 +20,37 @@ print("M4 diag: is_logged_in       =", dev.is_logged_in)
 print("M4 diag: user_id            =", dev.user_id)
 print("M4 diag: user_name          =", repr(dev.user_name))
 
+# Fetch the account's bound printers from the cloud (a fresh instance hasn't).
+if dev.is_logged_in:
+    n = dev.refresh()
+    print("M4 diag: refresh -> cloud reports", n, "printer(s)")
+
 printers = dev.printers()
 print("M4 diag: bound printers      =",
       [(p.dev_id, p.name, p.online) for p in printers])
 
-sel = dev.selected
-print("M4 diag: selected            =", (sel.dev_id if sel else None))
-print("M4 diag: status              =", dev.status())
+# If a printer is bound, exercise select + status read-back (READ-ONLY, safe).
+if printers:
+    p = printers[0]
+    dev.select(p.dev_id)
+    print("M4 diag: selected            =", (dev.selected.dev_id if dev.selected else None))
+    print("M4 diag: status              =", dev.status())
+else:
+    sel = dev.selected
+    print("M4 diag: selected            =", (sel.dev_id if sel else None))
+    print("M4 diag: status              =", dev.status())
 
 # --- hard asserts: the device-plane INFRASTRUCTURE is reachable -----------
 assert dev.available, "network plugin not available (libbambu_networking.so not loaded)"
 assert isinstance(printers, list), "device.printers() did not return a list"
 # selection/status plumbing must not throw and must be well-typed:
+sel = dev.selected
 assert sel is None or isinstance(sel.dev_id, str), "selected has bad dev_id"
 st = dev.status()
 assert st is None or isinstance(st, dict), "status() not None-or-dict"
+# with a bound printer we should have enumerated at least one:
+if dev.is_logged_in and len(printers) > 0:
+    assert all(isinstance(p.dev_id, str) and p.dev_id for p in printers), "bad printer dev_id"
 
 # --- reported finding: did the login persist to this (headless) datadir? ---
 expect = os.environ.get("PYSLIC3R_M4_EXPECT_USER", "")

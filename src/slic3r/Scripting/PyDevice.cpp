@@ -15,6 +15,7 @@
 
 #include "PyBindings.hpp"
 
+#include <chrono>
 #include <map>
 #include <string>
 
@@ -22,6 +23,7 @@
 
 #include <wx/app.h>
 #include <wx/thread.h>
+#include <wx/utils.h>   // wxMilliSleep
 
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
@@ -125,12 +127,38 @@ void register_device(py::module_ &m)
             return py::str(n);
         })
         .def("printers", [](const PyDevice &) {
-            // Account-bound (+ local) printers. Empty list is a valid result
-            // (logged in, nothing bound yet).
+            // Account-bound (+ local) printers, from the cached list. Call
+            // refresh() first to fetch it from the cloud (a fresh instance
+            // hasn't). Empty list is a valid result (nothing bound).
             py::list out;
             for (auto &kv : all_machines("Device.printers"))
                 out.append(PyBoundPrinter{kv.first});
             return out;
+        })
+        .def("refresh", [](const PyDevice &) {
+            // Fetch the account's bound-printer list from the cloud (what the
+            // GUI does on the Device page). update_user_machine_list_info()
+            // makes a synchronous HTTP call then defers the JSON parse via
+            // CallAfter — so pump the event loop until the list populates,
+            // then return the count. Returns 0 if not logged in / unavailable.
+            DeviceManager *dm = devmgr("Device.refresh");
+            if (dm == nullptr) return size_t(0);
+            NetworkAgent *a = GUI::wxGetApp().getAgent();
+            if (a == nullptr || !a->is_user_login()) return size_t(0);
+
+            dm->update_user_machine_list_info();
+            {
+                py::gil_scoped_release nogil;
+                using clock = std::chrono::steady_clock;
+                const auto t0 = clock::now();
+                for (;;) {
+                    if (wxTheApp != nullptr) wxTheApp->Yield(true);   // run the parse
+                    if (!dm->get_user_machinelist().empty()) break;  // populated
+                    if (clock::now() - t0 > std::chrono::seconds(8)) break;
+                    wxMilliSleep(80);
+                }
+            }
+            return dm->get_user_machinelist().size();
         })
         .def_property_readonly("selected", [](const PyDevice &) -> py::object {
             DeviceManager *dm = devmgr("Device.selected");
