@@ -40,6 +40,14 @@ std::string py_eval_str(const std::string &expr);
 // M0 self-test: no-op unless env PYSLIC3R_M0_TEST=1. Called by host_init.
 void maybe_start_m0_selftest();
 
+// Script runner (SPEC §4 "scripts run once"): if env PYSLIC3R_SCRIPT names a
+// .py file, run it once on the wx main thread after the app is up, driving the
+// live document through pyslic3r. Leaves the app running by default; set
+// PYSLIC3R_SCRIPT_EXIT=1 for batch use (finalize + exit after the script,
+// exit code reflects success). No-op if PYSLIC3R_SCRIPT is unset. Called by
+// host_init.
+void maybe_run_user_script();
+
 } // namespace pyslic3r
 
 #endif // slic3r_Scripting_PyHost_hpp_
