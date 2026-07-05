@@ -53,8 +53,15 @@ the object count.
   are consistent. The derived global config is read-only (raise on set) — you edit presets
   or plate settings, exactly as in the GUI.
 - **apply_preset uses the real Tab path** (`Tab::select_preset`) — compatibility checks,
-  dependent-tab cascade, dirty state, Plater update. This was the op most likely to break
-  headless; it worked.
+  dependent-tab cascade, dirty state, Plater update.
+  **Correction (found during M3):** the M2 run did NOT actually exercise this — the seed
+  profile ships only the placeholder "Default Printer", so `verify_m2.py`'s
+  "apply a *different* printer" step found no alternative and skipped
+  (`apply_preset(tested=False)`). M3 later force-called `Tab::select_preset` and it
+  **segfaults headless** (it drives ObjectList/ObjectSettings widgets that aren't
+  populated offscreen). So `apply_preset` is implemented but currently **unverified /
+  not headless-safe**; see M3-RESULT for the fix path. The other M2 mutations
+  (add/remove/translate/arrange/config.set) are genuinely verified.
 
 ## What fought back
 

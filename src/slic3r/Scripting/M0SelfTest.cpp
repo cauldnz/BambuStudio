@@ -130,18 +130,16 @@ void write_result_and_quit()
                             << " — " << (pass ? "PASS" : "FAIL");
 }
 
-void finalize_on_main()
+// Terminal for EVERY path (pass or fail): finalize the interpreter, write the
+// result, and exit. Called on the main thread. Never returns.
+void finalize_and_exit()
 {
-    if (s_worker.joinable())
-        s_worker.join();    // worker has already signalled; this is immediate
-
-    // The M0 clean-shutdown gate is specifically about the *interpreter*:
+    // The clean-shutdown gate is specifically about the *interpreter*:
     // "interpreter finalized, no hang on exit." Finalize it explicitly here,
-    // on the main thread, after the 1000 marshalled round-trips — this is the
-    // thing the spike must de-risk, and it lets us assert it independently of
+    // on the main thread — the thing the spike de-risks — independently of
     // BambuStudio's full GUI teardown (which, run headless, hits a pre-existing
-    // wxWebView::RunScript segfault during the first-run wizard's webview
-    // teardown — unrelated to pyslic3r; see M0-RESULT "What fought back").
+    // wxWebView::RunScript segfault in the first-run wizard's webview teardown,
+    // unrelated to pyslic3r; see M0-RESULT "What fought back").
     s_results.py_version = Py_GetVersion();
     bool finalize_ok = true;
     try {
@@ -159,12 +157,17 @@ void finalize_on_main()
     write_result_and_quit();
 
     // Exit without dragging the process through BambuStudio's flaky headless
-    // GUI/webview teardown. The interpreter — the subject of this spike — has
-    // been finalized cleanly above; a normal wx close here instead segfaults in
-    // wxWebView teardown, which is orthogonal to embed+marshal. Flush first.
+    // GUI/webview teardown. Flush first.
     std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(s_results.failed ? 1 : 0);
+}
+
+void finalize_on_main()
+{
+    if (s_worker.joinable())
+        s_worker.join();    // worker has already signalled; this is immediate
+    finalize_and_exit();
 }
 
 void run_path_b_worker()
@@ -253,7 +256,7 @@ void run_selftest_on_main()
     const long expected_count = std::atol(env_or("PYSLIC3R_M0_EXPECT_OBJECTS", "2").c_str());
 
     load_fixtures_on_main();
-    if (s_results.failed) { write_result_and_quit(); return; }
+    if (s_results.failed) { finalize_and_exit(); }
 
     // ---- path (a): straight main-thread use -------------------------------
     const auto t0 = std::chrono::steady_clock::now();
@@ -314,10 +317,25 @@ void run_selftest_on_main()
         }
     }
 
+    // ---- M3: slicing, verified via read-back ------------------------------
+    if (std::getenv("PYSLIC3R_M3_TEST") != nullptr && !s_results.failed) {
+        const std::string script = env_or("PYSLIC3R_M3_SCRIPT", "");
+        try {
+            py::gil_scoped_acquire gil;
+            py::object ns = py::module_::import("__main__").attr("__dict__");
+            if (script.empty())
+                throw std::runtime_error("PYSLIC3R_M3_SCRIPT not set");
+            py::eval_file(script, ns);
+            check(true, "M3: slicing asserts passed (" + script + ")");
+        } catch (const std::exception &e) {
+            check(false, std::string("M3: slicing asserts failed: ") + e.what());
+        }
+    }
+
     if (s_results.failed) {
-        // Path (b) would only hang on a broken foundation; report honestly.
-        write_result_and_quit();
-        return;
+        // Path (b) would only hang on a broken foundation; report honestly
+        // and exit cleanly (do not leave the app running).
+        finalize_and_exit();
     }
 
     // ---- path (b): background thread through the marshalling primitive ----

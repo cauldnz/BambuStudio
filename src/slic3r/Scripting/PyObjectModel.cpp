@@ -31,13 +31,21 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
-#include "libslic3r/Format/bbs_3mf.hpp"   // LoadStrategy
+#include "libslic3r/Print.hpp"                 // Print, PrintStatistics
+#include "libslic3r/GCode/GCodeProcessor.hpp"  // GCodeProcessorResult
+#include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Tab.hpp"
+#include "slic3r/GUI/BackgroundSlicingProcess.hpp"   // job.cancel() -> stop()
 
 #include <boost/filesystem/path.hpp>
+#include <chrono>
+#include <cmath>
+#include <map>
+
+#include <wx/utils.h>   // wxMilliSleep
 
 namespace py = pybind11;
 using namespace Slic3r;
@@ -104,6 +112,19 @@ struct PyPlate    { int idx; };
 enum class ConfigSource { Global, Print, Filament, Printer, Plate };
 struct PyConfig { ConfigSource source; int plate_idx = 0; };
 
+// M3 slicing handles.
+struct PySliceJob { int plate_idx; };
+struct PySliceResult
+{
+    bool                    success = false;
+    long                    print_time_s = 0;
+    long                    layer_count = 0;
+    std::map<int, double>   filament_g;    // per extruder/slot
+    std::map<int, double>   filament_mm;   // per extruder/slot (from volume)
+    std::string             gcode_path;
+    std::string             error;         // reason when !success
+};
+
 // The PresetCollection backing a preset source, or nullptr for Global/Plate.
 PresetCollection *preset_collection(ConfigSource s)
 {
@@ -169,6 +190,34 @@ ModelVolume *volume_at(const PyVolume &v, const char *what)
     return obj->volumes[v.vol_idx];
 }
 
+// Read slice stats off a sliced plate into a PySliceResult. Main thread.
+void fill_slice_result(int plate_idx, PySliceResult &res)
+{
+    auto &list = plater_or_throw("SliceResult")->get_partplate_list();
+    GUI::PartPlate *plate = list.get_plate(plate_idx);
+    if (plate == nullptr) return;
+
+    res.gcode_path = plate->get_tmp_gcode_path();
+
+    const GCodeProcessorResult *gr = plate->get_slice_result();
+    if (gr != nullptr) {
+        const auto &mode = gr->print_statistics.modes[0];   // 0 = Normal
+        res.print_time_s = long(mode.time + 0.5f);
+        res.layer_count  = long(mode.layers_times.size());
+
+        // mm per extruder from extruded volume; area from filament diameter
+        // (default 1.75 mm — refine from filament config later if needed).
+        const double area = M_PI * (1.75 / 2.0) * (1.75 / 2.0);
+        for (const auto &kv : gr->print_statistics.total_volumes_per_extruder)
+            res.filament_mm[int(kv.first)] = area > 0 ? kv.second / area : 0.0;
+    }
+
+    // grams per extruder from the Print statistics.
+    const Print &print = list.get_current_fff_print();
+    for (const auto &kv : print.print_statistics().filament_stats)
+        res.filament_g[int(kv.first)] = kv.second;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -220,19 +269,23 @@ void register_object_model(py::module_ &m)
             col->update_dirty();                 // mark preset dirty like the GUI
             plater->on_config_change(cfg);        // diff + schedule reslice
         }, py::arg("key"), py::arg("value"))
-        .def("apply_preset", [](const PyConfig &c, const std::string &name) {
+        .def("apply_preset", [](const PyConfig &c, const std::string &name, bool force) {
             // Select a named preset via the Tab — the same path the preset
             // dropdown uses (compatibility checks, dependent tabs, dirty, and
-            // the Plater cascade).
+            // the Plater cascade). force=True force-selects, which also allows
+            // selecting a system preset that isn't yet "installed"/visible —
+            // the end state of installing it through the wizard.
             Preset::Type t = preset_type(c.source);
             if (t == Preset::TYPE_INVALID)
                 throw std::runtime_error("apply_preset only on print/filament/printer config");
             main_thread("Config.apply_preset");
             GUI::Tab *tab = GUI::wxGetApp().get_tab(t);
             if (tab == nullptr) throw std::runtime_error("no tab for preset type");
-            if (!tab->select_preset(name))
+            const bool ok = tab->select_preset(name, /*delete_current=*/false,
+                                               /*last_ph=*/std::string(), /*force_select=*/force);
+            if (!ok && !force)
                 throw std::runtime_error("preset not applied (not found or incompatible): " + name);
-        }, py::arg("name"));
+        }, py::arg("name"), py::arg("force") = false);
 
     // ---- Volume -----------------------------------------------------------
     py::class_<PyVolume>(m, "Volume")
@@ -362,6 +415,91 @@ void register_object_model(py::module_ &m)
             plater_or_throw("PlateList.arrange")->arrange();
         });
 
+    // ---- SliceResult ------------------------------------------------------
+    py::class_<PySliceResult>(m, "SliceResult")
+        .def_property_readonly("success",       [](const PySliceResult &r) { return r.success; })
+        .def_property_readonly("print_time_s",  [](const PySliceResult &r) { return r.print_time_s; })
+        .def_property_readonly("layer_count",   [](const PySliceResult &r) { return r.layer_count; })
+        .def_property_readonly("filament_g",    [](const PySliceResult &r) { return r.filament_g; })
+        .def_property_readonly("filament_mm",   [](const PySliceResult &r) { return r.filament_mm; })
+        .def_property_readonly("gcode_3mf_path",[](const PySliceResult &r) { return r.gcode_path; })
+        .def_property_readonly("error",         [](const PySliceResult &r) { return r.error; });
+
+    // ---- SliceJob ---------------------------------------------------------
+    py::class_<PySliceJob>(m, "SliceJob")
+        .def_property_readonly("done", [](const PySliceJob &j) {
+            auto *plater = plater_or_throw("SliceJob.done");
+            GUI::PartPlate *plate = plate_or_throw(j.plate_idx, "SliceJob.done");
+            return plate->is_slice_result_valid() ||
+                   (!plater->is_background_process_slicing() &&
+                    !plater->is_background_process_update_scheduled());
+        })
+        .def_property_readonly("progress", [](const PySliceJob &) {
+            // Pollable progress placeholder; push progress is M5. Percent is
+            // not exposed publicly off the process, so report slicing state.
+            auto *plater = plater_or_throw("SliceJob.progress");
+            const char *stage = plater->is_background_process_slicing() ? "slicing" : "idle";
+            return py::make_tuple(py::none(), std::string(stage));
+        })
+        .def("cancel", [](const PySliceJob &) {
+            plater_or_throw("SliceJob.cancel")->background_process().stop();
+        })
+        .def("wait", [](const PySliceJob &j, py::object timeout) -> PySliceResult {
+            // Runs on the wx main thread (Python's thread in this model). Pump
+            // the event loop so the slicing worker's completion/progress events
+            // are delivered, polling the plate's validity — a controlled event
+            // pump, NOT a nested modal loop. GIL is released while pumping.
+            main_thread("SliceJob.wait");
+            auto *plater = plater_or_throw("SliceJob.wait");
+            const double timeout_s = timeout.is_none() ? 300.0 : timeout.cast<double>();
+
+            PySliceResult res;
+            {
+                py::gil_scoped_release nogil;
+                using clock = std::chrono::steady_clock;
+                const auto t0 = clock::now();
+                const auto start_grace = std::chrono::milliseconds(6000);
+                GUI::PartPlate *plate = plater->get_partplate_list().get_plate(j.plate_idx);
+                bool ever_busy = false;
+                for (;;) {
+                    if (wxTheApp != nullptr) wxTheApp->Yield(true);  // deliver events
+                    if (plate != nullptr && plate->is_slice_result_valid()) {
+                        res.success = true; break;
+                    }
+                    const bool busy = plater->is_background_process_slicing() ||
+                                      plater->is_background_process_update_scheduled();
+                    if (busy) ever_busy = true;
+                    const auto elapsed = clock::now() - t0;
+                    if (ever_busy && !busy) {
+                        // It ran and stopped without producing a valid result.
+                        // Give the completion event a few more turns to land.
+                        for (int k = 0; k < 10 && !plate->is_slice_result_valid(); ++k) {
+                            if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                            wxMilliSleep(50);
+                        }
+                        if (plate->is_slice_result_valid()) { res.success = true; }
+                        else { res.success = false;
+                               res.error = "slicing stopped without a valid result (slice error)"; }
+                        break;
+                    }
+                    if (!ever_busy && elapsed > start_grace) {
+                        res.success = false;
+                        res.error = "slicing never started — plate not sliceable "
+                                    "(invalid/empty config or objects off the plate)";
+                        break;
+                    }
+                    if (elapsed > std::chrono::duration<double>(timeout_s)) {
+                        res.success = false;
+                        res.error = "timeout waiting for slice";
+                        break;
+                    }
+                    wxMilliSleep(40);
+                }
+            }
+            if (res.success) fill_slice_result(j.plate_idx, res);
+            return res;
+        }, py::arg("timeout") = py::none());
+
     // ---- Document ---------------------------------------------------------
     py::class_<PyDocument>(m, "Document")
         // Kept from M0 for continuity:
@@ -381,7 +519,23 @@ void register_object_model(py::module_ &m)
         })
         .def_property_readonly("printer_config", [](const PyDocument &) {
             return PyConfig{ConfigSource::Printer};
-        });
+        })
+        // ---- M3 slicing ---------------------------------------------------
+        .def("slice", [](const PyDocument &, py::object plate) {
+            auto *plater = plater_or_throw("Document.slice");
+            auto &list = plater->get_partplate_list();
+            int idx;
+            if (plate.is_none()) {
+                idx = list.get_curr_plate_index();
+            } else {
+                idx = plate.cast<int>();
+                if (idx < 0 || idx >= list.get_plate_count())
+                    throw std::runtime_error("plate index out of range");
+                list.select_plate(idx);   // reslice targets the current plate
+            }
+            plater->reslice();            // starts the background slicing worker
+            return PySliceJob{idx};
+        }, py::arg("plate") = py::none());
 
     // ---- Application ------------------------------------------------------
     py::class_<PyApp>(m, "Application")
