@@ -1500,6 +1500,22 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_develop_mode  = create_item_checkbox(_L("Develop mode"), page, _L("Develop mode"), 50, "developer_mode");
     auto item_skip_ams_blacklist_check  = create_item_checkbox(_L("Skip AMS blacklist check"), page, _L("Skip AMS blacklist check"), 50, "skip_ams_blacklist_check");
 
+    // pyslic3r: opt-in version override for the unofficial-build cloud gate.
+    // Shipped OFF + BLANK. The user supplies the version; the project does not.
+    auto item_force_client_version = create_item_checkbox(
+        _L("Force reported studio version (advanced \u2014 at your own risk)"), page,
+        _L("Report a custom version to Bambu Cloud instead of this build's real "
+           "version, to work around the unofficial-build gate on cloud features "
+           "(camera, cloud dispatch). OFF by default. You supply the version "
+           "string below; this project ships it blank. Enabling this may breach "
+           "Bambu's Terms of Service and put your account at risk."),
+        50, "force_client_version");
+    auto item_forced_client_version = create_item_input(
+        _L("Version to report"), _L(""), page,
+        _L("Exact version string to report, e.g. 02.01.01.52. Only used when the "
+           "box above is ticked. Left blank, nothing is overridden."),
+        "forced_client_version");
+
     sizer_page->Add(title_general_settings, 0, wxEXPAND, 0);
     sizer_page->Add(item_language, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_region, 0, wxTOP, FromDIP(3));
@@ -1596,6 +1612,8 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(title_develop_mode, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_develop_mode, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_skip_ams_blacklist_check, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_force_client_version, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_forced_client_version, 0, wxTOP, FromDIP(3));
 
     page->SetSizer(sizer_page);
     page->Layout();

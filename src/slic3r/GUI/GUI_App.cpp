@@ -2647,7 +2647,17 @@ std::map<std::string, std::string> GUI_App::get_extra_header()
     std::map<std::string, std::string> extra_headers;
     extra_headers.insert(std::make_pair("X-BBL-Client-Type", "slicer"));
     extra_headers.insert(std::make_pair("X-BBL-Client-Name", SLIC3R_APP_NAME));
-    extra_headers.insert(std::make_pair("X-BBL-Client-Version", VersionInfo::convert_full_version(SLIC3R_VERSION)));
+    // pyslic3r: optional user-forced client version (Develop Mode setting).
+    // Shipped OFF + BLANK so the app deliberately fails cloud-gated ops on this
+    // unofficial build. If the user opts in (at their own responsibility) we
+    // report the version string THEY supply instead of this build's real one.
+    std::string client_version = VersionInfo::convert_full_version(SLIC3R_VERSION);
+    if (app_config && app_config->get_bool("force_client_version")) {
+        const std::string forced = app_config->get("forced_client_version");
+        if (!forced.empty())
+            client_version = VersionInfo::convert_full_version(forced);
+    }
+    extra_headers.insert(std::make_pair("X-BBL-Client-Version", client_version));
 #if defined(__WINDOWS__)
 #ifdef _M_X64
     extra_headers.insert(std::make_pair("X-BBL-OS-Type", "windows"));
