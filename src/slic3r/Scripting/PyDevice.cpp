@@ -41,6 +41,12 @@
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Jobs/PrintJob.hpp"      // PrintPrepareData
 #include "slic3r/Utils/bambu_networking.hpp" // BBL::PrintParams
+#include "libslic3r/ProjectTask.hpp"            // Slic3r::FilamentInfo
+#include "libslic3r/PresetBundle.hpp"           // PresetBundle
+#include "slic3r/GUI/DeviceCore/DevMapping.h"   // DevMappingUtil (auto-mapper)
+#include "slic3r/GUI/DeviceCore/DevDefs.h"      // VIRTUAL_TRAY_MAIN_ID / DEPUTY
+#include "slic3r/GUI/BitmapCache.hpp"           // BitmapCache::parse_color4
+#include <cstdio>                               // std::snprintf
 
 namespace py = pybind11;
 using namespace Slic3r;
@@ -100,6 +106,117 @@ std::map<std::string, MachineObject *> all_machines(const char *what)
     for (auto &kv : dm->get_user_machinelist())            // account-bound (cloud)
         if (kv.second != nullptr) out.emplace(kv.first, kv.second);
     return out;
+}
+
+// Build the full AMS mapping table (v0 array + v1 {ams_id,slot_id} array +
+// info table) via the app's own auto-mapper. A dispatch that sends only a bare
+// v0 mapping makes the printer fail with "Failed to get AMS mapping table"
+// (HMS 0700-8012). Single-nozzle only; mirrors SelectMachineDialog
+// do_ams_mapping + get_ams_mapping_result (FROM_NORMAL). Fills
+// params.ams_mapping / ams_mapping2 / ams_mapping_info. Returns false if no
+// valid mapping was produced (caller then falls back to the manual string).
+bool build_ams_mapping(MachineObject *mo, GUI::Plater *plater, int plate_idx,
+                       bool use_ams, BBL::PrintParams &params)
+{
+    if (mo == nullptr || plater == nullptr) return false;
+    PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+    if (pb == nullptr) return false;
+
+    auto &list = plater->get_partplate_list();
+    GUI::PartPlate *pp = list.get_plate(plate_idx);
+    if (pp == nullptr) return false;
+
+    // Per-filament preset metadata, indexed to match filament_presets.
+    struct PInfo { std::string filament_id, setting_id, type; };
+    std::vector<PInfo> preset_info;
+    for (const auto &name : pb->filament_presets) {
+        PInfo pi;
+        Preset *preset = pb->filaments.find_preset(name);
+        if (preset != nullptr) {
+            pi.filament_id = preset->filament_id;
+            pi.setting_id  = preset->setting_id;
+            std::string disp;
+            pi.type = preset->get_filament_type(disp);
+        }
+        preset_info.push_back(std::move(pi));
+    }
+
+    // Input filament list from the plate's used filaments (1-based -> 0-based).
+    std::vector<int> used = pp->get_used_filaments();
+    std::vector<FilamentInfo> in_filaments;
+    for (size_t i = 0; i < used.size(); ++i) {
+        int u = used[i] - 1;
+        if (u < 0 || u >= (int)preset_info.size()) continue;
+        std::string colour = pb->project_config.opt_string("filament_colour",
+                                                           (unsigned int)u);
+        unsigned char rgba[4] = {0, 0, 0, 255};
+        GUI::BitmapCache::parse_color4(colour, rgba);
+        char cbuf[10];
+        std::snprintf(cbuf, sizeof(cbuf), "#%02X%02X%02X%02X",
+                      rgba[0], rgba[1], rgba[2], rgba[3]);
+        FilamentInfo info;
+        info.id          = u;
+        info.type        = preset_info[u].type;
+        info.filament_id = preset_info[u].filament_id;
+        info.setting_id  = preset_info[u].setting_id;
+        info.color       = cbuf;
+        in_filaments.push_back(std::move(info));
+    }
+    if (in_filaments.empty()) return false;
+
+    if (!mo->HasAms()) use_ams = false;
+    std::vector<bool> map_opt = use_ams
+        ? std::vector<bool>{false, true, false, false}   // USE_RIGHT_AMS
+        : std::vector<bool>{false, false, false, true};  // USE_RIGHT_EXT
+
+    std::vector<FilamentInfo> result;
+    if (DevMappingUtil::ams_filament_mapping(mo, in_filaments, result, map_opt) != 0)
+        return false;
+    if (!DevMappingUtil::is_valid_mapping_result(mo, result))
+        return false;
+
+    nlohmann::json v0   = nlohmann::json::array();
+    nlohmann::json v1   = nlohmann::json::array();
+    nlohmann::json info = nlohmann::json::array();
+    for (int i = 0; i < (int)pb->filament_presets.size(); ++i) {
+        int tray_id = -1;
+        nlohmann::json item_v1;
+        item_v1["ams_id"]  = 0xff;
+        item_v1["slot_id"] = 0xff;
+        nlohmann::json item;
+        item["ams"]          = tray_id;
+        item["targetColor"]  = "";
+        item["filamentId"]   = "";
+        item["filamentType"] = "";
+        for (int k = 0; k < (int)result.size(); ++k) {
+            if (result[k].id != i) continue;
+            tray_id              = result[k].tray_id;
+            item["ams"]          = tray_id;
+            item["filamentType"] = result[k].type;
+            item["filamentId"]   = result[k].filament_id;
+            item["sourceColor"]  = in_filaments[k].color;
+            item["targetColor"]  = result[k].color;
+            if (tray_id == VIRTUAL_TRAY_MAIN_ID || tray_id == VIRTUAL_TRAY_DEPUTY_ID)
+                tray_id = -1;
+            try {
+                if (result[k].ams_id.empty() || result[k].slot_id.empty()) {
+                    item_v1["ams_id"]  = VIRTUAL_TRAY_MAIN_ID;
+                    item_v1["slot_id"] = VIRTUAL_TRAY_MAIN_ID;
+                } else {
+                    item_v1["ams_id"]  = std::stoi(result[k].ams_id);
+                    item_v1["slot_id"] = std::stoi(result[k].slot_id);
+                }
+            } catch (...) {}
+            break;
+        }
+        v0.push_back(tray_id);
+        v1.push_back(item_v1);
+        info.push_back(item);
+    }
+    params.ams_mapping      = v0.dump();
+    params.ams_mapping2     = v1.dump();
+    params.ams_mapping_info = info.dump();
+    return true;
 }
 
 const char *hms_level_str(Slic3r::HMSMessageLevel l)
@@ -371,7 +488,11 @@ void register_device(py::module_ &m)
             params.plate_index     = idx + 1;   // 1-based on the wire
             params.project_name    = project_name;
             params.task_use_ams    = use_ams;
-            params.ams_mapping     = ams_mapping;
+            // Full AMS mapping table via the app's auto-mapper (a bare v0
+            // string alone -> "Failed to get AMS mapping table"). A non-empty
+            // manual ams_mapping still wins only if the auto-map can't run.
+            if (!(use_ams && build_ams_mapping(mo, plater, idx, use_ams, params)))
+                params.ams_mapping = ams_mapping;
             params.task_bed_leveling     = bed_leveling;
             params.task_flow_cali        = flow_cali;
             params.task_record_timelapse = timelapse;
@@ -490,7 +611,11 @@ void register_device(py::module_ &m)
             params.plate_index     = idx + 1;   // 1-based on the wire
             params.project_name    = project_name;
             params.task_use_ams    = use_ams;
-            params.ams_mapping     = ams_mapping;
+            // Full AMS mapping table via the app's auto-mapper (a bare v0
+            // string alone -> "Failed to get AMS mapping table"). A non-empty
+            // manual ams_mapping still wins only if the auto-map can't run.
+            if (!(use_ams && build_ams_mapping(mo, plater, idx, use_ams, params)))
+                params.ams_mapping = ams_mapping;
 
             py::dict out;
             out["dev_id"]          = params.dev_id;
