@@ -24,6 +24,9 @@
 #include <pybind11/embed.h>
 
 #include <wx/app.h>
+#include <wx/dialog.h>
+#include <wx/timer.h>
+#include <wx/toplevel.h>
 #include <wx/version.h>
 
 #include <boost/log/trivial.hpp>
@@ -56,6 +59,37 @@ struct M0Results
 
 M0Results   s_results;
 std::thread s_worker;
+
+// Headless modal auto-dismisser. Run offscreen, cloud/device operations can
+// pop informational MessageDialogs (e.g. GUI_App::process_network_msg emits
+// "update_studio"/"wait_info" because a from-source build isn't a recognised
+// official Studio version) — a ShowModal with no human to click it wedges the
+// app. This repeating timer fires even inside a nested ShowModal loop and ends
+// any stray modal, so automated/headless runs never hang on one. (A real
+// deployment would instead capture such messages; here we just dismiss them.)
+class ModalDismissTimer : public wxTimer
+{
+public:
+    void Notify() override
+    {
+        for (wxWindow *w : wxTopLevelWindows)
+            if (auto *dlg = dynamic_cast<wxDialog *>(w))
+                if (dlg->IsModal()) {
+                    BOOST_LOG_TRIVIAL(warning) << "pyslic3r: auto-dismissing headless modal";
+                    dlg->EndModal(wxID_OK);
+                }
+    }
+};
+// Heap-allocated at Start() time (NOT a static global — a wxTimer constructed
+// before wxApp exists doesn't register with the event loop).
+ModalDismissTimer *s_modal_dismisser = nullptr;
+
+void start_modal_dismisser()
+{
+    if (s_modal_dismisser == nullptr)
+        s_modal_dismisser = new ModalDismissTimer();
+    s_modal_dismisser->Start(200);
+}
 
 void check(bool ok, const std::string &what)
 {
@@ -255,6 +289,9 @@ void run_selftest_on_main()
     BOOST_LOG_TRIVIAL(info) << "pyslic3r M0 self-test starting";
     const long expected_count = std::atol(env_or("PYSLIC3R_M0_EXPECT_OBJECTS", "2").c_str());
 
+    // Dismiss any stray headless modal (see ModalDismissTimer) for the whole run.
+    start_modal_dismisser();
+
     load_fixtures_on_main();
     if (s_results.failed) { finalize_and_exit(); }
 
@@ -344,6 +381,21 @@ void run_selftest_on_main()
             check(true, "M4: device plane asserts passed (" + script + ")");
         } catch (const std::exception &e) {
             check(false, std::string("M4: device plane asserts failed: ") + e.what());
+        }
+    }
+
+    // ---- SEND: slice + camera_url + DRY-RUN send (no dispatch) -------------
+    if (std::getenv("PYSLIC3R_SEND_TEST") != nullptr && !s_results.failed) {
+        const std::string script = env_or("PYSLIC3R_SEND_SCRIPT", "");
+        try {
+            py::gil_scoped_acquire gil;
+            py::object ns = py::module_::import("__main__").attr("__dict__");
+            if (script.empty())
+                throw std::runtime_error("PYSLIC3R_SEND_SCRIPT not set");
+            py::eval_file(script, ns);
+            check(true, "SEND: camera_url + dry-run send asserts passed (" + script + ")");
+        } catch (const std::exception &e) {
+            check(false, std::string("SEND: asserts failed: ") + e.what());
         }
     }
 

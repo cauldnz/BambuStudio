@@ -15,9 +15,13 @@
 
 #include "PyBindings.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #include <pybind11/stl.h>
 
@@ -33,6 +37,10 @@
 #include "slic3r/GUI/DeviceCore/DevExtruderSystem.h"
 #include "slic3r/GUI/DeviceCore/DevChamber.h"
 #include "slic3r/GUI/DeviceCore/DevHMS.h"
+#include "slic3r/GUI/Plater.hpp"
+#include "slic3r/GUI/PartPlate.hpp"
+#include "slic3r/GUI/Jobs/PrintJob.hpp"      // PrintPrepareData
+#include "slic3r/Utils/bambu_networking.hpp" // BBL::PrintParams
 
 namespace py = pybind11;
 using namespace Slic3r;
@@ -59,6 +67,14 @@ DeviceManager *devmgr(const char *what)
 {
     dev_main_thread(what);
     return GUI::wxGetApp().getDeviceManager();
+}
+
+GUI::Plater *plater_dev(const char *what)
+{
+    dev_main_thread(what);
+    GUI::Plater *p = GUI::wxGetApp().plater();
+    if (p == nullptr) throw std::runtime_error("no active document");
+    return p;
 }
 
 bool logged_in(const char *what)
@@ -269,7 +285,157 @@ void register_device(py::module_ &m)
                 d["hms"] = items;
             }
             return d;
-        }, py::arg("wait") = 0.0);
+        }, py::arg("wait") = 0.0)
+
+        // ---- camera (read-only) -------------------------------------------
+        .def("camera_url", [](const PyDevice &, double timeout) -> py::object {
+            // The liveview stream URL for the selected printer (bambu:///tutk|
+            // agora|rtsp|local). READ-ONLY. Async: the plugin invokes a
+            // callback with the URL; pump until it fires. Decoding an actual
+            // frame from this stream is a separate media-pipeline task (needs
+            // libBambuSource + ffmpeg) — deferred; this returns the URL an
+            // external player/decoder can consume.
+            NetworkAgent *a = agent("Device.camera_url");
+            DeviceManager *dm = devmgr("Device.camera_url");
+            if (a == nullptr || dm == nullptr) return py::none();
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr) throw std::runtime_error("no printer selected (device.select first)");
+
+            auto url = std::make_shared<std::string>();
+            auto got = std::make_shared<std::atomic<bool>>(false);
+            a->get_camera_url(mo->get_dev_id(), [url, got](std::string u) {
+                *url = std::move(u);
+                got->store(true);
+            });
+            {
+                py::gil_scoped_release nogil;
+                using clock = std::chrono::steady_clock;
+                const auto t0 = clock::now();
+                while (!got->load()) {
+                    if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                    if (clock::now() - t0 > std::chrono::duration<double>(timeout)) break;
+                    wxMilliSleep(60);
+                }
+            }
+            if (!got->load() || url->empty()) return py::none();
+            return py::str(*url);
+        }, py::arg("timeout") = 10.0)
+
+        // ---- send (WRITE — dispatch a sliced plate to the printer) ---------
+        // dry_run=True does everything EXCEPT the dispatch (export the sliced
+        // 3mf, build the print params) — safe to call anytime. dry_run=False
+        // actually starts the print on the physical printer and MUST only be
+        // called with the user's explicit, per-print approval.
+        .def("send", [](const PyDevice &, py::object plate, bool dry_run,
+                        const std::string &project_name, bool use_ams,
+                        const std::string &ams_mapping, bool bed_leveling,
+                        bool flow_cali, bool timelapse) -> py::dict {
+            GUI::Plater *plater = plater_dev("Device.send");
+            DeviceManager *dm = devmgr("Device.send");
+            NetworkAgent *a = GUI::wxGetApp().getAgent();
+            if (dm == nullptr || a == nullptr)
+                throw std::runtime_error("device plane unavailable");
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr)
+                throw std::runtime_error("no printer selected (device.select first)");
+
+            auto &list = plater->get_partplate_list();
+            const int idx = plate.is_none() ? list.get_curr_plate_index()
+                                            : plate.cast<int>();
+            if (idx < 0 || idx >= list.get_plate_count())
+                throw std::runtime_error("plate index out of range");
+            GUI::PartPlate *pp = list.get_plate(idx);
+            if (pp == nullptr || !pp->is_slice_result_valid())
+                throw std::runtime_error("plate not sliced — call doc.slice() first");
+
+            // Export the sliced 3mf (+ config 3mf for cloud) — same as GUI send.
+            if (!plate.is_none()) list.select_plate(idx);
+            const int rc = plater->send_gcode(idx, nullptr);
+            if (rc != 0)
+                throw std::runtime_error("send_gcode export failed rc=" + std::to_string(rc));
+            plater->export_config_3mf(idx, nullptr);
+
+            GUI::PrintPrepareData jd;
+            plater->get_print_job_data(&jd);
+
+            BBL::PrintParams params;
+            params.dev_id          = mo->get_dev_id();
+            params.dev_name        = mo->get_dev_name();
+            params.connection_type = mo->connection_type();
+            params.dev_ip          = mo->get_dev_ip();
+            params.username        = "bblp";
+            params.password        = mo->get_access_code();
+            params.ftp_folder      = mo->get_ftp_folder();
+            params.filename        = jd._3mf_path.string();
+            params.config_filename = jd._3mf_config_path.string();
+            params.plate_index     = idx + 1;   // 1-based on the wire
+            params.project_name    = project_name;
+            params.task_use_ams    = use_ams;
+            params.ams_mapping     = ams_mapping;
+            params.task_bed_leveling     = bed_leveling;
+            params.task_flow_cali        = flow_cali;
+            params.task_record_timelapse = timelapse;
+            params.auto_bed_leveling     = bed_leveling ? 2 : 0;
+            params.auto_flow_cali        = flow_cali ? 2 : 0;
+
+            py::dict out;
+            out["dev_id"]      = params.dev_id;
+            out["gcode_3mf"]   = params.filename;
+            out["config_3mf"]  = params.config_filename;
+            out["plate_index"] = params.plate_index;
+            out["connection"]  = params.connection_type;
+
+            if (dry_run) {
+                out["dry_run"]    = true;
+                out["dispatched"] = false;
+                out["ready"]      = !params.filename.empty();
+                return out;
+            }
+
+            // === REAL DISPATCH — physical print starts here. ===============
+            // Run start_print on a worker thread and pump the main loop, so the
+            // agent's MQTT confirmation (polled by wait_fn) can be delivered —
+            // mirrors the GUI's PrintJob (a background job).
+            std::atomic<bool> done{false};
+            std::atomic<int>  sret{-999};
+            std::mutex        info_mtx;
+            std::string       info_snap;
+            int               stage_snap = -1;
+            auto update_fn = [&](int stage, int /*code*/, std::string info) {
+                std::lock_guard<std::mutex> lk(info_mtx);
+                stage_snap = stage; info_snap = std::move(info);
+            };
+            auto cancel_fn = []() { return false; };
+            auto wait_fn   = [](int, std::string) { return true; };
+
+            std::thread worker([&]() {
+                const int r = a->start_print(params, update_fn, cancel_fn, wait_fn);
+                sret.store(r);
+                done.store(true);
+            });
+            {
+                py::gil_scoped_release nogil;
+                while (!done.load()) {
+                    if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                    wxMilliSleep(80);
+                }
+            }
+            worker.join();
+
+            out["dry_run"]     = false;
+            out["dispatched"]  = (sret.load() == 0);
+            out["result_code"] = sret.load();
+            {
+                std::lock_guard<std::mutex> lk(info_mtx);
+                out["stage"] = stage_snap;
+                out["info"]  = info_snap;
+            }
+            return out;
+        }, py::arg("plate") = py::none(), py::arg("dry_run") = false,
+           py::arg("project_name") = std::string("pyslic3r"),
+           py::arg("use_ams") = false, py::arg("ams_mapping") = std::string(),
+           py::arg("bed_leveling") = false, py::arg("flow_cali") = false,
+           py::arg("timelapse") = false);
 
     m.attr("_device_singleton") = py::cast(PyDevice{});
 }

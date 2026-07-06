@@ -111,16 +111,45 @@ server MQTT connection and re-issue the fetch (a fresh instance can race its own
 login). Also learned: **changing the account password unbinds the printer** —
 rebind after a credential change.
 
-## Deferred — the M4 write half
+## Camera + send — implemented
 
-- `device.send(gcode_3mf, plate, ams_mapping)` — dispatch a sliced job. **Gated
-  behind explicit, per-print user approval** (hard rule — never dispatch a print
-  without asking).
-- `device.camera_frame()` — a single liveview frame (`NetworkAgent::get_camera_url`
-  → RTSP/TUTK). Read-only; entry point mapped.
+```
+app.device.camera_url(timeout=10)              -> str | None  # liveview stream URL
+app.device.send(plate=None, dry_run=False, …)  -> dict        # dispatch a sliced plate
+```
+
+- **`camera_url()`** returns the liveview stream URL (`bambu:///tutk|agora|rtsp`).
+  A decoded *frame* is a separate media-pipeline task (libBambuSource + ffmpeg —
+  deferred). **Environmental limit:** the cloud rejects camera access from our
+  *unofficial* (from-source) build with an `update_studio` message → so on this
+  build `camera_url()` returns `None` (does NOT hang — see the dismisser below).
+  The binding is correct and should work on an official build.
+- **`send()`** mirrors the GUI: `Plater::send_gcode` exports the sliced 3mf (+
+  config 3mf), then `NetworkAgent::start_print(PrintParams, …)`. **`dry_run=True`
+  does everything except the dispatch** (export + build params) — verified live:
+  sliced fixture → `dispatched:False, ready:True, connection:'cloud'`, the
+  gcode.3mf on disk. **`dry_run=False` is the real dispatch and MUST only run with
+  explicit, per-print user approval** (hard rule). The real path runs `start_print`
+  on a worker thread while pumping the main loop (mirrors the GUI's PrintJob).
+
+## Headless modal auto-dismisser
+
+Run offscreen, cloud/device ops can pop `MessageDialog`s (e.g.
+`process_network_msg` emits `update_studio`/`wait_info` because a from-source build
+isn't a recognised Studio version) — a `ShowModal` with no human wedges the app.
+A repeating `wxTimer` (heap-allocated — a static one doesn't register before the
+wx app exists) ends any stray modal, firing even inside a nested `ShowModal` loop.
+This is why `camera_url()` degrades to `None` instead of hanging, and is general
+headless-robustness the deployment needs.
+
+## Still deferred
+
+- **Real print dispatch** (`send(dry_run=False)`) — coded, but only ever run with
+  explicit per-print approval; not exercised.
 - **Push status/progress events** with reconnect + exponential backoff
   (cadence-sensitive — push-first, `pushall` only on reconnect). Shared machinery
   with M5's event → MCP-notification path.
+- **Decoded camera frame** — needs the AV pipeline (libBambuSource + ffmpeg).
 
 ## Environment
 
