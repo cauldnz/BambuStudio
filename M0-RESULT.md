@@ -43,9 +43,9 @@ on. It is proven.
 | interpreter finalize (explicit `host_shutdown`) | 2.31 ms |
 
 Interpreter init is ~8 ms — negligible, and one-time. **No Intel split-lock startup
-stall to report:** the host is an AMD Ryzen 7 PRO 8845HS under KVM, so the split-lock
+stall to report:** the host is an an AMD CPU under KVM, so the split-lock
 `#AC` path LAUNCH.md flags (Intel-specific) does not apply here. Worth re-checking on
-the Intel Unraid box at deployment.
+Intel deployment hardware.
 
 ---
 
@@ -143,7 +143,7 @@ embed/marshal design and only matters for the automated offscreen harness.
 
 - **Base:** `cauldnz/BambuStudio` @ `ba4f27b` (fork of `bambulab/BambuStudio`), Bambu
   Studio **02.08.00.50**. M0 branch `feat/py-runtime-m0`.
-- **OS:** Ubuntu 26.04 LTS (dev VM, KVM, AMD Ryzen 7 PRO 8845HS, 6 cores / 20 GB).
+- **OS:** Ubuntu 26.04 LTS (dev VM, KVM, an AMD CPU, 6 cores / 20 GB).
 - **Compiler:** GCC 15.2.0 (`Ubuntu 15.2.0-16ubuntu1`), libstdc++. GNU ld 2.46.
 - **CMake:** 4.2.3. **Ninja:** 1.13.2.
 - **Python:** 3.14.4 (`Development.Embed`). **pybind11:** 3.0.1 (`pybind11-dev`).

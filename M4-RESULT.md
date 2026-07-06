@@ -75,14 +75,14 @@ re-resolved per call (a stale handle can't dereference a freed `MachineObject`).
   `libbambu_networking.so`, `libBambuSource.so`, `libagora_rtc_sdk.so`
   (camera/liveview), `liblive555.so` into `<datadir>/plugins/`. Loads at startup
   after a restart. The version-pin risk did **not** bite.
-- **Interactive login rig (for the human):** Xvfb `:1` + fluxbox + x11vnc on
+- **Interactive login rig (for the human):** Xvfb `:1` + VNC on
   `:5901`, BambuStudio under `dbus-run-session`, connected with a VNC client. Used
   once to log in; the headless tests then reuse the persisted session.
 
 ## The SSO limitation (important product constraint)
 
 The **OSS Linux build could not complete Apple ID (third-party SSO) login** —
-Chris's real account uses Apple ID, and the login webview couldn't finish the
+the maintainer's real account uses third-party (Apple/Google) SSO, and the login webview couldn't finish the
 Apple flow; there's also no way to add a password to an existing SSO account.
 Workaround: a **password-based** test account (`<test-account-email>`, id `<redacted-user-id>`).
 **This belongs in SPEC §5:** any end user on Apple/Google SSO can't use the cloud
