@@ -29,12 +29,26 @@ printers = dev.printers()
 print("M4 diag: bound printers      =",
       [(p.dev_id, p.name, p.online) for p in printers])
 
-# If a printer is bound, exercise select + status read-back (READ-ONLY, safe).
+# If a printer is bound, exercise select + LIVE status telemetry (READ-ONLY).
 if printers:
     p = printers[0]
     dev.select(p.dev_id)
     print("M4 diag: selected            =", (dev.selected.dev_id if dev.selected else None))
-    print("M4 diag: status              =", dev.status())
+    # wait>0: force subscribe + pushall + wait for the printer's status push.
+    st = dev.status(wait=25)
+    print("M4 diag: connected           =", st.get("connected"),
+          "awaiting_push =", st.get("awaiting_push"))
+    print("M4 diag: print_status        =", repr(st.get("print_status")),
+          "stage =", repr(st.get("stage")))
+    print("M4 diag: bed_temp            =", st.get("bed_temp"), "/", st.get("bed_temp_target"))
+    print("M4 diag: nozzles             =", st.get("nozzles"))
+    print("M4 diag: chamber             =", st.get("chamber_temp"), "/", st.get("chamber_temp_target"))
+    print("M4 diag: hms                 =", st.get("hms"))
+    # Telemetry sanity: if the printer is online and we got a push, we should
+    # have real ambient temperatures (a bed reading > 0).
+    if p.online and not st.get("awaiting_push", True):
+        assert st.get("bed_temp", 0) > 0, f"push received but no bed temp: {st}"
+        print("M4 diag: LIVE TELEMETRY OK (received status push from the printer)")
 else:
     sel = dev.selected
     print("M4 diag: selected            =", (sel.dev_id if sel else None))

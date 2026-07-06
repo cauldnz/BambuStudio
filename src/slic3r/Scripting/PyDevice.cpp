@@ -29,6 +29,10 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/GUI/DeviceCore/DevManager.h"
 #include "slic3r/GUI/DeviceManager.hpp"
+#include "slic3r/GUI/DeviceCore/DevBed.h"
+#include "slic3r/GUI/DeviceCore/DevExtruderSystem.h"
+#include "slic3r/GUI/DeviceCore/DevChamber.h"
+#include "slic3r/GUI/DeviceCore/DevHMS.h"
 
 namespace py = pybind11;
 using namespace Slic3r;
@@ -80,6 +84,17 @@ std::map<std::string, MachineObject *> all_machines(const char *what)
     for (auto &kv : dm->get_user_machinelist())            // account-bound (cloud)
         if (kv.second != nullptr) out.emplace(kv.first, kv.second);
     return out;
+}
+
+const char *hms_level_str(Slic3r::HMSMessageLevel l)
+{
+    switch (l) {
+    case Slic3r::HMS_FATAL:   return "fatal";
+    case Slic3r::HMS_SERIOUS: return "serious";
+    case Slic3r::HMS_COMMON:  return "common";
+    case Slic3r::HMS_INFO:    return "info";
+    default:                  return "unknown";
+    }
 }
 
 struct PyDevice {};
@@ -146,17 +161,24 @@ void register_device(py::module_ &m)
             NetworkAgent *a = GUI::wxGetApp().getAgent();
             if (a == nullptr || !a->is_user_login()) return size_t(0);
 
-            dm->update_user_machine_list_info();
-            {
-                py::gil_scoped_release nogil;
-                using clock = std::chrono::steady_clock;
-                const auto t0 = clock::now();
-                for (;;) {
-                    if (wxTheApp != nullptr) wxTheApp->Yield(true);   // run the parse
-                    if (!dm->get_user_machinelist().empty()) break;  // populated
-                    if (clock::now() - t0 > std::chrono::seconds(8)) break;
-                    wxMilliSleep(80);
+            py::gil_scoped_release nogil;
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            // Re-issue the fetch periodically once the server MQTT is up: a
+            // fresh instance's first fetch can race the login/connect, and the
+            // JSON parse is deferred (CallAfter). Stop as soon as the list
+            // populates. (An empty result is legitimate — nothing bound.)
+            clock::time_point last_fetch{};   // epoch => fetch on the first eligible turn
+            for (;;) {
+                if (wxTheApp != nullptr) wxTheApp->Yield(true);   // run the deferred parse
+                if (a->is_server_connected() &&
+                    clock::now() - last_fetch > std::chrono::seconds(3)) {
+                    dm->update_user_machine_list_info();
+                    last_fetch = clock::now();
                 }
+                if (!dm->get_user_machinelist().empty()) break;  // populated
+                if (clock::now() - t0 > std::chrono::seconds(15)) break;
+                wxMilliSleep(120);
             }
             return dm->get_user_machinelist().size();
         })
@@ -172,24 +194,82 @@ void register_device(py::module_ &m)
             if (dm == nullptr || !dm->set_selected_machine(dev_id))
                 throw std::runtime_error("could not select device: " + dev_id);
         }, py::arg("dev_id"))
-        .def("status", [](const PyDevice &) -> py::object {
-            // Status for the selected printer. None if nothing selected /
-            // unavailable. Direct MachineObject fields (temps/HMS come with the
-            // write half once a printer is bound to test against).
+        .def("status", [](const PyDevice &, double wait) -> py::object {
+            // Live status for the selected printer. None if nothing selected /
+            // unavailable. With wait>0, establish the telemetry: a headless
+            // offscreen app is never "studio active", so its app-subscribe
+            // never fires and no status flows — force the subscribe, request a
+            // full push, and pump the loop until the push lands (or timeout).
             DeviceManager *dm = devmgr("Device.status");
             if (dm == nullptr) return py::none();
             MachineObject *mo = dm->get_selected_machine();
             if (mo == nullptr) return py::none();
+
+            if (wait > 0.0) {
+                NetworkAgent *a = GUI::wxGetApp().getAgent();
+                if (a != nullptr) a->start_subscribe("app");
+                mo->reset_update_time();
+                mo->command_request_push_all(true);
+                py::gil_scoped_release nogil;
+                using clock = std::chrono::steady_clock;
+                const auto t0 = clock::now();
+                for (;;) {
+                    if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                    // connected AND a full status push received (is_connecting
+                    // = connected but push_count==0):
+                    if (mo->is_connected() && !mo->is_connecting()) break;
+                    if (clock::now() - t0 > std::chrono::duration<double>(wait)) break;
+                    mo->command_request_push_all(false);   // throttled to 3s internally
+                    wxMilliSleep(120);
+                }
+            }
+
             py::dict d;
-            d["dev_id"]         = mo->get_dev_id();
-            d["online"]         = mo->is_online();
-            d["print_status"]   = mo->print_status;          // RUNNING/PAUSE/FINISH/...
-            d["progress"]       = mo->mc_print_percent;      // 0..100
-            d["current_layer"]  = mo->curr_layer;
-            d["total_layers"]   = mo->total_layers;
-            d["remaining_s"]    = mo->mc_left_time;
+            d["dev_id"]        = mo->get_dev_id();
+            d["online"]        = mo->is_online();
+            d["connected"]     = mo->is_connected();
+            d["awaiting_push"] = mo->is_connecting();   // connected, no full status yet
+            d["print_status"]  = mo->print_status;      // RUNNING/PAUSE/FINISH/...
+            d["stage"]         = std::string(mo->get_curr_stage().ToUTF8().data());
+            d["progress"]      = mo->mc_print_percent;  // 0..100
+            d["current_layer"] = mo->curr_layer;
+            d["total_layers"]  = mo->total_layers;
+            d["remaining_s"]   = mo->mc_left_time;
+            d["subtask_name"]  = mo->subtask_name;
+
+            if (DevBed *bed = mo->GetBed()) {
+                d["bed_temp"]        = bed->GetBedTemp();
+                d["bed_temp_target"] = bed->GetBedTempTarget();
+            }
+            if (DevExtderSystem *ex = mo->GetExtderSystem()) {
+                py::list nozzles;
+                const int n = ex->GetTotalExtderCount();
+                for (int i = 0; i < n; ++i) {
+                    py::dict nz;
+                    nz["current"] = ex->GetNozzleTempCurrent(i);
+                    nz["target"]  = ex->GetNozzleTempTarget(i);
+                    nozzles.append(nz);
+                }
+                d["nozzles"] = nozzles;
+            }
+            if (std::shared_ptr<DevChamber> ch = mo->GetChamber()) {
+                if (ch->HasChamber()) {
+                    d["chamber_temp"]        = ch->GetChamberTemp();
+                    d["chamber_temp_target"] = ch->GetChamberTempTarget();
+                }
+            }
+            if (DevHMS *hms = mo->GetHMS()) {
+                py::list items;
+                for (const auto &it : hms->GetHMSItems()) {
+                    py::dict h;
+                    h["level"] = std::string(hms_level_str(it.get_level()));
+                    h["code"]  = it.get_long_error_code();
+                    items.append(h);
+                }
+                d["hms"] = items;
+            }
             return d;
-        });
+        }, py::arg("wait") = 0.0);
 
     m.attr("_device_singleton") = py::cast(PyDevice{});
 }

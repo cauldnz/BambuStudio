@@ -53,8 +53,12 @@ app.device.refresh()          -> int          # fetch bound-printer list from cl
 app.device.printers()         -> list[BoundPrinter]   # account-bound (+ local)
 app.device.selected           -> BoundPrinter | None
 app.device.select(dev_id)     -> None
-app.device.status()           -> dict | None  # selected printer: state/%/layer/time
+app.device.status(wait=0.0)   -> dict | None  # live telemetry (wait>0 = establish it)
 BoundPrinter.dev_id / name / online / connection_type
+# status() dict: dev_id, online, connected, awaiting_push, print_status, stage,
+#   progress, current_layer, total_layers, remaining_s, subtask_name,
+#   bed_temp/bed_temp_target, nozzles[{current,target}], chamber_temp[/target],
+#   hms[{level, code}]
 ```
 
 All routed through the GUI's own `NetworkAgent` / `DeviceManager`
@@ -94,17 +98,26 @@ knows the bound printers after it fetches them from the cloud
 (`update_user_machine_list_info()` → `get_user_print_info`, then a deferred JSON
 parse); `refresh()` triggers that and pumps the loop until the list populates.
 
+## Live telemetry — DONE, verified against the real P2S
+
+`status(wait>0)` establishes and reads live telemetry. Headless is never "studio
+active" (the app-subscribe gate in `GUI_App`'s idle handler), so it force-calls
+`agent->start_subscribe("app")`, `command_request_push_all(true)`, and pumps the
+loop until `is_connecting()` clears (a full push arrived), then reads the rich
+fields. Verified live off an idle P2S: `print_status='FINISH'`, bed 16 °C /
+nozzle 19 °C / chamber 21 °C (real ambient), and it even surfaced a `serious`
+HMS alert (`0500060000020070`). `refresh()` was also hardened to wait for the
+server MQTT connection and re-issue the fetch (a fresh instance can race its own
+login). Also learned: **changing the account password unbinds the printer** —
+rebind after a credential change.
+
 ## Deferred — the M4 write half
 
-Now unblocked by the bound printer; still to build/test:
-- **Fuller live `status()`** — temps / HMS / full print state come via the
-  printer's MQTT push (a `pushall` after select/subscribe). The idle printer
-  currently reports the direct fields (all zero = idle); the richer telemetry
-  needs the MQTT-connect + wait-for-push path (bed/nozzle via
-  `GetBed()`/`GetExtderSystem()`, errors via `GetHMS()`).
 - `device.send(gcode_3mf, plate, ams_mapping)` — dispatch a sliced job. **Gated
   behind explicit, per-print user approval** (hard rule — never dispatch a print
   without asking).
+- `device.camera_frame()` — a single liveview frame (`NetworkAgent::get_camera_url`
+  → RTSP/TUTK). Read-only; entry point mapped.
 - **Push status/progress events** with reconnect + exponential backoff
   (cadence-sensitive — push-first, `pushall` only on reconnect). Shared machinery
   with M5's event → MCP-notification path.
