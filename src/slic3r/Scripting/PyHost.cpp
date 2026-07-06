@@ -2,9 +2,13 @@
 #include "PyBindings.hpp"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 #include <pybind11/embed.h>
 
@@ -82,6 +86,7 @@ void host_init()
     s_initialized = true;
 
     maybe_start_m0_selftest();
+    maybe_run_user_script();
 }
 
 void host_shutdown()
@@ -128,6 +133,56 @@ std::string py_eval_str(const std::string &expr)
         out = py::str(res).cast<std::string>();
     });
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Script runner — the general "run a .py against the live app" entry point.
+// ---------------------------------------------------------------------------
+
+void maybe_run_user_script()
+{
+    const char *path = std::getenv("PYSLIC3R_SCRIPT");
+    if (path == nullptr || *path == '\0')
+        return;
+
+    const char *exit_env = std::getenv("PYSLIC3R_SCRIPT_EXIT");
+    const bool  exit_after = (exit_env != nullptr && std::strcmp(exit_env, "1") == 0);
+    const std::string script = path;
+
+    // Defer one event-loop turn so post_init has settled and the document
+    // exists, then run the script ON the main thread — pyslic3r's bindings
+    // touch Plater/Model there. (A script that blocks, e.g. slice().wait(),
+    // pumps the loop itself; see SliceJob.wait.)
+    wxTheApp->CallAfter([script, exit_after]() {
+        int rc = 0;
+        {
+            py::gil_scoped_acquire gil;   // tight scope: released before any shutdown
+            try {
+                py::object ns = py::module_::import("__main__").attr("__dict__");
+                py::eval_file(script, ns);
+            } catch (const std::exception &e) {
+                rc = 1;
+                std::fprintf(stderr, "pyslic3r: script error in %s: %s\n",
+                             script.c_str(), e.what());
+                std::fflush(stderr);
+            }
+        }
+        std::printf("PYSLIC3R_SCRIPT: %s (%s)\n", rc == 0 ? "OK" : "ERROR", script.c_str());
+        std::fflush(stdout);
+
+        if (exit_after) {
+            // Batch mode: finalize the interpreter and exit without dragging
+            // the process through BambuStudio's flaky headless GUI teardown
+            // (same rationale as the self-test). GIL scope above has closed,
+            // so host_shutdown's parked-GIL reacquire is clean.
+            host_shutdown();
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::_Exit(rc);
+        }
+        // Otherwise leave the app running — the script has done its thing
+        // against the live session.
+    });
 }
 
 } // namespace pyslic3r
