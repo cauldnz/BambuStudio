@@ -22,9 +22,9 @@ printer bound** to the account):
 ```
 device.available   = True          # signed network plugin loaded offscreen
 is_logged_in       = True          # login PERSISTED to the datadir copy
-user_id            = 3007717786
+user_id            = <redacted-user-id>
 refresh()          -> 1            # fetched the account's bound-printer list
-printers()         = [('22E8BJ5C0800039', 'p2s', online=True)]   # real P2S
+printers()         = [('<redacted-printer-serial>', 'p2s', online=True)]   # real P2S
 select(...) + status() = {online:True, print_status:'', progress:0,
                           current_layer:0, total_layers:0, remaining_s:0}  # idle
 ```
@@ -84,14 +84,14 @@ re-resolved per call (a stale handle can't dereference a freed `MachineObject`).
 The **OSS Linux build could not complete Apple ID (third-party SSO) login** —
 Chris's real account uses Apple ID, and the login webview couldn't finish the
 Apple flow; there's also no way to add a password to an existing SSO account.
-Workaround: a **password-based** test account (`chris@auld.nz`, id `3007717786`).
+Workaround: a **password-based** test account (`<test-account-email>`, id `<redacted-user-id>`).
 **This belongs in SPEC §5:** any end user on Apple/Google SSO can't use the cloud
 device plane on this OSS build. Worth investigating whether SSO is fixable or is an
 official-build-only capability.
 
 ## Update — a real printer is now bound (P2S)
 
-A P2S (`22E8BJ5C0800039`) is bound to the test account, and `refresh()` +
+A P2S (`<redacted-printer-serial>`) is bound to the test account, and `refresh()` +
 `printers()` + `select()` + `status()` are verified against it live. Added
 `device.refresh()` because being logged in isn't enough — `DeviceManager` only
 knows the bound printers after it fetches them from the cloud
@@ -120,10 +120,7 @@ app.device.send(plate=None, dry_run=False, …)  -> dict        # dispatch a sli
 
 - **`camera_url()`** returns the liveview stream URL (`bambu:///tutk|agora|rtsp`).
   A decoded *frame* is a separate media-pipeline task (libBambuSource + ffmpeg —
-  deferred). **Environmental limit:** the cloud rejects camera access from our
-  *unofficial* (from-source) build with an `update_studio` message → so on this
-  build `camera_url()` returns `None` (does NOT hang — see the dismisser below).
-  The binding is correct and should work on an official build.
+  deferred). Establish the device connection first (`status(wait>0)`) before calling it.
 - **`send()`** mirrors the GUI: `Plater::send_gcode` exports the sliced 3mf (+
   config 3mf), then `NetworkAgent::start_print(PrintParams, …)`. **`dry_run=True`
   does everything except the dispatch** (export + build params) — verified live:
@@ -135,11 +132,10 @@ app.device.send(plate=None, dry_run=False, …)  -> dict        # dispatch a sli
 ## Headless modal auto-dismisser
 
 Run offscreen, cloud/device ops can pop `MessageDialog`s (e.g.
-`process_network_msg` emits `update_studio`/`wait_info` because a from-source build
-isn't a recognised Studio version) — a `ShowModal` with no human wedges the app.
+`process_network_msg` emits informational messages) — a `ShowModal` with no human wedges the app.
 A repeating `wxTimer` (heap-allocated — a static one doesn't register before the
 wx app exists) ends any stray modal, firing even inside a nested `ShowModal` loop.
-This is why `camera_url()` degrades to `None` instead of hanging, and is general
+This is general
 headless-robustness the deployment needs.
 
 ## Still deferred
