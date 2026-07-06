@@ -34,6 +34,7 @@
 #include "libslic3r/Print.hpp"                 // Print, PrintStatistics
 #include "libslic3r/GCode/GCodeProcessor.hpp"  // GCodeProcessorResult
 #include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
+#include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
@@ -43,6 +44,7 @@
 #include <boost/filesystem/path.hpp>
 #include <chrono>
 #include <cmath>
+#include <algorithm>   // std::sort
 #include <map>
 
 #include <wx/utils.h>   // wxMilliSleep
@@ -340,6 +342,69 @@ void register_object_model(py::module_ &m)
             auto *plater = plater_or_throw("Object.delete");
             (void) object_at(o.idx, "Object.delete");     // bounds-check
             plater->delete_object_from_model(o.idx);      // snapshots internally
+        })
+        // ---- paint-by-height: per-Z-band config overrides ------------------
+        // UI-parity: mirrors the object-list "Height range Modifier". Writes
+        // ModelObject::layer_config_ranges[{min_z,max_z}] and refreshes via
+        // changed_object, exactly like the GUI. `overrides` maps config keys to
+        // values (e.g. {"extruder": "2", "layer_height": "0.12"}). Re-slice after.
+        .def("add_height_range", [](const PyObject &o, double min_z, double max_z,
+                                    py::dict overrides) {
+            if (!(max_z > min_z))
+                throw std::runtime_error("max_z must be greater than min_z");
+            auto *plater = plater_or_throw("Object.add_height_range");
+            ModelObject *obj = object_at(o.idx, "Object.add_height_range");
+            GUI::Plater::TakeSnapshot snap(plater, "API: add height range");
+
+            const t_layer_height_range range{ min_z, max_z };
+            ModelConfig &cfg = obj->layer_config_ranges[range];   // creates entry
+
+            // Seed a well-formed range config the way the GUI does: a
+            // layer_height (from the object/preset) and extruder=0 ("use object").
+            double lh = 0.2;
+            {
+                const DynamicPrintConfig &oc = obj->config.get();
+                auto *pb = GUI::wxGetApp().preset_bundle;
+                if (oc.has("layer_height"))
+                    lh = oc.opt_float("layer_height");
+                else if (pb && pb->prints.get_edited_preset().config.has("layer_height"))
+                    lh = pb->prints.get_edited_preset().config.opt_float("layer_height");
+            }
+            cfg.set_key_value("layer_height", new ConfigOptionFloat(lh));
+            cfg.set_key_value("extruder",     new ConfigOptionInt(0));
+
+            // Apply caller overrides (serialized-string path, like Config.set).
+            for (auto kv : overrides) {
+                const std::string key = kv.first.cast<std::string>();
+                const std::string val = py::str(kv.second).cast<std::string>();
+                ConfigSubstitutionContext ctx{ ForwardCompatibilitySubstitutionRule::Disable };
+                cfg.set_deserialize(key, val, ctx);
+            }
+            plater->changed_object(int(o.idx));
+            return py::make_tuple(min_z, max_z);
+        }, py::arg("min_z"), py::arg("max_z"), py::arg("overrides") = py::dict())
+        .def("clear_height_ranges", [](const PyObject &o) {
+            auto *plater = plater_or_throw("Object.clear_height_ranges");
+            ModelObject *obj = object_at(o.idx, "Object.clear_height_ranges");
+            GUI::Plater::TakeSnapshot snap(plater, "API: clear height ranges");
+            obj->layer_config_ranges.clear();
+            plater->changed_object(int(o.idx));
+        })
+        .def("height_ranges", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.height_ranges");
+            py::list out;
+            for (const auto &kv : obj->layer_config_ranges) {
+                py::dict d;
+                d["min_z"] = kv.first.first;
+                d["max_z"] = kv.first.second;
+                py::dict ov;
+                const DynamicPrintConfig &c = kv.second.get();
+                for (const std::string &k : c.keys())
+                    ov[py::str(k)] = c.opt_serialize(k);
+                d["overrides"] = ov;
+                out.append(d);
+            }
+            return out;
         });
 
     // ---- Model ------------------------------------------------------------
@@ -394,6 +459,83 @@ void register_object_model(py::module_ &m)
         })
         .def_property_readonly("config", [](const PyPlate &p) {
             return PyConfig{ConfigSource::Plate, p.idx};
+        })
+        // ---- paint-by-height: colour changes (the multi-colour primitive) --
+        // UI-parity: mirrors the preview vertical-slider "add colour change".
+        // Writes Model::plates_custom_gcodes[plate] with ColorChange items
+        // (extruder is 1-based = AMS slot), then invalidates the slice result
+        // exactly as the slider handler does. Re-slice after (doc.slice()).
+        // `changes`: list of dicts, each {"z": <print_z>, "extruder": <1-based>,
+        //  optional "color": "#RRGGBB"} (colour auto-filled from the filament
+        //  preset colour when omitted).
+        .def("set_color_changes", [](const PyPlate &p, py::list changes) {
+            auto *plater = plater_or_throw("Plate.set_color_changes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+
+            std::vector<std::string> ext_colors =
+                plater->get_extruder_colors_from_plater_config();  // 0-based
+
+            CustomGCode::Info info;
+            info.mode = CustomGCode::Undef;
+            for (auto handle : changes) {
+                py::dict d = handle.cast<py::dict>();
+                CustomGCode::Item item;
+                item.type = CustomGCode::ColorChange;
+                if (!d.contains("z"))
+                    throw std::runtime_error("each colour change needs a 'z' (print_z)");
+                item.print_z = d["z"].cast<double>();
+                if (!d.contains("extruder"))
+                    throw std::runtime_error("each colour change needs an 'extruder' (1-based)");
+                item.extruder = d["extruder"].cast<int>();
+                if (item.extruder < 1)
+                    throw std::runtime_error("extruder is 1-based (AMS slot); must be >= 1");
+                if (d.contains("color") && !d["color"].is_none()) {
+                    item.color = d["color"].cast<std::string>();
+                } else {
+                    const int i0 = item.extruder - 1;
+                    item.color = (i0 >= 0 && i0 < int(ext_colors.size()))
+                                     ? ext_colors[i0] : std::string("#FFFFFF");
+                }
+                info.gcodes.push_back(std::move(item));
+            }
+            std::sort(info.gcodes.begin(), info.gcodes.end());
+            CustomGCode::check_mode_for_custom_gcode_per_print_z(info);
+
+            GUI::Plater::TakeSnapshot snap(plater, "API: set colour changes");
+            plater->model().plates_custom_gcodes[plate->get_index()] = std::move(info);
+            plate->update_slice_result_valid_state(false);
+            plater->schedule_background_process();
+        }, py::arg("changes"))
+        .def("clear_color_changes", [](const PyPlate &p) {
+            auto *plater = plater_or_throw("Plate.clear_color_changes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            GUI::Plater::TakeSnapshot snap(plater, "API: clear colour changes");
+            plater->model().plates_custom_gcodes.erase(plate->get_index());
+            plate->update_slice_result_valid_state(false);
+            plater->schedule_background_process();
+        })
+        .def("color_changes", [](const PyPlate &p) {
+            auto *plater = plater_or_throw("Plate.color_changes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            py::list out;
+            auto &m = plater->model().plates_custom_gcodes;
+            auto it = m.find(plate->get_index());
+            if (it == m.end()) return out;
+            for (const CustomGCode::Item &item : it->second.gcodes) {
+                py::dict d;
+                d["z"]        = item.print_z;
+                d["extruder"] = item.extruder;
+                d["color"]    = item.color;
+                d["type"]     = int(item.type);
+                out.append(d);
+            }
+            return out;
         });
 
     py::class_<PyPlateList>(m, "PlateList")
