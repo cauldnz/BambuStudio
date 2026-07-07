@@ -33,6 +33,11 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/GUI/DeviceCore/DevManager.h"
 #include "slic3r/GUI/DeviceManager.hpp"
+#include "slic3r/GUI/DeviceCore/DevFilaSystem.h"
+#include "slic3r/GUI/Printer/BambuTunnel.h"
+#include "libslic3r/Utils.hpp"
+#include <dlfcn.h>
+#include <cstdio>
 #include "slic3r/GUI/DeviceCore/DevBed.h"
 #include "slic3r/GUI/DeviceCore/DevExtruderSystem.h"
 #include "slic3r/GUI/DeviceCore/DevChamber.h"
@@ -405,6 +410,77 @@ void register_device(py::module_ &m)
         }, py::arg("wait") = 0.0)
 
         // ---- camera (read-only) -------------------------------------------
+        // Enumerate the loaded AMS trays (read-back so a script can verify the
+        // physical filament: colour is hex RGBA e.g. "FF0000FF").
+        .def("ams", [](const PyDevice &) -> py::object {
+            DeviceManager *dm = devmgr("Device.ams");
+            if (dm == nullptr) return py::none();
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr) return py::none();
+            auto fila = mo->GetFilaSystem();
+            if (!fila) return py::none();
+            py::list out;
+            for (const auto &ap : fila->GetAmsList()) {
+                DevAms *ams = ap.second;
+                if (ams == nullptr) continue;
+                for (const auto &tp : ams->GetTrays()) {
+                    DevAmsTray *tray = tp.second;
+                    if (tray == nullptr || !tray->is_exists) continue;
+                    py::dict d;
+                    d["ams_id"]  = ap.first;
+                    d["slot_id"] = tp.first;
+                    d["color"]   = tray->color;          // hex RGBA
+                    d["type"]    = tray->m_fila_type;     // e.g. "PLA"
+                    out.append(std::move(d));
+                }
+            }
+            return out;
+        })
+        // Watch a running print: pump the event loop so status pushes land, and
+        // call callback(update) on each change (layer/stage/status/progress) until
+        // the print finishes or timeout_s. callback may return False to stop.
+        .def("watch", [](const PyDevice &, py::function callback,
+                         double poll_s, double timeout_s) {
+            DeviceManager *dm = devmgr("Device.watch");
+            if (dm == nullptr) throw std::runtime_error("no device manager");
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr) throw std::runtime_error("no selected printer");
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            int last_layer = -1, last_progress = -1;
+            std::string last_stage = "\x01", last_status = "\x01";
+            bool seen_running = false;
+            for (;;) {
+                {
+                    py::gil_scoped_release nogil;   // pump for status pushes
+                    if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                    wxMilliSleep((unsigned long) (poll_s * 1000.0));
+                }
+                const int         layer    = mo->curr_layer;
+                const int         total    = mo->total_layers;
+                const int         progress = mo->mc_print_percent;
+                const std::string stage    = std::string(mo->get_curr_stage().ToUTF8().data());
+                const std::string status   = mo->print_status;
+                if (status == "RUNNING" || status == "PAUSE") seen_running = true;
+                const bool changed = layer != last_layer || stage != last_stage ||
+                                     status != last_status || progress != last_progress;
+                if (changed) {
+                    py::dict u;
+                    u["print_status"]  = status;
+                    u["progress"]      = progress;
+                    u["current_layer"] = layer;
+                    u["total_layers"]  = total;
+                    u["stage"]         = stage;
+                    u["remaining_s"]   = mo->mc_left_time;
+                    py::object ret = callback(u);
+                    last_layer = layer; last_progress = progress;
+                    last_stage = stage; last_status = status;
+                    if (!ret.is_none()) { try { if (!ret.cast<bool>()) break; } catch (...) {} }
+                }
+                if (seen_running && (status == "FINISH" || status == "FAILED")) break;
+                if (clock::now() - t0 > std::chrono::duration<double>(timeout_s)) break;
+            }
+        }, py::arg("callback"), py::arg("poll_s") = 2.0, py::arg("timeout_s") = 3600.0)
         .def("camera_url", [](const PyDevice &, double timeout) -> py::object {
             // The liveview stream URL for the selected printer (bambu:///tutk|
             // agora|rtsp|local). READ-ONLY. Async: the plugin invokes a
@@ -443,6 +519,76 @@ void register_device(py::module_ &m)
         // 3mf, build the print params) — safe to call anytime. dry_run=False
         // actually starts the print on the physical printer and MUST only be
         // called with the user's explicit, per-print approval.
+        // Grab one H.264 keyframe (+ a few frames) from the TUTK camera stream
+        // into out_path (a raw .h264 elementary stream) via libBambuSource's
+        // exported C API. Caller decodes with ffmpeg. Returns the path or None.
+        // Abort the current print (UI-parity: the Stop button).
+        .def("stop", [](const PyDevice &) -> py::object {
+            DeviceManager *dm = devmgr("Device.stop");
+            if (dm == nullptr) return py::none();
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr) return py::none();
+            const int r = mo->command_task_abort();
+            py::dict d; d["result_code"] = r; d["stopped"] = (r == 0);
+            return d;
+        })
+        .def("camera_frame", [](const PyDevice &, const std::string &url,
+                                const std::string &out_path, double timeout) -> py::object {
+            if (url.empty()) return py::none();
+            const std::string plugin = Slic3r::data_dir() + "/plugins/libBambuSource.so";
+            void *lib = dlopen(plugin.c_str(), RTLD_NOW | RTLD_GLOBAL);
+            if (lib == nullptr) return py::none();
+            typedef void *Tunnel;
+            auto p_create = (int (*)(Tunnel *, const char *))          dlsym(lib, "Bambu_Create");
+            auto p_open   = (int (*)(Tunnel))                          dlsym(lib, "Bambu_Open");
+            auto p_start  = (int (*)(Tunnel, bool))                    dlsym(lib, "Bambu_StartStream");
+            auto p_info   = (int (*)(Tunnel, int, Bambu_StreamInfo *)) dlsym(lib, "Bambu_GetStreamInfo");
+            auto p_read   = (int (*)(Tunnel, Bambu_Sample *))          dlsym(lib, "Bambu_ReadSample");
+            auto p_close  = (void (*)(Tunnel))                         dlsym(lib, "Bambu_Close");
+            if (!p_create || !p_open || !p_start || !p_read || !p_close) return py::none();
+
+            bool ok = false;
+            {
+                py::gil_scoped_release nogil;   // network / P2P I/O
+                Tunnel t = nullptr;
+                if (p_create(&t, url.c_str()) == 0 && p_open(t) == 0) {
+                    p_start(t, true);                       // video
+                    Bambu_StreamInfo info; memset(&info, 0, sizeof(info));
+                    if (p_info) p_info(t, 0, &info);
+                    FILE *f = fopen(out_path.c_str(), "wb");
+                    if (f != nullptr) {
+                        using clock = std::chrono::steady_clock;
+                        const auto t0 = clock::now();
+                        bool started = false; int frames = 0;
+                        while (frames < 8) {
+                            Bambu_Sample sample; memset(&sample, 0, sizeof(sample));
+                            int r = p_read(t, &sample);
+                            if (r == 0) {                    // Bambu_success
+                                const bool key = (sample.flags & f_sync) != 0;
+                                if (!started && key) {
+                                    started = true;
+                                    if (info.format_buffer && info.format_size > 0)
+                                        fwrite(info.format_buffer, 1, info.format_size, f);
+                                }
+                                if (started && sample.buffer && sample.size > 0) {
+                                    fwrite(sample.buffer, 1, sample.size, f);
+                                    ++frames;
+                                }
+                            } else if (r == 2) {             // would_block
+                                wxMilliSleep(30);
+                            } else {
+                                break;                       // stream_end / error
+                            }
+                            if (clock::now() - t0 > std::chrono::duration<double>(timeout)) break;
+                        }
+                        fclose(f);
+                        ok = started && frames > 0;
+                    }
+                    p_close(t);
+                }
+            }
+            return ok ? py::object(py::str(out_path)) : py::none();
+        }, py::arg("url"), py::arg("out_path"), py::arg("timeout") = 20.0)
         .def("send", [](const PyDevice &, py::object plate, bool dry_run,
                         const std::string &project_name, bool use_ams,
                         const std::string &ams_mapping, bool bed_leveling,
