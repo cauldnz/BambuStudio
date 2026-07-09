@@ -117,7 +117,7 @@ struct PyPlateList {};
 struct PyPlate    { int idx; };
 
 // Which config a PyConfig fronts.
-enum class ConfigSource { Global, Print, Filament, Printer, Plate };
+enum class ConfigSource { Global, Print, Filament, Printer, Plate, Object };
 struct PyConfig { ConfigSource source; int plate_idx = 0; };
 
 // M3 slicing handles.
@@ -185,6 +185,12 @@ const ConfigBase *resolve_config(const PyConfig &c, const char *what)
         GUI::PartPlate *plate = plate_or_throw(c.plate_idx, what);
         if (plate->config() == nullptr) throw std::runtime_error("no plate config");
         return plate->config();
+    }
+    case ConfigSource::Object: {
+        // per-object overrides (ModelObject::config). plate_idx carries the
+        // object index for this source. Only the explicitly-set overrides are
+        // visible here (empty unless set), matching the GUI object-settings list.
+        return &object_at(c.plate_idx, what)->config.get();
     }
     }
     throw std::runtime_error("unknown config source");
@@ -279,6 +285,13 @@ void register_object_model(py::module_ &m)
                 if (cfg == nullptr) throw std::runtime_error("no plate config");
                 cfg->set_deserialize_strict(key, value);
                 plater->schedule_background_process();
+                return;
+            }
+            if (c.source == ConfigSource::Object) {
+                ModelObject *obj = object_at(c.plate_idx, "Config.set");
+                ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::EnableSilent);
+                obj->config.set_deserialize(key, value, ctx);
+                plater->changed_object(int(c.plate_idx));   // same reslice the GUI uses
                 return;
             }
             PresetCollection *col = preset_collection(c.source);
@@ -420,6 +433,13 @@ void register_object_model(py::module_ &m)
             for (size_t i = 0; i < obj->volumes.size(); ++i)
                 out.append(PyVolume{o.idx, i});
             return out;
+        })
+        .def_property_readonly("config", [](const PyObject &o) {
+            // Per-object print-setting overrides (get/has/keys/set). Empty
+            // unless overrides are set; set() layers over the global config and
+            // reslices, exactly like the GUI object-settings panel.
+            (void) object_at(o.idx, "Object.config");   // bounds-check
+            return PyConfig{ConfigSource::Object, int(o.idx)};
         })
         .def("texts", [](const PyObject &o) {
             // Editable emboss-text volumes (UI-parity with the Text gizmo).
