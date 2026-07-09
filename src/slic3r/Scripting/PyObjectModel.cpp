@@ -27,6 +27,7 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Preset.hpp"
@@ -36,6 +37,10 @@
 #include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
 #include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
 #include "slic3r/GUI/GUI_App.hpp"
+#include <pybind11/eval.h>                  // py::exec (embedded download helper)
+#include <boost/filesystem/fstream.hpp>
+#include <regex>
+#include <algorithm>
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Tab.hpp"
@@ -107,6 +112,7 @@ struct PyDocument {};
 struct PyModel {};
 struct PyObject   { size_t idx; };
 struct PyVolume   { size_t obj_idx; size_t vol_idx; };
+struct PyText     { size_t obj_idx; size_t vol_idx; };
 struct PyPlateList {};
 struct PyPlate    { int idx; };
 
@@ -190,6 +196,15 @@ ModelVolume *volume_at(const PyVolume &v, const char *what)
     if (v.vol_idx >= obj->volumes.size())
         throw std::runtime_error("volume index out of range (model changed?)");
     return obj->volumes[v.vol_idx];
+}
+
+// Resolve a text handle to its ModelVolume, asserting it is editable text.
+ModelVolume *text_at(const PyText &t, const char *what)
+{
+    ModelVolume *v = volume_at(PyVolume{t.obj_idx, t.vol_idx}, what);
+    if (!v->is_text())
+        throw std::runtime_error(std::string(what) + ": volume is not editable text");
+    return v;
 }
 
 // Read slice stats off a sliced plate into a PySliceResult. Main thread.
@@ -304,6 +319,92 @@ void register_object_model(py::module_ &m)
             return volume_at(v, "Volume.is_model_part")->is_model_part();
         });
 
+    // ---- Text (editable emboss text: UI-parity with the Text gizmo) --------
+    py::class_<PyText>(m, "Text")
+        .def_property_readonly("text", [](const PyText &t) {
+            return text_at(t, "Text.text")->get_text_info().m_text;
+        })
+        .def_property_readonly("font_name", [](const PyText &t) {
+            return text_at(t, "Text.font_name")->get_text_info().m_font_name;
+        })
+        .def_property_readonly("font_size", [](const PyText &t) {
+            return text_at(t, "Text.font_size")->get_text_info().m_font_size;
+        })
+        .def_property_readonly("thickness", [](const PyText &t) {
+            return text_at(t, "Text.thickness")->get_text_info().m_thickness;
+        })
+        .def_property_readonly("bold", [](const PyText &t) {
+            return text_at(t, "Text.bold")->get_text_info().m_bold;
+        })
+        .def_property_readonly("italic", [](const PyText &t) {
+            return text_at(t, "Text.italic")->get_text_info().m_italic;
+        })
+        .def_property_readonly("width", [](const PyText &t) {
+            const TextInfo ti = text_at(t, "Text.width")->get_text_info();
+            TextResult r;
+            load_text_shape(ti.m_text.c_str(), ti.m_font_name.c_str(), ti.m_font_size,
+                            ti.m_thickness + ti.m_embeded_depth, ti.m_bold, ti.m_italic, r);
+            return r.text_width;
+        })
+        .def("set_text", [](const PyText &t, const std::string &new_text,
+                            bool fit, py::object max_width) -> py::object {
+            main_thread("Text.set_text");
+            ModelObject *obj = object_at(t.obj_idx, "Text.set_text");
+            ModelVolume *vol = text_at(t, "Text.set_text");
+            TextInfo ti = vol->get_text_info();  // copy
+
+            // The slot to fit within: explicit max_width, else the current label's width.
+            double target_w;
+            if (!max_width.is_none()) {
+                target_w = max_width.cast<double>();
+            } else {
+                TextResult orig;
+                load_text_shape(ti.m_text.c_str(), ti.m_font_name.c_str(), ti.m_font_size,
+                                ti.m_thickness + ti.m_embeded_depth, ti.m_bold, ti.m_italic, orig);
+                target_w = orig.text_width;
+            }
+
+            float size = ti.m_font_size;
+            TextResult r;
+            load_text_shape(new_text.c_str(), ti.m_font_name.c_str(), size,
+                            ti.m_thickness + ti.m_embeded_depth, ti.m_bold, ti.m_italic, r);
+            bool fitted = false;
+            if (fit && r.text_width > target_w && r.text_width > 0.0) {
+                size = (float)(size * (target_w / r.text_width));
+                load_text_shape(new_text.c_str(), ti.m_font_name.c_str(), size,
+                                ti.m_thickness + ti.m_embeded_depth, ti.m_bold, ti.m_italic, r);
+                fitted = true;
+            }
+            if (r.text_mesh.empty())
+                throw std::runtime_error("Text.set_text: mesh generation failed (font missing?)");
+
+            ti.m_text = new_text;
+            ti.m_font_size = size;
+
+            // Swap the volume mesh in place (mirrors GUI Emboss recreate_model_volume).
+            GUI::wxGetApp().plater()->take_snapshot("Edit Text");
+            Geometry::Transformation tran = vol->get_transformation();
+            ModelVolume *nv = obj->add_volume(r.text_mesh, false);
+            nv->calculate_convex_hull();
+            nv->set_transformation(tran.get_matrix());
+            nv->set_text_info(ti);
+            nv->name = vol->name;
+            nv->set_type(vol->type());
+            nv->config.apply(vol->config);
+            std::swap(obj->volumes[t.vol_idx], obj->volumes.back());
+            obj->delete_volume(obj->volumes.size() - 1);
+            obj->invalidate_bounding_box();
+            GUI::wxGetApp().plater()->update();
+
+            py::dict d;
+            d["text"]       = new_text;
+            d["font_size"]  = size;
+            d["width"]      = r.text_width;
+            d["fit_target"] = target_w;
+            d["fitted"]     = fitted;
+            return d;
+        }, py::arg("text"), py::arg("fit") = true, py::arg("max_width") = py::none());
+
     // ---- Object -----------------------------------------------------------
     py::class_<PyObject>(m, "Object")
         .def_property_readonly("name", [](const PyObject &o) {
@@ -318,6 +419,15 @@ void register_object_model(py::module_ &m)
             py::list out;
             for (size_t i = 0; i < obj->volumes.size(); ++i)
                 out.append(PyVolume{o.idx, i});
+            return out;
+        })
+        .def("texts", [](const PyObject &o) {
+            // Editable emboss-text volumes (UI-parity with the Text gizmo).
+            ModelObject *obj = object_at(o.idx, "Object.texts");
+            py::list out;
+            for (size_t i = 0; i < obj->volumes.size(); ++i)
+                if (obj->volumes[i]->is_text())
+                    out.append(PyText{o.idx, i});
             return out;
         })
         .def("bounding_box", [](const PyObject &o) {
@@ -864,6 +974,87 @@ void register_object_model(py::module_ &m)
         });
 
     m.attr("app") = py::cast(PyApp{});
+
+    // MakerWorld model download — Python (urllib) transport. MakerWorld's
+    // Cloudflare fingerprints and blocks libcurl (Slic3r::Http), but lets
+    // Python's TLS stack through; so we do the fetch in Python, reusing the C++
+    // auth primitive device.request_bind_ticket(). Exposed as pyslic3r.download_model.
+    {
+        py::dict ns;
+        py::exec(R"PYSRC(
+def download_model(url_or_id, instance_id=None, out_dir=None, retries=4):
+    """Download a MakerWorld model's 3mf via the logged-in Bambu account.
+
+    url_or_id : a MakerWorld model URL (…/models/<design>…#profileId-<instance>)
+                or a bare design id (then pass instance_id=).
+    retries   : attempts against MakerWorld's (aggressive, intermittent) Cloudflare.
+    Returns {name, path, size, design_id, instance_id}.
+
+    A code alternative to a browser download. Navigates Cloudflare by using
+    Python's TLS stack (native libcurl is fingerprinted and blocked); still
+    retries with backoff because Cloudflare bot-management can 403 transiently.
+    """
+    import pyslic3r as _ps, urllib.request, urllib.parse, http.cookiejar, json, os, re, tempfile, time
+    dev = _ps.app.device
+    if not dev.is_logged_in:
+        raise RuntimeError("download_model: not logged in to a Bambu account")
+    design_id, inst = None, instance_id
+    m = re.search(r"/models/(\d+)", str(url_or_id))
+    if m:
+        design_id = m.group(1)
+    m = re.search(r"profileId-(\d+)", str(url_or_id))
+    if m and inst is None:
+        inst = m.group(1)
+    if design_id is None:
+        design_id = str(url_or_id)
+    if inst is None:
+        raise RuntimeError("download_model: need instance_id= or a URL containing #profileId-<id>")
+
+    host = "https://makerworld.com/"
+    hdrs = {"User-Agent": "BambuStudio", "accept": "*/*"}
+    TRANSIENT = (403, 429, 500, 502, 503, 504)
+    err = None
+    for attempt in range(max(1, retries)):
+        try:
+            ticket = dev.request_bind_ticket()  # one-time; fresh per attempt
+            if not ticket:
+                raise RuntimeError("request_bind_ticket failed (login/session?)")
+            f3mf = host + "api/v1/design-service/instance/%s/f3mf" % inst
+            signin = host + "api/sign-in/ticket?to=" + urllib.parse.quote(f3mf, safe="") + "&ticket=" + ticket
+            cj = http.cookiejar.CookieJar()
+            op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            meta = op.open(urllib.request.Request(signin, headers=hdrs), timeout=60).read()
+            j = json.loads(meta)
+            cdn = j.get("url")
+            name = j.get("name") or ("model_%s.3mf" % inst)
+            if not cdn:
+                raise RuntimeError("could not resolve file url: %r" % meta[:160])
+            data = op.open(urllib.request.Request(cdn, headers=hdrs), timeout=180).read()
+            if not data:
+                raise RuntimeError("downloaded file is empty")
+            d = out_dir or tempfile.gettempdir()
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            return {"name": name, "path": path, "size": len(data),
+                    "design_id": design_id, "instance_id": inst}
+        except urllib.error.HTTPError as e:
+            err = e
+            if e.code in TRANSIENT and attempt < retries - 1:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            raise RuntimeError("download_model: HTTP %s from MakerWorld (Cloudflare?)" % e.code)
+        except Exception as e:
+            err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            raise
+    raise RuntimeError("download_model failed after %d attempts: %s" % (retries, err))
+)PYSRC", ns, ns);
+        m.attr("download_model") = ns["download_model"];
+    }
 }
 
 } // namespace pyslic3r

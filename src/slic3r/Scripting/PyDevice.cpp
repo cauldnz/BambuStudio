@@ -279,6 +279,16 @@ void register_device(py::module_ &m)
             if (n.empty()) n = a->get_user_name();
             return py::str(n);
         })
+        .def("request_bind_ticket", [](const PyDevice &) -> py::object {
+            // One-time web-auth ticket. The GUI exchanges it at
+            // <host>api/sign-in/ticket?to=<url>&ticket=<t> to establish an
+            // authenticated session (e.g. MakerWorld model download).
+            NetworkAgent *a = agent("Device.request_bind_ticket");
+            if (a == nullptr || !a->is_user_login()) return py::none();
+            std::string ticket;
+            if (a->request_bind_ticket(&ticket) != 0) return py::none();
+            return py::str(ticket);
+        })
         .def("printers", [](const PyDevice &) {
             // Account-bound (+ local) printers, from the cached list. Call
             // refresh() first to fetch it from the cloud (a fresh instance
