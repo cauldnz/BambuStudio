@@ -127,6 +127,10 @@ struct PySliceResult
     bool                    success = false;
     long                    print_time_s = 0;
     long                    layer_count = 0;
+    double                  total_weight = 0;               // grams (sum of filament_g)
+    double                  total_cost = 0;                 // currency units
+    double                  total_wipe_tower_filament = 0;  // mm
+    int                     total_toolchanges = 0;
     std::map<int, double>   filament_g;    // per extruder/slot
     std::map<int, double>   filament_mm;   // per extruder/slot (from volume)
     std::string             gcode_path;
@@ -248,6 +252,15 @@ void fill_slice_result(int plate_idx, PySliceResult &res)
                                        ? double(gr->filament_densities[e]) : 1.24;  // PLA fallback
             res.filament_g[e]  = vol_mm3 / 1000.0 * density;      // mm^3 -> cm^3 * g/cm^3
         }
+        if (Print *_pr = plate->fff_print()) {
+            const PrintStatistics &_ps = _pr->print_statistics();
+            res.total_weight              = _ps.total_weight;
+            res.total_cost                = _ps.total_cost;
+            res.total_toolchanges         = _ps.total_toolchanges;
+            res.total_wipe_tower_filament = _ps.total_wipe_tower_filament;
+        }
+        if (res.total_weight <= 0.0)   // fallback: sum per-extruder filament_g
+            for (const auto &_kv : res.filament_g) res.total_weight += _kv.second;
     }
 }
 
@@ -820,6 +833,10 @@ void register_object_model(py::module_ &m)
         .def_property_readonly("success",       [](const PySliceResult &r) { return r.success; })
         .def_property_readonly("print_time_s",  [](const PySliceResult &r) { return r.print_time_s; })
         .def_property_readonly("layer_count",   [](const PySliceResult &r) { return r.layer_count; })
+        .def_property_readonly("total_weight",  [](const PySliceResult &r) { return r.total_weight; })
+        .def_property_readonly("total_cost",    [](const PySliceResult &r) { return r.total_cost; })
+        .def_property_readonly("total_toolchanges", [](const PySliceResult &r) { return r.total_toolchanges; })
+        .def_property_readonly("total_wipe_tower_filament", [](const PySliceResult &r) { return r.total_wipe_tower_filament; })
         .def_property_readonly("filament_g",    [](const PySliceResult &r) { return r.filament_g; })
         .def_property_readonly("filament_mm",   [](const PySliceResult &r) { return r.filament_mm; })
         .def_property_readonly("gcode_3mf_path",[](const PySliceResult &r) { return r.gcode_path; })
