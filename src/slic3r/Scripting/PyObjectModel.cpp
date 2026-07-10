@@ -587,6 +587,28 @@ void register_object_model(py::module_ &m)
             plater_or_throw("Object.split")->split_object();
             return model_or_throw("Object.split").objects.size();
         })
+        .def("cut", [](const PyObject &o, double z, bool keep_upper, bool keep_lower) {
+            main_thread("Object.cut");
+            if (!keep_upper && !keep_lower)
+                throw std::runtime_error("cut: keep_upper and keep_lower are both false");
+            auto *plater = plater_or_throw("Object.cut");
+            ModelObject *obj = object_at(o.idx, "Object.cut");
+            if (obj->instances.empty())
+                throw std::runtime_error("cut: object has no instances");
+            const Vec3d off = obj->instances[0]->get_offset();
+            ModelObjectCutAttributes attrs =
+                only_if(keep_upper, ModelObjectCutAttribute::KeepUpper) |
+                only_if(keep_lower, ModelObjectCutAttribute::KeepLower);
+            const double d = 1000.0;   // large horizontal quad (spans any object)
+            std::array<Vec3d, 4> pts = {
+                Vec3d(off.x() - d, off.y() - d, z),
+                Vec3d(off.x() + d, off.y() - d, z),
+                Vec3d(off.x() + d, off.y() + d, z),
+                Vec3d(off.x() - d, off.y() + d, z)
+            };
+            plater->cut(o.idx, 0, pts, attrs);
+            return model_or_throw("Object.cut").objects.size();
+        }, py::arg("z"), py::arg("keep_upper") = true, py::arg("keep_lower") = true)
         .def("place_on_bed", [](const PyObject &o) {
             auto *plater = plater_or_throw("Object.place_on_bed");
             ModelObject *obj = object_at(o.idx, "Object.place_on_bed");
