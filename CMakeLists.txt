@@ -49,6 +49,7 @@ option(SLIC3R_MSVC_COMPILE_PARALLEL "Compile on Visual Studio in parallel" 1)
 option(SLIC3R_MSVC_PDB          "Generate PDB files on MSVC in Release mode" 1)
 option(SLIC3R_PERL_XS           "Compile XS Perl module and enable Perl unit and integration tests" 0)
 option(SLIC3R_ASAN              "Enable ASan on Clang and GCC" 0)
+option(BBS_PY_RUNTIME           "Embed the pyslic3r Python runtime (libbambu_api)" 1)
 # If SLIC3R_FHS is 1 -> SLIC3R_DESKTOP_INTEGRATION is always 0, othrewise variable.
 CMAKE_DEPENDENT_OPTION(SLIC3R_DESKTOP_INTEGRATION "Allow performing desktop integration during runtime" 1 "NOT SLIC3R_FHS" 0)
 
@@ -791,6 +792,14 @@ function(bambustudio_copy_sos target config postfix output_sos)
         PARENT_SCOPE
     )
 endfunction()
+
+if (BBS_PY_RUNTIME AND SLIC3R_GUI)
+    # Embedded pyslic3r runtime (src/slic3r/Scripting -> libbambu_api).
+    # M0 uses the distro toolchain: python3-dev + pybind11-dev.
+    find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Embed)
+    find_package(pybind11 CONFIG REQUIRED)
+    message(STATUS "pyslic3r runtime enabled: Python ${Python_VERSION}, pybind11 ${pybind11_VERSION}")
+endif ()
 
 # libslic3r, BambuStudio GUI and the BambuStudio executable.
 add_subdirectory(src)

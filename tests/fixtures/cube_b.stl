@@ -1,0 +1,86 @@
+solid cube_b
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 0.0 0.0
+   vertex 40.0 10.0 0.0
+   vertex 40.0 0.0 0.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 0.0 0.0
+   vertex 30.0 10.0 0.0
+   vertex 40.0 10.0 0.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 0.0 10.0
+   vertex 40.0 0.0 10.0
+   vertex 40.0 10.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 0.0 10.0
+   vertex 40.0 10.0 10.0
+   vertex 30.0 10.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 0.0 0.0
+   vertex 40.0 0.0 0.0
+   vertex 40.0 0.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 0.0 0.0
+   vertex 40.0 0.0 10.0
+   vertex 30.0 0.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 40.0 0.0 0.0
+   vertex 40.0 10.0 0.0
+   vertex 40.0 10.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 40.0 0.0 0.0
+   vertex 40.0 10.0 10.0
+   vertex 40.0 0.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 40.0 10.0 0.0
+   vertex 30.0 10.0 0.0
+   vertex 30.0 10.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 40.0 10.0 0.0
+   vertex 30.0 10.0 10.0
+   vertex 40.0 10.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 10.0 0.0
+   vertex 30.0 0.0 0.0
+   vertex 30.0 0.0 10.0
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.0 10.0 0.0
+   vertex 30.0 0.0 10.0
+   vertex 30.0 10.0 10.0
+  endloop
+ endfacet
+endsolid cube_b
