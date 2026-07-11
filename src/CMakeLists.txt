@@ -227,6 +227,23 @@ if (WIN32)
         )
     endif ()
 
+    # Stage the native runtime DLLs + the embedded interpreter DLL next to the ACTUAL
+    # per-config exe. bambustudio_copy_dlls() above runs at configure time into a fixed
+    # config dir (Release under a multi-config generator), so a RelWithDebInfo build
+    # otherwise leaves the exe dir without its deps DLLs; and it predates the embedded
+    # Python. This POST_BUILD copy targets $<TARGET_FILE_DIR:BambuStudio> (correct config)
+    # and adds pythonXY.dll when the pyslic3r runtime is enabled.
+    file(GLOB _bbs_rt_dlls "${CMAKE_PREFIX_PATH}/bin/*.dll" "${CMAKE_PREFIX_PATH}/bin/occt/*.dll")
+    if (BBS_PY_RUNTIME AND Python_EXECUTABLE)
+        get_filename_component(_bbs_pydir "${Python_EXECUTABLE}" DIRECTORY)
+        file(GLOB _bbs_py_dlls "${_bbs_pydir}/python3*.dll")
+        list(APPEND _bbs_rt_dlls ${_bbs_py_dlls})
+    endif ()
+    foreach (_bbs_dll IN LISTS _bbs_rt_dlls)
+        add_custom_command(TARGET BambuStudio POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_bbs_dll}" "$<TARGET_FILE_DIR:BambuStudio>"
+            VERBATIM)
+    endforeach ()
 
 else ()
     if (NOT APPLE AND NOT FLATPAK)
