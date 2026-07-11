@@ -55,7 +55,6 @@ jobs:
         shell: pwsh
         run: |
           "PKG_CONFIG_EXECUTABLE=C:\Strawberry\perl\bin\pkg-config.bat" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$env:GITHUB_PATH" | Out-Null
           "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           "C:\Strawberry\c\bin"    | Out-File -FilePath $env:GITHUB_PATH -Append
 
@@ -112,26 +111,15 @@ jobs:
           (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() | Out-File "$zip.sha256"
           "ARTIFACT_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Smoke test (headless pyslic3r)
+      - name: Smoke test (headless pyslic3r, bare PATH → proves self-contained)
         shell: pwsh
         run: |
           $stage = "$env:RUNNER_TEMP\pyslic3r-BambuStudio-win64"
-          $script = "$env:RUNNER_TEMP\smoke.py"
-          @'
-          import os, traceback
-          with open(os.environ["PYSLIC3R_VERIFY_OUT"], "w") as f:
-              try:
-                  import pyslic3r
-                  a = pyslic3r.app
-                  f.write(f"OK {a.name} {a.version}\n"); f.write("VERIFY_DONE\n")
-              except Exception:
-                  f.write("EXCEPTION\n" + traceback.format_exc())
-          '@ | Set-Content -Path $script -Encoding utf8
           $res = "$env:RUNNER_TEMP\smoke_out.txt"
-          $env:PYSLIC3R_SCRIPT = $script
+          $env:PYSLIC3R_SCRIPT = "$env:GITHUB_WORKSPACE\tools\pyslic3r_smoke.py"
           $env:PYSLIC3R_SCRIPT_EXIT = "1"
           $env:PYSLIC3R_VERIFY_OUT = $res
-          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"   # prove self-contained
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"   # no system Python / deps
           & "$stage\bambu-studio.exe" --datadir "$env:RUNNER_TEMP\datadir" | Out-Null
           Get-Content $res
           if (-not (Select-String -Path $res -Pattern 'VERIFY_DONE' -Quiet)) { throw "pyslic3r smoke test failed" }
