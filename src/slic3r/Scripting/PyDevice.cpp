@@ -36,7 +36,11 @@
 #include "slic3r/GUI/DeviceCore/DevFilaSystem.h"
 #include "slic3r/GUI/Printer/BambuTunnel.h"
 #include "libslic3r/Utils.hpp"
-#include <dlfcn.h>
+#ifdef _WIN32
+#include <windows.h>   // LoadLibraryA / GetProcAddress (camera-plugin loader)
+#else
+#include <dlfcn.h>     // dlopen / dlsym (camera-plugin loader)
+#endif
 #include <cstdio>
 #include "slic3r/GUI/DeviceCore/DevBed.h"
 #include "slic3r/GUI/DeviceCore/DevExtruderSystem.h"
@@ -58,6 +62,17 @@ using namespace Slic3r;
 
 namespace pyslic3r {
 namespace {
+
+// Cross-platform dynamic-loader shims for the Bambu camera plugin. POSIX uses
+// dlopen/dlsym; Windows uses LoadLibrary/GetProcAddress. Only Device.camera_frame
+// touches these — the rest of the Scripting surface is loader-free.
+#ifdef _WIN32
+inline void *plugin_dlopen(const char *path) { return reinterpret_cast<void *>(::LoadLibraryA(path)); }
+inline void *plugin_dlsym(void *lib, const char *name) { return reinterpret_cast<void *>(::GetProcAddress(reinterpret_cast<HMODULE>(lib), name)); }
+#else
+inline void *plugin_dlopen(const char *path) { return ::dlopen(path, RTLD_NOW | RTLD_GLOBAL); }
+inline void *plugin_dlsym(void *lib, const char *name) { return ::dlsym(lib, name); }
+#endif
 
 void dev_main_thread(const char *what)
 {
@@ -545,16 +560,22 @@ void register_device(py::module_ &m)
         .def("camera_frame", [](const PyDevice &, const std::string &url,
                                 const std::string &out_path, double timeout) -> py::object {
             if (url.empty()) return py::none();
+#ifdef _WIN32
+            const std::string plugin = Slic3r::data_dir() + "/plugins/BambuSource.dll";
+#elif defined(__APPLE__)
+            const std::string plugin = Slic3r::data_dir() + "/plugins/libBambuSource.dylib";
+#else
             const std::string plugin = Slic3r::data_dir() + "/plugins/libBambuSource.so";
-            void *lib = dlopen(plugin.c_str(), RTLD_NOW | RTLD_GLOBAL);
+#endif
+            void *lib = plugin_dlopen(plugin.c_str());
             if (lib == nullptr) return py::none();
             typedef void *Tunnel;
-            auto p_create = (int (*)(Tunnel *, const char *))          dlsym(lib, "Bambu_Create");
-            auto p_open   = (int (*)(Tunnel))                          dlsym(lib, "Bambu_Open");
-            auto p_start  = (int (*)(Tunnel, bool))                    dlsym(lib, "Bambu_StartStream");
-            auto p_info   = (int (*)(Tunnel, int, Bambu_StreamInfo *)) dlsym(lib, "Bambu_GetStreamInfo");
-            auto p_read   = (int (*)(Tunnel, Bambu_Sample *))          dlsym(lib, "Bambu_ReadSample");
-            auto p_close  = (void (*)(Tunnel))                         dlsym(lib, "Bambu_Close");
+            auto p_create = (int (*)(Tunnel *, const char *))          plugin_dlsym(lib, "Bambu_Create");
+            auto p_open   = (int (*)(Tunnel))                          plugin_dlsym(lib, "Bambu_Open");
+            auto p_start  = (int (*)(Tunnel, bool))                    plugin_dlsym(lib, "Bambu_StartStream");
+            auto p_info   = (int (*)(Tunnel, int, Bambu_StreamInfo *)) plugin_dlsym(lib, "Bambu_GetStreamInfo");
+            auto p_read   = (int (*)(Tunnel, Bambu_Sample *))          plugin_dlsym(lib, "Bambu_ReadSample");
+            auto p_close  = (void (*)(Tunnel))                         plugin_dlsym(lib, "Bambu_Close");
             if (!p_create || !p_open || !p_start || !p_read || !p_close) return py::none();
 
             bool ok = false;
