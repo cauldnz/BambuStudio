@@ -1,0 +1,158 @@
+name: Windows portable (pyslic3r)
+
+# Builds the native Windows pyslic3r-BambuStudio and assembles a self-contained
+# portable ZIP (exe + BambuStudio.dll + resources + native runtime DLLs + a bundled
+# python.org embeddable CPython). On a version tag it publishes a GitHub Release.
+#
+# The multi-hour deps build is the bottleneck. It is cached on the hash of deps/**;
+# the FIRST run builds deps (slow — and may exceed GitHub-hosted limits: prefer a
+# self-hosted runner with warm deps, tracked at cauldnz-pos#10), later runs restore
+# the cache and only build the app (~30 min). Set the runner via the `runner` input.
+
+on:
+  push:
+    branches: [ feat/windows-native ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (windows-latest or a self-hosted label)'
+        default: 'windows-latest'
+
+env:
+  PYTHON_VERSION: '3.12.10'
+  CMAKE_VERSION: '3.31.6'
+  DEPS_DIR: 'C:\src\BambuStudio-deps'
+  # Cap deps parallelism so a memory-constrained runner does not MSB4166 (see
+  # WINDOWS-BUILD-RESULT.md gotcha #5); harmless on big runners.
+  PS_DEPS_MSBUILD_JOBS: ':4'
+  CMAKE_BUILD_PARALLEL_LEVEL: '4'
+  MSBUILDDISABLENODEREUSE: '1'
+
+jobs:
+  build:
+    runs-on: ${{ github.event.inputs.runner || 'windows-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pybind11 + pinned CMake
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pybind11 "cmake==${{ env.CMAKE_VERSION }}"
+          "PYBIND11_DIR=$(python -m pybind11 --cmakedir)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PYTHON_ROOT=$(python -c 'import sys,os;print(os.path.dirname(sys.executable))')" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # windows-latest ships Strawberry Perl (C:\Strawberry) — provides perl + a
+      # pkg-config.bat used by find_package(PkgConfig)/pkg_check_modules(LIBAV).
+      - name: Locate Perl + pkg-config
+        shell: pwsh
+        run: |
+          "PKG_CONFIG_EXECUTABLE=C:\Strawberry\perl\bin\pkg-config.bat" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$env:GITHUB_PATH" | Out-Null
+          "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\Strawberry\c\bin"    | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Cache deps destdir
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS_DIR }}
+          key: bbs-deps-${{ runner.os }}-${{ hashFiles('deps/**/*.cmake', 'deps/CMakeLists.txt') }}
+
+      - name: Build deps (first run only; multi-hour)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vspath.txt
+          set /p VSPATH=<vspath.txt
+          set "PATH=%PYTHON_ROOT%\Scripts;C:\Strawberry\perl\bin;C:\Strawberry\c\bin;%PATH%"
+          set "Python_ROOT_DIR=%PYTHON_ROOT%"
+          set "pybind11_DIR=%PYBIND11_DIR%"
+          build_win.bat -s deps -d "%DEPS_DIR%"
+
+      - name: Build app
+        shell: cmd
+        run: |
+          set "PATH=%PYTHON_ROOT%\Scripts;C:\Strawberry\perl\bin;C:\Strawberry\c\bin;%PATH%"
+          set "Python_ROOT_DIR=%PYTHON_ROOT%"
+          set "pybind11_DIR=%PYBIND11_DIR%"
+          set "PKG_CONFIG_PATH=%DEPS_DIR%\usr\local\lib\pkgconfig"
+          build_win.bat -s app
+
+      - name: Fetch Python embeddable package
+        shell: pwsh
+        run: |
+          $url = "https://www.python.org/ftp/python/${{ env.PYTHON_VERSION }}/python-${{ env.PYTHON_VERSION }}-embed-amd64.zip"
+          curl.exe -L --fail -o "$env:RUNNER_TEMP\python-embed.zip" $url
+
+      - name: Assemble portable ZIP
+        shell: pwsh
+        run: |
+          $stage = "$env:RUNNER_TEMP\pyslic3r-BambuStudio-win64"
+          $out   = "build\src\RelWithDebInfo"
+          $deps  = "$env:DEPS_DIR\usr\local\bin"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "$out\bambu-studio.exe","$out\BambuStudio.dll" $stage -Force
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::ExtractToDirectory("$env:RUNNER_TEMP\python-embed.zip", $stage, $true)
+          Remove-Item "$stage\python.exe","$stage\pythonw.exe" -Force -ErrorAction SilentlyContinue
+          Copy-Item "$deps\*.dll" $stage -Force
+          if (Test-Path "$deps\occt") { Copy-Item "$deps\occt\*.dll" $stage -Force }
+          Copy-Item "resources" "$stage\resources" -Recurse -Force
+          Copy-Item "LICENSE" "$stage\LICENSE" -Force
+          $zip = "$env:RUNNER_TEMP\pyslic3r-BambuStudio-win64-py${{ env.PYTHON_VERSION }}.zip"
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() | Out-File "$zip.sha256"
+          "ARTIFACT_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Smoke test (headless pyslic3r)
+        shell: pwsh
+        run: |
+          $stage = "$env:RUNNER_TEMP\pyslic3r-BambuStudio-win64"
+          $script = "$env:RUNNER_TEMP\smoke.py"
+          @'
+          import os, traceback
+          with open(os.environ["PYSLIC3R_VERIFY_OUT"], "w") as f:
+              try:
+                  import pyslic3r
+                  a = pyslic3r.app
+                  f.write(f"OK {a.name} {a.version}\n"); f.write("VERIFY_DONE\n")
+              except Exception:
+                  f.write("EXCEPTION\n" + traceback.format_exc())
+          '@ | Set-Content -Path $script -Encoding utf8
+          $res = "$env:RUNNER_TEMP\smoke_out.txt"
+          $env:PYSLIC3R_SCRIPT = $script
+          $env:PYSLIC3R_SCRIPT_EXIT = "1"
+          $env:PYSLIC3R_VERIFY_OUT = $res
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"   # prove self-contained
+          & "$stage\bambu-studio.exe" --datadir "$env:RUNNER_TEMP\datadir" | Out-Null
+          Get-Content $res
+          if (-not (Select-String -Path $res -Pattern 'VERIFY_DONE' -Quiet)) { throw "pyslic3r smoke test failed" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyslic3r-BambuStudio-win64
+          path: |
+            ${{ env.ARTIFACT_ZIP }}
+            ${{ env.ARTIFACT_ZIP }}.sha256
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARTIFACT_ZIP }}
+            ${{ env.ARTIFACT_ZIP }}.sha256
+          body: |
+            Self-contained portable Windows x64 build of pyslic3r-BambuStudio
+            (bundled CPython ${{ env.PYTHON_VERSION }}). Unzip and run bambu-studio.exe.
+            Unofficial; AGPL-3.0; not affiliated with Bambu Lab. Corresponding source:
+            this tag of cauldnz/BambuStudio.
