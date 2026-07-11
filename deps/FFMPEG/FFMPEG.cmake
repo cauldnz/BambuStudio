@@ -16,6 +16,10 @@ if (MSVC)
             COMMAND ${CMAKE_COMMAND} -E copy_directory  "${_source_dir}/bin" "${_dstdir}/bin"
             COMMAND ${CMAKE_COMMAND} -E copy_directory  "${_source_dir}/lib" "${_dstdir}/lib"
             COMMAND ${CMAKE_COMMAND} -E copy_directory  "${_source_dir}/include" "${_dstdir}/include"
+            # The prebuilt .pc files ship a broken relative prefix (prefix=./dist);
+            # rewrite to the absolute install prefix so pkg_check_modules(LIBAV) links.
+            COMMAND ${CMAKE_COMMAND} -DPCDIR=${_dstdir}/lib/pkgconfig -DPCPREFIX=${_dstdir}
+                    -P ${CMAKE_CURRENT_LIST_DIR}/fix_ffmpeg_pc.cmake
     )
 
 else ()
