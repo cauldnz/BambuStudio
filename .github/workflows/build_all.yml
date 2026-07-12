@@ -24,35 +24,50 @@ on:
      - ".github/workflows/build_*.yml"
      - 'BuildLinux.sh'
      - 'build_win.bat'
-    
+
   workflow_dispatch: # manual dispatch
       inputs:
         build-deps-only:
             description: 'Only build dependencies (bypasses caching)'
             type: boolean
             default: false
+        include-macos:
+            description: 'Also build macOS (expensive runners; manual runs only)'
+            type: boolean
+            default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # macOS runners cost ~10x Linux, so we do NOT build them automatically. push /
+  # pull_request build Linux + Windows only; macOS builds only on a manual
+  # workflow_dispatch (and only when include-macos is left on). To build macOS,
+  # run this workflow manually ("Run workflow") from the Actions tab / gh CLI.
+  select_platforms:
+    name: Select platforms
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          base='{"os":"ubuntu-22.04"},{"os":"ubuntu-24.04"},{"os":"ubuntu-26.04"},{"os":"windows-latest"}'
+          mac='{"os":"macos-15-intel","arch":"x86_64"},{"os":"macos-15","arch":"arm64"},{"os":"macos-26","arch":"arm64"}'
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include-macos }}" = "true" ]; then
+            echo "matrix={\"include\":[$base,$mac]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[$base]}" >> "$GITHUB_OUTPUT"
+          fi
+
   build_all:
     name: Build All
+    needs: select_platforms
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-          - os: ubuntu-24.04
-          - os: ubuntu-26.04
-          - os: windows-latest
-          - os: macos-15-intel
-            arch: x86_64
-          - os: macos-15
-            arch: arm64
-          - os: macos-26
-            arch: arm64
+      matrix: ${{ fromJSON(needs.select_platforms.outputs.matrix) }}
     uses: ./.github/workflows/build_check_cache.yml
     with:
       os: ${{ matrix.os }}
