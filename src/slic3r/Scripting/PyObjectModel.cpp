@@ -2025,6 +2025,14 @@ void register_object_model(py::module_ &m)
                 if (clock::now() - t0 > std::chrono::seconds(120)) break;
                 wxMilliSleep(40);
             }
+            // Settle: the ArrangeJob applies its result via a completion event that can
+            // land a turn AFTER is_any_job_running() clears — pump a few more turns so a
+            // slice/validate right after sees the arranged layout (fixes slice(arrange=True)
+            // reporting "not sliceable" on a freshly-added off-plate object).
+            for (int k = 0; k < 12; ++k) {
+                if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                wxMilliSleep(20);
+            }
         }, py::arg("wait") = false);
 
     // ---- SliceResult ------------------------------------------------------
