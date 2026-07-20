@@ -50,6 +50,7 @@
 #include "libslic3r/PresetBundle.hpp"           // PresetBundle
 #include "slic3r/GUI/DeviceCore/DevMapping.h"   // DevMappingUtil (auto-mapper)
 #include "slic3r/GUI/DeviceCore/DevDefs.h"      // VIRTUAL_TRAY_MAIN_ID / DEPUTY
+#include "slic3r/GUI/DeviceCore/DevConfigUtil.h" // DevPrinterConfigUtil::get_printer_display_name
 #include "slic3r/GUI/BitmapCache.hpp"           // BitmapCache::parse_color4
 #include <cstdio>                               // std::snprintf
 
@@ -384,6 +385,7 @@ void register_device(py::module_ &m)
             d["total_layers"]  = mo->total_layers;
             d["remaining_s"]   = mo->mc_left_time;
             d["subtask_name"]  = mo->subtask_name;
+            d["print_error"]   = mo->print_error;  // 0 = none; nonzero = printer-side error code (plate mismatch / incompatible file / HMS)
 
             if (DevBed *bed = mo->GetBed()) {
                 d["bed_temp"]        = bed->GetBedTemp();
@@ -399,6 +401,8 @@ void register_device(py::module_ &m)
                     nozzles.append(nz);
                 }
                 d["nozzles"] = nozzles;
+                d["current_ams"]  = ex->GetCurrentAmsId();   // active AMS unit ("255"/"254" = external spool)
+                d["current_slot"] = ex->GetCurrentSlotId();  // active tray/slot — changes on a mid-print filament swap
             }
             if (std::shared_ptr<DevChamber> ch = mo->GetChamber()) {
                 if (ch->HasChamber()) {
@@ -533,6 +537,43 @@ void register_device(py::module_ &m)
         // into out_path (a raw .h264 elementary stream) via libBambuSource's
         // exported C API. Caller decodes with ffmpeg. Returns the path or None.
         // Abort the current print (UI-parity: the Stop button).
+        .def_property_readonly("printer_model", [](const PyDevice &) -> py::object {
+            // Bound printer model display name (e.g. "Bambu Lab P2S") from printer_type.
+            // Used by device sync to pick the matching slicing preset.
+            DeviceManager *dm = devmgr("Device.printer_model");
+            if (dm == nullptr) return py::none();
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr) return py::none();
+            std::string m = DevPrinterConfigUtil::get_printer_display_name(mo->printer_type);
+            if (m.empty()) return py::none();
+            return py::str(m);
+        })
+        .def("resume", [](const PyDevice &, bool ignore) -> py::object {
+            // UI-parity: Resume. ignore=True = "Resume Ignore" (dismiss a print-error /
+            // build-plate-mismatch pause and continue anyway, via command_hms_ignore);
+            // ignore=False = a plain resume (equivalent to "Resume Retry").
+            DeviceManager *dm = devmgr("Device.resume");
+            if (dm == nullptr) return py::none();
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr) return py::none();
+            int r;
+            if (ignore)
+                r = mo->command_hms_ignore(std::to_string(mo->print_error), mo->job_id_);
+            else
+                r = mo->command_task_resume();
+            py::dict d; d["result_code"] = r; d["resumed"] = (r == 0); d["ignore"] = ignore;
+            return d;
+        }, py::arg("ignore") = false)
+        .def("pause", [](const PyDevice &) -> py::object {
+            // UI-parity: the Pause button.
+            DeviceManager *dm = devmgr("Device.pause");
+            if (dm == nullptr) return py::none();
+            MachineObject *mo = dm->get_selected_machine();
+            if (mo == nullptr) return py::none();
+            const int r = mo->command_task_pause();
+            py::dict d; d["result_code"] = r; d["paused"] = (r == 0);
+            return d;
+        })
         .def("stop", [](const PyDevice &) -> py::object {
             DeviceManager *dm = devmgr("Device.stop");
             if (dm == nullptr) return py::none();
