@@ -1805,6 +1805,17 @@ void register_object_model(py::module_ &m)
         .def("select", [](const PyPlate &p) {
             plater_or_throw("Plate.select")->get_partplate_list().select_plate(p.idx);
         })
+        .def("move", [](const PyPlate &p, double dx, double dy, double dz) {
+            // UI-parity: "Move Plate" — translate every object on this plate by (dx,dy,dz) mm
+            // (PartPlate::translate_all_instance takes a delta, as the GUI on_move_plate does).
+            auto *plater = plater_or_throw("Plate.move");
+            GUI::PartPlate *pl = plater->get_partplate_list().get_plate(p.idx);
+            if (pl == nullptr) throw std::runtime_error("plate gone");
+            GUI::Plater::TakeSnapshot snap(plater, "API: move plate");
+            pl->translate_all_instance(Vec3d(dx, dy, dz));
+            for (ModelObject *o : plater->model().objects) o->invalidate_bounding_box();
+            plater->update();
+        }, py::arg("dx"), py::arg("dy"), py::arg("dz") = 0.0)
         .def_property_readonly("config", [](const PyPlate &p) {
             return PyConfig{ConfigSource::Plate, p.idx};
         })
