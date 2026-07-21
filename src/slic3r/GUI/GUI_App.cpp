@@ -8110,6 +8110,14 @@ void GUI_App::window_pos_center(wxTopLevelWindow *window)
 
 bool GUI_App::config_wizard_startup()
 {
+    // pyslic3r: a headless/scripted session (env PYSLIC3R_SCRIPT, or the MCP
+    // bridge PYSLIC3R_BRIDGE_PORT) must never block on the modal first-run wizard —
+    // automation drives fresh datadirs headlessly. See app.install_printer for the
+    // in-process vendor-machine bootstrap.
+    if (std::getenv("PYSLIC3R_SCRIPT") || std::getenv("PYSLIC3R_BRIDGE_PORT")) {
+        BOOST_LOG_TRIVIAL(info) << "pyslic3r: skipping startup config wizard (headless: PYSLIC3R_SCRIPT/PYSLIC3R_BRIDGE_PORT set)";
+        return false;
+    }
     if (!m_app_conf_exists || preset_bundle->printers.only_default_printers()) {
         BOOST_LOG_TRIVIAL(info) << "run wizard...";
         run_wizard(ConfigWizard::RR_DATA_EMPTY);
