@@ -2602,6 +2602,71 @@ void register_object_model(py::module_ &m)
                     out.push_back(p.name);
             return out;
         })
+        // Enumerate installable vendor machines (from resources/profiles) — the
+        // ones a fresh datadir has but that aren't visible until "installed".
+        .def("available_printers", [](const PyApp &) {
+            main_thread("app.available_printers");
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            py::list out;
+            for (const auto &vp : pb->vendors) {
+                for (const auto &pm : vp.second.models) {
+                    if (pm.technology != ptFFF) continue;
+                    py::dict d;
+                    d["vendor"] = vp.second.id;
+                    d["model"]  = pm.name;
+                    py::list vars;
+                    for (const auto &v : pm.variants) vars.append(v.name);
+                    d["variants"] = vars;
+                    out.append(d);
+                }
+            }
+            return out;
+        })
+        // Install a vendor machine the way the first-run wizard does — mark it
+        // visible in app_config (set_variant on printer_model/printer_variant) +
+        // install the model's default filament(s), then reload presets. Unblocks
+        // apply_preset()/slicing on a fresh datadir with no GUI wizard. [B O P].
+        .def("install_printer", [](const PyApp &, const std::string &name) {
+            main_thread("app.install_printer");
+            auto &app = GUI::wxGetApp();
+            auto *pb = app.preset_bundle;
+            auto *ac = app.app_config;
+            if (pb == nullptr || ac == nullptr) throw std::runtime_error("no preset bundle / app config");
+            const Preset *mp = pb->printers.find_preset(name, false);
+            if (mp == nullptr) throw std::runtime_error("no such printer preset: " + name + " (see available_printers())");
+            if (mp->vendor == nullptr) throw std::runtime_error("not a vendor/system preset: " + name);
+            const std::string vendor  = mp->vendor->id;
+            const std::string model   = mp->config.opt_string("printer_model");
+            const std::string variant = mp->config.opt_string("printer_variant");
+            if (model.empty() || variant.empty())
+                throw std::runtime_error("preset missing printer_model/printer_variant: " + name);
+            ac->set_variant(vendor, model, variant, true);
+            // install the model's default filament(s) so the datadir can slice
+            std::vector<std::string> fils;
+            for (const auto &vp : pb->vendors)
+                for (const auto &pm : vp.second.models)
+                    if (pm.name == model || pm.id == model)
+                        for (const auto &f : pm.default_materials) fils.push_back(f);
+            if (!fils.empty()) {
+                std::map<std::string, std::string> sec =
+                    ac->has_section(AppConfig::SECTION_FILAMENTS)
+                        ? ac->get_section(AppConfig::SECTION_FILAMENTS)
+                        : std::map<std::string, std::string>{};
+                for (const auto &f : fils) sec[f] = "true";
+                ac->set_section(AppConfig::SECTION_FILAMENTS, sec);
+            }
+            // reload so visibility is recomputed from app_config, then select it
+            pb->load_presets(*ac, ForwardCompatibilitySubstitutionRule::EnableSystemSilent);
+            pb->printers.select_preset_by_name(name, true);
+            int vis = 0;
+            for (const Preset &pr : pb->printers.get_presets()) if (pr.is_visible) ++vis;
+            py::dict out;
+            out["printer"] = name; out["vendor"] = vendor;
+            out["model"] = model; out["variant"] = variant;
+            out["filaments_installed"] = (int) fils.size();
+            out["visible_printers"] = vis;
+            return out;
+        }, py::arg("name"))
         // Cloud device plane (M4). Registered in PyDevice.cpp; exposed here as
         // app.device. Account/app-level (one logged-in account), so it hangs
         // off Application, not Document.
