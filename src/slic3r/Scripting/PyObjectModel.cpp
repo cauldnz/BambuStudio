@@ -2331,6 +2331,27 @@ void register_object_model(py::module_ &m)
             fs::copy_file(src, fs::path(path), fs::copy_option::overwrite_if_exists);
             return path;
         }, py::arg("path"))
+        // Export the current plate as a printable .gcode.3mf container
+        // (UI-parity: Export -> "Export G-code" / the .gcode.3mf that Bambu prints).
+        // Unlike save_gcode (raw .gcode body), this is the wrapped container the
+        // device plane sends and that can be re-imported (load_gcode) and printed.
+        // Requires a valid slice.
+        .def("export_gcode_3mf", [](const PyDocument &, const std::string &path) {
+            namespace fs = boost::filesystem;
+            auto *plater = plater_or_throw("Document.export_gcode_3mf");
+            auto &list = plater->get_partplate_list();
+            int idx = list.get_curr_plate_index();
+            GUI::PartPlate *plate = list.get_plate(idx);
+            if (plate == nullptr) throw std::runtime_error("no current plate");
+            if (!plate->is_slice_result_valid())
+                throw std::runtime_error("no valid slice; call slice().wait() first");
+            int ret = plater->export_3mf(fs::path(path),
+                                         SaveStrategy::Silence | SaveStrategy::SplitModel |
+                                         SaveStrategy::WithGcode | SaveStrategy::SkipModel, idx);
+            if (ret < 0 || !fs::exists(fs::path(path)) || fs::file_size(fs::path(path)) == 0)
+                throw std::runtime_error("gcode.3mf not written: " + path);
+            return path;
+        }, py::arg("path"))
         // Save the project as a .3mf (UI-parity: Save Project).
         // Export the arranged geometry as STL (UI-parity: Export -> STL, but
         // without the file dialog). Combined transformed mesh over model parts.
@@ -2377,6 +2398,69 @@ void register_object_model(py::module_ &m)
             main_thread("Document.to_script");
             return build_state_script();
         })
+        // Generate a calibration test model in the scene (UI-parity: the
+        // Calibration menu). Routes through Plater::calib_* so it produces
+        // exactly what the GUI would, ready to slice + print. [B O] (Prusa has
+        // no in-GUI calibration generator -> N/A there).
+        //   kind: "pa" (mode=line|pattern|tower), "temp_tower", "max_vol_speed",
+        //         "vfa", "retraction", "flow_rate" (pass=1|2)
+        .def("calibrate", [](const PyDocument &, const std::string &kind, const py::kwargs &kw) {
+            main_thread("Document.calibrate");
+            auto *plater = plater_or_throw("Document.calibrate");
+            // The internal calib_* new_project(false,false) pops an UnsavedChanges
+            // confirm modal when the project/presets are dirty (wedges headless).
+            // Reset to a clean project first (skip_confirm) so that call stays silent.
+            plater->new_project(true, true);
+            auto getd = [&](const char *k, double d) { return kw.contains(k) ? kw[k].cast<double>() : d; };
+            auto geti = [&](const char *k, int d) { return kw.contains(k) ? kw[k].cast<int>() : d; };
+            Calib_Params params;
+            params.print_numbers = true;
+            params.extruder_id   = geti("extruder", 0);
+            std::string k = kind;
+            if (k == "pa" || k == "pressure_advance") {
+                std::string mode = kw.contains("mode") ? kw["mode"].cast<std::string>() : "pattern";
+                if (mode == "line")       params.mode = CalibMode::Calib_PA_Line;
+                else if (mode == "tower") params.mode = CalibMode::Calib_PA_Tower;
+                else                      params.mode = CalibMode::Calib_PA_Pattern;
+                params.start = getd("start", 0.0);
+                params.end   = getd("end", 0.08);
+                params.step  = getd("step", 0.002);
+                plater->calib_pa(params);
+            } else if (k == "temp_tower" || k == "temp") {
+                params.mode = CalibMode::Calib_Temp_Tower;
+                params.start = getd("start", 230.0);
+                params.end   = getd("end", 190.0);
+                params.step  = 5.0;
+                plater->calib_temp(params);
+            } else if (k == "max_vol_speed" || k == "vol_speed") {
+                params.mode = CalibMode::Calib_Vol_speed_Tower;
+                params.start = getd("start", 5.0);
+                params.end   = getd("end", 30.0);
+                params.step  = getd("step", 0.5);
+                plater->calib_max_vol_speed(params);
+            } else if (k == "vfa") {
+                params.mode = CalibMode::Calib_VFA_Tower;
+                params.start = getd("start", 40.0);
+                params.end   = getd("end", 200.0);
+                params.step  = getd("step", 10.0);
+                plater->calib_VFA(params);
+            } else if (k == "retraction") {
+                params.mode = CalibMode::Calib_Retraction_tower;
+                params.start = getd("start", 0.0);
+                params.end   = getd("end", 2.0);
+                params.step  = getd("step", 0.1);
+                plater->calib_retraction(params);
+            } else if (k == "flow_rate" || k == "flow") {
+                plater->calib_flowrate(geti("pass", 1));
+            } else {
+                throw std::runtime_error("unknown calibration kind: " + kind +
+                    " (pa|temp_tower|max_vol_speed|vfa|retraction|flow_rate)");
+            }
+            py::dict out;
+            out["kind"] = kind;
+            out["objects"] = plater->model().objects.size();
+            return out;
+        }, py::arg("kind"))
         .def("save_3mf", [](const PyDocument &, const std::string &path) {
             namespace fs = boost::filesystem;
             auto *plater = plater_or_throw("Document.save_3mf");
