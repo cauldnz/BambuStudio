@@ -5541,6 +5541,14 @@ void GUI_App::check_new_version(bool show_tips, int by_user)
 
 void GUI_App::check_beta_version(bool show_tips_when_no_beta)
 {
+    // pyslic3r: a headless/scripted session must never pop the beta-version update
+    // modal. wxDialog::ShowModal() runs a nested event loop that blocks forever
+    // under xvfb (nothing dismisses it) — it surfaces as an arrange/slice "hang"
+    // when the async version check returns mid-run. Same guard as the config wizard.
+    if (std::getenv("PYSLIC3R_SCRIPT") || std::getenv("PYSLIC3R_BRIDGE_PORT")) {
+        BOOST_LOG_TRIVIAL(info) << "pyslic3r: skipping beta-version check (headless)";
+        return;
+    }
     // When the beta channel is off the stable callers have already shown the toast
     // (see check_update / check_new_version), so we just bail out here.
     if (app_config->get("enable_beta_version_update") != "true") {
