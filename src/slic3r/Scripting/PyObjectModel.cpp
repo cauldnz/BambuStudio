@@ -145,7 +145,8 @@ struct PyPlateList {};
 struct PyPlate    { int idx; };
 
 // Which config a PyConfig fronts.
-enum class ConfigSource { Global, Print, Filament, Printer, Plate, Object, Volume };
+enum class ConfigSource { Global, Print, Filament, Printer, Plate, Object, Volume,
+                          Project };
 struct PyConfig { ConfigSource source; int plate_idx = 0; int vol_idx = 0; };
 
 // M3 slicing handles.
@@ -217,6 +218,16 @@ const ConfigBase *resolve_config(const PyConfig &c, const char *what)
         GUI::PartPlate *plate = plate_or_throw(c.plate_idx, what);
         if (plate->config() == nullptr) throw std::runtime_error("no plate config");
         return plate->config();
+    }
+    case ConfigSource::Project: {
+        // Project-scoped options — notably `filament_map` (which nozzle each
+        // filament prints on, 1-based) and `filament_map_mode`. These live on the
+        // PresetBundle, not on any preset, so they are invisible to the
+        // print/filament/printer sources.
+        main_thread(what);
+        PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+        if (pb == nullptr) throw std::runtime_error("no preset bundle");
+        return &pb->project_config;
     }
     case ConfigSource::Volume: {
         // per-volume overrides (ModelVolume::config); plate_idx=object, vol_idx=volume.
@@ -765,6 +776,14 @@ void register_object_model(py::module_ &m)
                 DynamicPrintConfig *cfg = plate->config();
                 if (cfg == nullptr) throw std::runtime_error("no plate config");
                 cfg->set_deserialize_strict(key, value);
+                plater->schedule_background_process();
+                return;
+            }
+            if (c.source == ConfigSource::Project) {
+                main_thread("Config.set");
+                PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+                if (pb == nullptr) throw std::runtime_error("no preset bundle");
+                pb->project_config.set_deserialize_strict(key, value);
                 plater->schedule_background_process();
                 return;
             }
@@ -2424,6 +2443,11 @@ void register_object_model(py::module_ &m)
         })
         .def_property_readonly("printer_config", [](const PyDocument &) {
             return PyConfig{ConfigSource::Printer};
+        })
+        // Project-scoped config (filament_map / filament_map_mode). Not a preset —
+        // it belongs to the project, which is why it is separate from the three above.
+        .def_property_readonly("project_config", [](const PyDocument &) {
+            return PyConfig{ConfigSource::Project};
         })
         .def_property_readonly("settings", [](const PyDocument &) { return PySettings{}; })
         .def_property_readonly("filaments", [](const PyDocument &) {
