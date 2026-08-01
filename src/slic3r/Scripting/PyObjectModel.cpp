@@ -1973,6 +1973,70 @@ void register_object_model(py::module_ &m)
     // ---- Plate / PlateList ------------------------------------------------
     py::class_<PyPlate>(m, "Plate")
         .def_property_readonly("index", [](const PyPlate &p) { return p.idx; })
+        // ---- filament -> nozzle map (dual-nozzle: H2D/H2C/X2D) -------------
+        // Extruder ids here are 1-BASED, matching the fork's own convention
+        // ("0 based filament ids, 1 based extruder ids", PartPlate.hpp:247).
+        // The dispatcher converts to 0-based at the Python boundary so the whole
+        // pyslic3r surface stays consistent.
+        .def_property("filament_maps",
+            [](const PyPlate &p) {
+                main_thread("Plate.filament_maps");
+                auto &list = plater_or_throw("Plate.filament_maps")->get_partplate_list();
+                GUI::PartPlate *plate = list.get_plate(p.idx);
+                if (plate == nullptr) throw std::runtime_error("plate gone");
+                py::list out;
+                for (int v : plate->get_filament_maps()) out.append(v);
+                return out;
+            },
+            [](const PyPlate &p, const std::vector<int> &maps) {
+                main_thread("Plate.filament_maps");
+                auto *plater = plater_or_throw("Plate.filament_maps");
+                GUI::PartPlate *plate = plater->get_partplate_list().get_plate(p.idx);
+                if (plate == nullptr) throw std::runtime_error("plate gone");
+                plate->set_filament_maps(maps);
+                plater->schedule_background_process();
+            })
+        // The plate has its OWN grouping mode, and get_real_filament_map_mode()
+        // prefers it over project_config unless it is fmmDefault. An auto mode
+        // REGROUPS filaments at slice time and discards the map, so setting the
+        // map without pinning the mode here achieves nothing.
+        // FilamentMapMode: 0 AutoForFlush, 1 AutoForMatch, 2 Manual,
+        //                  3 NozzleManual, 4 AutoForQuality, 5 Default.
+        .def_property("filament_map_mode",
+            [](const PyPlate &p) {
+                main_thread("Plate.filament_map_mode");
+                auto &list = plater_or_throw("Plate.filament_map_mode")->get_partplate_list();
+                GUI::PartPlate *plate = list.get_plate(p.idx);
+                if (plate == nullptr) throw std::runtime_error("plate gone");
+                return int(plate->get_filament_map_mode());
+            },
+            [](const PyPlate &p, int mode) {
+                main_thread("Plate.filament_map_mode");
+                auto *plater = plater_or_throw("Plate.filament_map_mode");
+                GUI::PartPlate *plate = plater->get_partplate_list().get_plate(p.idx);
+                if (plate == nullptr) throw std::runtime_error("plate gone");
+                plate->set_filament_map_mode(FilamentMapMode(mode));
+                plater->schedule_background_process();
+            })
+        // What the slicer will ACTUALLY use. The plate's own map wins when set;
+        // otherwise it falls back to project_config -- so writing project_config
+        // alone is silently shadowed whenever the plate already has one.
+        .def_property_readonly("effective_filament_maps", [](const PyPlate &p) {
+            main_thread("Plate.effective_filament_maps");
+            auto &list = plater_or_throw("Plate.effective_filament_maps")->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+            if (pb == nullptr) throw std::runtime_error("no preset bundle");
+            bool from_global = false;
+            auto maps = plate->get_real_filament_maps(pb->project_config, &from_global);
+            py::list vals;
+            for (int v : maps) vals.append(v);
+            py::dict d;
+            d["maps"] = vals;
+            d["source"] = from_global ? "project" : "plate";
+            return d;
+        })
         .def_property_readonly("object_count", [](const PyPlate &p) {
             auto &list = plater_or_throw("Plate.object_count")->get_partplate_list();
             GUI::PartPlate *plate = list.get_plate(p.idx);
