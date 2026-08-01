@@ -2486,6 +2486,52 @@ void register_object_model(py::module_ &m)
             pb->update_multi_material_filament_presets();
             plater->on_config_change(pb->full_config());
         }, py::arg("name"))
+        // ---- per-SLOT preset reads -----------------------------------------
+        // doc.filament_config is the single EDITED preset, so it reports slot 0 for
+        // every slot. These read the preset actually bound to THIS slot, which is
+        // the only way to answer "can nozzle N print the filament in slot S?".
+        .def("preset_get", [](const PyFilament &f, const std::string &key) -> py::object {
+            main_thread("Filament.preset_get");
+            PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+            if (pb == nullptr) throw std::runtime_error("no preset bundle");
+            const auto &names = pb->filament_presets;
+            if (f.slot < 0 || size_t(f.slot) >= names.size())
+                throw std::runtime_error("filament slot out of range");
+            const Preset *p = pb->filaments.find_preset(names[f.slot]);
+            if (p == nullptr) return py::none();
+            const ConfigOption *opt = p->config.option(key);
+            if (opt == nullptr) return py::none();
+            return py::cast(opt->serialize());
+        }, py::arg("key"))
+        // Per-extruder BITMASK: bit i set == nozzle i can print this filament.
+        // On an H2D, TPU reads 2 (0b10) = second nozzle only; a normal filament
+        // reads 3 (0b11) = either.
+        .def_property_readonly("printable", [](const PyFilament &f) -> py::object {
+            main_thread("Filament.printable");
+            PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+            if (pb == nullptr) throw std::runtime_error("no preset bundle");
+            const auto &names = pb->filament_presets;
+            if (f.slot < 0 || size_t(f.slot) >= names.size()) return py::none();
+            const Preset *p = pb->filaments.find_preset(names[f.slot]);
+            if (p == nullptr) return py::none();
+            auto *opt = p->config.option<ConfigOptionInts>("filament_printable");
+            if (opt == nullptr || opt->values.empty()) return py::none();
+            return py::cast(opt->values.front());
+        })
+        // The extruder variant this filament REQUIRES, e.g.
+        // "Direct Drive TPU High Flow". Compare against a nozzle's variant list.
+        .def_property_readonly("variant", [](const PyFilament &f) -> py::object {
+            main_thread("Filament.variant");
+            PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+            if (pb == nullptr) throw std::runtime_error("no preset bundle");
+            const auto &names = pb->filament_presets;
+            if (f.slot < 0 || size_t(f.slot) >= names.size()) return py::none();
+            const Preset *p = pb->filaments.find_preset(names[f.slot]);
+            if (p == nullptr) return py::none();
+            auto *opt = p->config.option<ConfigOptionStrings>("filament_extruder_variant");
+            if (opt == nullptr || opt->values.empty()) return py::none();
+            return py::cast(opt->values.front());
+        })
         .def("__repr__", [](const PyFilament &f) {
             return "<Filament slot=" + std::to_string(f.slot) + ">"; });
 
