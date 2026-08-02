@@ -783,6 +783,47 @@ void register_object_model(py::module_ &m)
                 main_thread("Config.set");
                 PresetBundle *pb = GUI::wxGetApp().preset_bundle;
                 if (pb == nullptr) throw std::runtime_error("no preset bundle");
+                // project_config is built by apply_only(defaults, s_project_options),
+                // so the keys it already HOLDS are exactly the project options. Without
+                // this, set_deserialize_strict() would happily create any PrintConfigDef
+                // key here -- applied after the printer/print presets, with no API path
+                // to remove it again.
+                if (!pb->project_config.has(key))
+                    throw std::runtime_error(
+                        key + " is not a project option (project config holds only the "
+                        "flush/filament-map/bed-type/switcher keys); use print_config, "
+                        "filament_config or printer_config");
+                // Map and mode have GUI-side invalidation. Writing the option directly
+                // leaves stale PLATE maps shadowing the new global mode, which is the
+                // exact store-but-not-effective failure this API keeps hitting.
+                if (key == "filament_map_mode") {
+                    DynamicPrintConfig tmp;
+                    tmp.apply_only(pb->project_config, {"filament_map_mode"});
+                    tmp.set_deserialize_strict(key, value);
+                    int m = tmp.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode")->getInt();
+                    if (m < 0 || m > int(fmmDefault))
+                        throw std::runtime_error("filament_map_mode out of range 0..5");
+                    plater->set_global_filament_map_mode(FilamentMapMode(m));
+                    plater->schedule_background_process();
+                    return;
+                }
+                if (key == "filament_map") {
+                    DynamicPrintConfig tmp;
+                    tmp.apply_only(pb->project_config, {"filament_map"});
+                    tmp.set_deserialize_strict(key, value);
+                    std::vector<int> vals = tmp.option<ConfigOptionInts>("filament_map")->values;
+                    int n_extruders = (int) pb->printers.get_edited_preset()
+                                          .config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+                    for (int v : vals)
+                        if (v < 1 || v > std::max(n_extruders, 1))
+                            throw std::runtime_error(
+                                "filament_map values are 1-BASED extruder ids; " +
+                                std::to_string(v) + " is out of range 1.." +
+                                std::to_string(std::max(n_extruders, 1)));
+                    plater->set_global_filament_map(vals);
+                    plater->schedule_background_process();
+                    return;
+                }
                 pb->project_config.set_deserialize_strict(key, value);
                 plater->schedule_background_process();
                 return;
@@ -1993,6 +2034,29 @@ void register_object_model(py::module_ &m)
                 auto *plater = plater_or_throw("Plate.filament_maps");
                 GUI::PartPlate *plate = plater->get_partplate_list().get_plate(p.idx);
                 if (plate == nullptr) throw std::runtime_error("plate gone");
+                PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+                if (pb == nullptr) throw std::runtime_error("no preset bundle");
+                // 1-BASED extruder ids. Zero underflows to SIZE_MAX downstream, and an
+                // over-range id indexes per-extruder vectors out of bounds.
+                int n_extruders = (int) pb->printers.get_edited_preset()
+                                      .config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+                for (int v : maps)
+                    if (v < 1 || v > std::max(n_extruders, 1))
+                        throw std::runtime_error(
+                            "filament_maps values are 1-BASED extruder ids; " +
+                            std::to_string(v) + " is out of range 1.." +
+                            std::to_string(std::max(n_extruders, 1)));
+                // PIN MANUAL FIRST. PartPlate::set_filament_map_mode() calls
+                // clear_filament_map() whenever the EFFECTIVE mode changes, so the
+                // natural caller sequence -- assign the map, then pin Manual -- threw
+                // the assignment away. Doing it in this order makes the map setter
+                // self-sufficient and matches what the GUI does.
+                FilamentMapMode global_mode =
+                    pb->project_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode")->value;
+                FilamentMapMode cur = plate->get_filament_map_mode();
+                FilamentMapMode eff = (cur == fmmDefault) ? global_mode : cur;
+                if (eff != fmmManual && eff != fmmNozzleManual)
+                    plate->set_filament_map_mode(fmmManual);
                 plate->set_filament_maps(maps);
                 plater->schedule_background_process();
             })
@@ -2015,6 +2079,14 @@ void register_object_model(py::module_ &m)
                 auto *plater = plater_or_throw("Plate.filament_map_mode");
                 GUI::PartPlate *plate = plater->get_partplate_list().get_plate(p.idx);
                 if (plate == nullptr) throw std::runtime_error("plate gone");
+                // Validate BEFORE casting: an out-of-range value reaches
+                // ConfigOptionEnum::serialize() and indexes the enum-name vector out
+                // of bounds, which is not caught in a release build.
+                if (mode < 0 || mode > int(fmmDefault))
+                    throw std::runtime_error(
+                        "filament_map_mode must be 0..5 (0 AutoForFlush, 1 AutoForMatch, "
+                        "2 Manual, 3 NozzleManual, 4 AutoForQuality, 5 Default); got " +
+                        std::to_string(mode));
                 plate->set_filament_map_mode(FilamentMapMode(mode));
                 plater->schedule_background_process();
             })
@@ -2036,6 +2108,21 @@ void register_object_model(py::module_ &m)
             d["maps"] = vals;
             d["source"] = from_global ? "project" : "plate";
             return d;
+        })
+        // Which filaments this plate's objects actually USE, 0-based.
+        // PartPlate::get_extruders(true) is what the GUI's own printable guard
+        // scopes itself to; checking every loaded slot instead makes an API guard
+        // stricter than the GUI, which breaks UI-parity in the restrictive
+        // direction (an unused, invalid slot would block a print the GUI allows).
+        .def_property_readonly("used_filaments", [](const PyPlate &p) {
+            main_thread("Plate.used_filaments");
+            auto &list = plater_or_throw("Plate.used_filaments")->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            py::list out;
+            for (int f : plate->get_extruders(true))
+                out.append(f - 1);              // 1-based filament id -> 0-based
+            return out;
         })
         .def_property_readonly("object_count", [](const PyPlate &p) {
             auto &list = plater_or_throw("Plate.object_count")->get_partplate_list();
@@ -2530,7 +2617,13 @@ void register_object_model(py::module_ &m)
             if (p == nullptr) return py::none();
             auto *opt = p->config.option<ConfigOptionStrings>("filament_extruder_variant");
             if (opt == nullptr || opt->values.empty()) return py::none();
-            return py::cast(opt->values.front());
+            // PER-EXTRUDER LIST, not a scalar. H2D TPU carries several entries and
+            // "Direct Drive TPU High Flow" is NOT the first -- .front() returned
+            // "Direct Drive Standard" and made a TPU look printable on nozzle 1.
+            // Return them all; the caller matches against the nozzle's variant list.
+            py::list out;
+            for (const auto &v : opt->values) out.append(v);
+            return py::object(out);
         })
         .def("__repr__", [](const PyFilament &f) {
             return "<Filament slot=" + std::to_string(f.slot) + ">"; });
