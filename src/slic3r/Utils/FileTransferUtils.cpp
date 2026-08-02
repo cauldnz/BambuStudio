@@ -126,8 +126,23 @@ void FileTransferJob::on_result(ResultCb cb) { result_cb_ = std::move(cb); }
 bool FileTransferJob::get_result(int &ec, int &resp_ec, std::string &json, std::vector<std::byte> &bin, uint32_t timeout_ms)
 {
     if (!h_) throw std::runtime_error("job handle invalid");
-    ft_job_result result;
-    if (m_->ft_job_get_result(h_, timeout_ms, &result) == ft_err::FT_EXCEPTION) return false;
+    // ZERO-INITIALISE. On any non-OK return the callee may not have written this
+    // struct at all, and the old code went on to parse it and then hand its
+    // pointers to ft_job_result_destroy().
+    ft_job_result result{};
+    // REQUIRE FT_OK. Only FT_EXCEPTION used to count as failure, so a timeout
+    // (FT_ETIMEOUT), I/O error (FT_EIO) or cancellation (FT_ECANCELLED) fell
+    // through, and res_ could still read 0 -- reporting a completed transfer for
+    // an upload that never finished. For a device file transfer that is the worst
+    // possible failure mode: silent, and indistinguishable from success.
+    const ft_err rc = m_->ft_job_get_result(h_, timeout_ms, &result);
+    if (rc != ft_err::FT_OK) {
+        ec      = static_cast<int>(rc);
+        resp_ec = static_cast<int>(rc);
+        json.clear();
+        bin.clear();
+        return false;                 // do NOT touch or destroy `result`
+    }
     solve_result(result);
     m_->ft_job_result_destroy(&result);
     ec = res_;

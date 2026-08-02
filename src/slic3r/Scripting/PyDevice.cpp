@@ -866,6 +866,7 @@ void register_device(py::module_ &m)
 
             // Tunnel URL: TCP-direct when we know a LAN ip, else the TUTK relay.
             std::string url;
+            std::atomic<bool> brtc_started{false};
             if (mo->is_support_brtc) {
                 const std::string ip = mo->get_dev_ip();
                 if (!ip.empty()) {
@@ -906,7 +907,9 @@ void register_device(py::module_ &m)
                 std::thread tworker([&]() {
                     try {
                         Slic3r::FileTransferTunnel tunnel(Slic3r::module(), url);
+                        brtc_started.store(true);   // a connection attempt began
                         if (!tunnel.sync_start_connect()) {
+                            brtc_started.store(false);   // never established
                             std::lock_guard<std::mutex> lk(tmtx);
                             terr = "filetransfer tunnel connect failed";
                             tdone.store(true);
@@ -932,7 +935,17 @@ void register_device(py::module_ &m)
                                 } catch (...) {}
                             }
                         }
-                        if (tstore.empty()) tstore = "emmc";   // GUI default (internal)
+                        if (tstore.empty()) {
+                            // Do NOT guess the destination on a device transfer.
+                            // "emmc" is the common case, not a safe default: on a
+                            // printer without it the upload goes nowhere and the
+                            // call still reports a storage name.
+                            terr = "media-ability query returned no storage; refusing "
+                                   "to guess a destination";
+                            tec  = -1;
+                            tok  = false;
+                            return;
+                        }
                         // upload (cmd_type 5)
                         nlohmann::json up;
                         up["cmd_type"]     = 5;
@@ -994,6 +1007,25 @@ void register_device(py::module_ &m)
                 if (tverify_ran) verified = py::bool_(tverified);
             }
 
+            // GATE FTP LIKE THE GUI. It picks one transport and never FTP-retries a
+            // BRTC upload that has started: retrying can duplicate a file that did
+            // land, and an FTP code 0 on a cloud printer reports staged=true for a
+            // file that never arrived. So fall back ONLY when BRTC was unsupported,
+            // or when the connection never came up at all.
+            const bool ftp_allowed = !mo->is_support_brtc || !brtc_started.load();
+            if (!staged && !ftp_allowed) {
+                out["staged"]      = false;
+                out["transport"]   = transport;
+                out["result_code"] = result_code;
+                out["error"]       = terror.empty()
+                    ? std::string("BRTC upload did not complete and FTP fallback is not "
+                                  "safe once the transfer has started -- the file may or "
+                                  "may not be on the printer. Check the printer's file "
+                                  "list before retrying.")
+                    : terror;
+                out["verified"]    = py::none();
+                return out;
+            }
             if (!staged) {
                 // ---- last resort: the legacy LAN FTP path (params fixed above) ----
                 std::atomic<bool> done{false};
