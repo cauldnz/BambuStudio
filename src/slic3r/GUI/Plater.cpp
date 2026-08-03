@@ -8736,7 +8736,18 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                                     _L("Attention!"));
                         },
                         [this, &path, &is_user_cancel, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value, double& angle_value, bool& is_split)-> int {
-                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                            // pyslic3r: never open the STEP mesh-quality dialog headlessly. ShowModal()
+                            // runs a nested event loop with nothing to dismiss it — the same failure
+                            // as the beta-version modal (#44) and the object-colour dialog (#95).
+                            // Reached by calibrate('max_vol_speed'), which loads
+                            // resources/calib/volumetric_speed/SpeedTestStructure.step.
+                            //
+                            // Falls through to the app's OWN else-branch, which uses the
+                            // linear/angle deflection and split-compound values from app_config —
+                            // the very values the dialog would have been pre-populated with. No
+                            // default is invented here.
+                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")
+                                && !std::getenv("PYSLIC3R_SCRIPT") && !std::getenv("PYSLIC3R_BRIDGE_PORT")) {
                                 StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                                 if (mesh_dlg.ShowModal() == wxID_OK) {
                                     linear_value = mesh_dlg.get_linear_defletion();
@@ -10901,7 +10912,18 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
                                             _L("Attention!"));
                 },
                 [this, &path, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value, double& angle_value, bool& is_split)-> int {
-                    if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                    // pyslic3r: never open the STEP mesh-quality dialog headlessly. ShowModal()
+                            // runs a nested event loop with nothing to dismiss it — the same failure
+                            // as the beta-version modal (#44) and the object-colour dialog (#95).
+                            // Reached by calibrate('max_vol_speed'), which loads
+                            // resources/calib/volumetric_speed/SpeedTestStructure.step.
+                            //
+                            // Falls through to the app's OWN else-branch, which uses the
+                            // linear/angle deflection and split-compound values from app_config —
+                            // the very values the dialog would have been pre-populated with. No
+                            // default is invented here.
+                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")
+                                && !std::getenv("PYSLIC3R_SCRIPT") && !std::getenv("PYSLIC3R_BRIDGE_PORT")) {
                         StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                         if (mesh_dlg.ShowModal() == wxID_OK) {
                             linear_value = mesh_dlg.get_linear_defletion();
