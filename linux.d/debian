@@ -31,6 +31,9 @@ REQUIRED_DEV_PACKAGES=(
     yasm
     libx264-dev
     libbz2-dev
+    # pyslic3r embedded runtime (BBS_PY_RUNTIME): CMakeLists.txt:798
+    python3-dev
+    pybind11-dev
 )
 
 if [[ -n "$UPDATE_LIB" ]]

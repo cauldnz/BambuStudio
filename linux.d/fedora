@@ -39,6 +39,9 @@ REQUIRED_DEV_PACKAGES=(
     yasm
     x264-devel
     bzip2-devel
+    # pyslic3r embedded runtime (BBS_PY_RUNTIME)
+    python3-devel
+    pybind11-devel
 )
 
 if [[ -n "$UPDATE_LIB" ]]
