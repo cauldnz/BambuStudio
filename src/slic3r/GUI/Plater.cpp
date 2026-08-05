@@ -8327,7 +8327,38 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     }
 
                     // Process color information in standard 3MF files(similar to color processing in OBJ files).
-                    if (load_model && !color_group_map.empty() && !volume_color_data.empty() && en_3mf_file_type != En3mfType::From_BBS) {
+                    //
+                    // pyslic3r: a headless/scripted session must never open the
+                    // object-colour mapping dialog. ShowModal() runs a nested event
+                    // loop that blocks forever under xvfb -- the same failure as the
+                    // beta-version modal, and the same guard (#44).
+                    //
+                    // This fires on BambuStudio's OWN shipped calibration asset:
+                    // resources/calib/filament_flow/flowrate-test-pass1.3mf is a bare
+                    // standard 3MF (its only metadata is a Title), so en_3mf_file_type
+                    // is not From_BBS and the app treats its own resource as a
+                    // third-party file. calib_flowrate -> add_model -> load_files
+                    // therefore wedges, while calib_pa is fine because it loads an
+                    // STL. Site confirmed by instrumenting all three ObjColorDialog
+                    // call sites, not inferred. (#95)
+                    //
+                    // Skipping is the right semantic too: the dialog assigns colours to
+                    // filament slots, and not running it leaves filament_ids untouched
+                    // -- what a caller doing its own colour mapping wants.
+                    const bool pyslic3r_headless =
+                        std::getenv("PYSLIC3R_SCRIPT") || std::getenv("PYSLIC3R_BRIDGE_PORT");
+                    if (pyslic3r_headless && load_model && !color_group_map.empty()
+                        && !volume_color_data.empty() && en_3mf_file_type != En3mfType::From_BBS) {
+                        // stderr as well as BOOST_LOG: these builds filter BOOST_LOG
+                        // out of stderr into <datadir>/log, and I once concluded this
+                        // branch was dead from a log line I was looking for in the
+                        // wrong stream. An "it did not fire" signal is only evidence
+                        // if it would have been visible had it fired.
+                        fprintf(stderr, "pyslic3r: skipping object-colour dialog (headless)\n");
+                        fflush(stderr);
+                        BOOST_LOG_TRIVIAL(info) << "pyslic3r: skipping object-colour dialog (headless)";
+                    }
+                    if (!pyslic3r_headless && load_model && !color_group_map.empty() && !volume_color_data.empty() && en_3mf_file_type != En3mfType::From_BBS) {
                         // Only process external standard 3MF files; the BBS's own 3MF files already have complete color processing logic
                         ObjDialogInOut color_dialog_in_out;
                         if (extract_colors_to_obj_dialog(&model, color_group_map, volume_color_data, color_dialog_in_out)) {
@@ -8705,7 +8736,18 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                                     _L("Attention!"));
                         },
                         [this, &path, &is_user_cancel, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value, double& angle_value, bool& is_split)-> int {
-                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                            // pyslic3r: never open the STEP mesh-quality dialog headlessly. ShowModal()
+                            // runs a nested event loop with nothing to dismiss it — the same failure
+                            // as the beta-version modal (#44) and the object-colour dialog (#95).
+                            // Reached by calibrate('max_vol_speed'), which loads
+                            // resources/calib/volumetric_speed/SpeedTestStructure.step.
+                            //
+                            // Falls through to the app's OWN else-branch, which uses the
+                            // linear/angle deflection and split-compound values from app_config —
+                            // the very values the dialog would have been pre-populated with. No
+                            // default is invented here.
+                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")
+                                && !std::getenv("PYSLIC3R_SCRIPT") && !std::getenv("PYSLIC3R_BRIDGE_PORT")) {
                                 StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                                 if (mesh_dlg.ShowModal() == wxID_OK) {
                                     linear_value = mesh_dlg.get_linear_defletion();
@@ -10870,7 +10912,18 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
                                             _L("Attention!"));
                 },
                 [this, &path, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value, double& angle_value, bool& is_split)-> int {
-                    if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                    // pyslic3r: never open the STEP mesh-quality dialog headlessly. ShowModal()
+                            // runs a nested event loop with nothing to dismiss it — the same failure
+                            // as the beta-version modal (#44) and the object-colour dialog (#95).
+                            // Reached by calibrate('max_vol_speed'), which loads
+                            // resources/calib/volumetric_speed/SpeedTestStructure.step.
+                            //
+                            // Falls through to the app's OWN else-branch, which uses the
+                            // linear/angle deflection and split-compound values from app_config —
+                            // the very values the dialog would have been pre-populated with. No
+                            // default is invented here.
+                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")
+                                && !std::getenv("PYSLIC3R_SCRIPT") && !std::getenv("PYSLIC3R_BRIDGE_PORT")) {
                         StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                         if (mesh_dlg.ShowModal() == wxID_OK) {
                             linear_value = mesh_dlg.get_linear_defletion();

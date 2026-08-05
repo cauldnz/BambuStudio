@@ -219,6 +219,12 @@ public:
     explicit TriangleSelector(const TriangleMesh& mesh, float edge_limit = 0.6f);
     int   get_orig_size_vertices() { return m_orig_size_vertices; }
     const std::vector<Triangle> &get_triangles() { return m_triangles; }
+    // Rewrite paint STATES in place, preserving subdivision. Used to move a
+    // model's painted regions onto different extruder slots without touching
+    // geometry: re-painting whole source facets instead would coarsen any fine
+    // paint the author did. Split and invalid triangles are skipped -- state is
+    // only meaningful on leaves. Returns how many triangles changed.
+    int remap_states(const std::map<int, int> &mapping);
     const std::vector<Vertex>&  get_vertices() { return m_vertices; }
     const std::vector<Vec3i>& get_neighbors() { return m_neighbors; }
     // Returns the facet_idx of the unsplit triangle containing the "hit". Returns -1 if the triangle isn't found.

@@ -1031,6 +1031,67 @@ void register_object_model(py::module_ &m)
             if (z_max <= z_min) throw std::runtime_error("paint_mmu_band: z_max must be > z_min");
             return mmu_paint_band(v, z_min, z_max, extruder);
         }, py::arg("z_min"), py::arg("z_max"), py::arg("extruder"))
+        // ---- colour IMPORT: what does an already-painted model expect? -------
+        // A downloaded multi-colour 3MF carries paint keyed to the slots ITS author
+        // used. is_mm_painted only says "yes, painted"; this says which extruders
+        // and how much of the mesh each covers, which is what an agent needs to
+        // decide whether its AMS can print the thing at all.
+        .def("paint_extruders", [](const PyVolume &v) {
+            main_thread("Volume.paint_extruders");
+            ModelVolume *vol = volume_at(v, "Volume.paint_extruders");
+            py::dict out;
+            py::list rows;
+            if (vol->mmu_segmentation_facets.get_data().first.empty()) {
+                out["painted"] = false;
+                out["extruders"] = rows;
+                out["total_facets"] = 0;
+                return out;
+            }
+            TriangleSelector sel(vol->mesh());
+            sel.deserialize(vol->mmu_segmentation_facets.get_data(), false);
+            std::map<int, int> counts;
+            int leaves = 0;
+            for (const auto &tr : sel.get_triangles()) {
+                if (!tr.valid() || tr.is_split()) continue;
+                ++leaves;
+                counts[int(tr.get_state())] += 1;
+            }
+            for (const auto &kv : counts) {
+                // state 0 is NONE (unpainted); report it separately from extruders
+                // so "half this model has no colour assigned" is visible rather
+                // than looking like an extruder.
+                py::dict d;
+                d["extruder"] = kv.first;          // 1-based, 0 == unpainted
+                d["facets"]   = kv.second;
+                d["fraction"] = leaves ? double(kv.second) / double(leaves) : 0.0;
+                rows.append(d);
+            }
+            out["painted"]      = true;
+            out["extruders"]    = rows;
+            out["total_facets"] = leaves;
+            return out;
+        })
+        // ---- region -> extruder mapping --------------------------------------
+        // Move painted regions onto different slots. LOSSLESS: rewrites the state
+        // on the selector's own leaves, so an author's fine (sub-facet) paint
+        // survives. Re-painting whole source facets would quietly coarsen it.
+        .def("remap_paint_extruders", [](const PyVolume &v, const std::map<int, int> &mapping) {
+            main_thread("Volume.remap_paint_extruders");
+            ModelVolume *vol = volume_at(v, "Volume.remap_paint_extruders");
+            if (vol->mmu_segmentation_facets.get_data().first.empty())
+                throw std::runtime_error("remap_paint_extruders: volume has no MMU paint");
+            for (const auto &kv : mapping) {
+                if (kv.first < 0 || kv.first > 16 || kv.second < 0 || kv.second > 16)
+                    throw std::runtime_error(
+                        "remap_paint_extruders: extruder ids are 1..16 (0 = unpainted); got " +
+                        std::to_string(kv.first) + "->" + std::to_string(kv.second));
+            }
+            TriangleSelector sel(vol->mesh());
+            sel.deserialize(vol->mmu_segmentation_facets.get_data(), false);
+            const int changed = sel.remap_states(mapping);
+            vol->mmu_segmentation_facets.set(sel);
+            return changed;
+        }, py::arg("mapping"))
         .def("clear_mmu_paint", [](const PyVolume &v) {
             main_thread("Volume.clear_mmu_paint");
             volume_at(v, "Volume.clear_mmu_paint")->mmu_segmentation_facets.reset();
