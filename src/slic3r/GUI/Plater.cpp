@@ -1,4 +1,9 @@
 #include "Plater.hpp"
+
+#ifdef BBS_PY_RUNTIME
+#include "slic3r/Scripting/PyHost.hpp"   // headless_session/push_warning (#121)
+#endif
+
 #include <array>
 #include <cstddef>
 #include <cstdio>
@@ -7933,6 +7938,26 @@ void read_binary_stl(const std::string& filename, std::string& model_id, std::st
 }
 
 // BBS: backup & restore
+// pyslic3r (#121): load_files is the densest modal site in the app -- seven
+// ShowModal() calls on paths any real project can take (saved by a newer Studio,
+// carrying customized presets, not from Bambu Lab...). Each one is a permanent
+// hang in a scripted session, where nothing clicks OK, and the load itself
+// succeeds either way: every one of them is informational. So each site asks
+// this first, and what it suppressed is recorded for Document.warnings.
+static bool headless_note(const std::string &msg)
+{
+#ifdef BBS_PY_RUNTIME
+    if (!pyslic3r::headless_session())
+        return false;
+    BOOST_LOG_TRIVIAL(warning) << "pyslic3r: suppressed load dialog: " << msg;
+    pyslic3r::push_warning(msg);
+    return true;
+#else
+    (void) msg;
+    return false;
+#endif
+}
+
 std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_files, LoadStrategy strategy, bool ask_multi)
 {
     std::vector<size_t> empty_result;
@@ -8130,7 +8155,8 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     if (en_3mf_file_type == En3mfType::From_Prusa) {
                         // do not reset the model config
                         load_config = false;
-                        if(load_type != LoadType::LoadGeometry)
+                        if (load_type != LoadType::LoadGeometry &&
+                            !headless_note("3mf is not from Bambu Lab: geometry loaded, config ignored"))
                             show_info(q, _L("The 3mf is not from Bambu Lab, load geometry data only."), _L("Load 3mf"));
                     }
                     else if (load_config && (file_version.maj() > app_version.maj())) {
@@ -8138,7 +8164,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         //load_config = false;
                         if (!load_model) {
                             // only load config case, return directly
-                            show_info(q, _L("The Config can not be loaded."), _L("Load 3mf"));
+                            if (!headless_note("the 3mf config could not be loaded: saved by a newer major version (" +
+                                               file_version.to_string() + " > " + app_version.to_string() + ")"))
+                                show_info(q, _L("The Config can not be loaded."), _L("Load 3mf"));
                             q->skip_thumbnail_invalid = false;
                             return empty_result;
                         }
@@ -8147,7 +8175,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         //q->select_view_3D("3D");
                         // select plate 0 as default
                         //q->select_plate(0);
-                        if (load_type != LoadType::LoadGeometry) {
+                        if (load_type != LoadType::LoadGeometry &&
+                            !headless_note("3mf was saved by a newer major version (" + file_version.to_string() +
+                                           " > " + app_version.to_string() + "): geometry loaded, config ignored")) {
                             if (en_3mf_file_type == En3mfType::From_BBS)
                                 show_info(q, _L("Due to the lower version of Bambu Studio, this 3mf file cannot be fully loaded. Please update Bambu Studio to the latest version"), _L("Load 3mf"));
                             else
@@ -8174,7 +8204,21 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         int app_version_cc = app_version.patch()/100;
 
                         if ((file_version.min() != app_version.min()) || (file_version_cc != app_version_cc)) {
+                            // The load has already succeeded here -- this dialog only tells
+                            // the user their Studio is older than the file. Every project
+                            // saved by a current Studio hits it, which makes it the single
+                            // dialog most likely to wedge a batch run (#121).
+                            std::string newer_msg = "3mf was saved by a newer Bambu Studio (" +
+                                                    file_version.to_string() + " > " + app_version.to_string() + ")";
                             if (config_substitutions.unrecogized_keys.size() > 0) {
+                                newer_msg += "; unrecognised config keys:";
+                                for (auto &key : config_substitutions.unrecogized_keys)
+                                    newer_msg += " " + key;
+                            }
+                            if (headless_note(newer_msg)) {
+                                // recorded, not shown
+                            }
+                            else if (config_substitutions.unrecogized_keys.size() > 0) {
                                 // std::string context = into_u8(text);
                                 wxString context;
                                 if (wxGetApp().app_config->get("user_mode") == "develop") {
@@ -8200,7 +8244,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     }
                     else if (load_config && config_loaded.empty()) {
                         load_config = false;
-                        if (wxGetApp().app_config->get_bool("skip_non_bambu_3mf_warning") != true) {
+                        if (wxGetApp().app_config->get_bool("skip_non_bambu_3mf_warning") != true &&
+                            !headless_note("3mf carries no loadable Bambu config (not from Bambu Lab, or from an old "
+                                           "Studio): geometry loaded, config ignored")) {
                             TipsDialog dlg(q,
                                 _L("Load 3mf"),
                                 file_version.maj() == 0 && file_version.min() == 0 && file_version.patch() == 0
@@ -8357,6 +8403,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         fprintf(stderr, "pyslic3r: skipping object-colour dialog (headless)\n");
                         fflush(stderr);
                         BOOST_LOG_TRIVIAL(info) << "pyslic3r: skipping object-colour dialog (headless)";
+#ifdef BBS_PY_RUNTIME
+                        pyslic3r::push_warning("object-colour mapping dialog skipped: the 3mf's colours were "
+                                               "left unmapped to filament slots");
+#endif
                     }
                     if (!pyslic3r_headless && load_model && !color_group_map.empty() && !volume_color_data.empty() && en_3mf_file_type != En3mfType::From_BBS) {
                         // Only process external standard 3MF files; the BBS's own 3MF files already have complete color processing logic
@@ -8463,11 +8513,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 warning_message += "\n";
                                 //show_info(q, _L("The 3mf has following modified G-codes in filament or printer presets:") + warning_message+ _L("Please confirm that these modified G-codes are safe to prevent any damage to the machine!"), _L("Modified G-codes"));
 
-                                MessageDialog dlg(q, _L("The 3mf has following modified G-codes in filament or printer presets:") + warning_message+ _L("Please confirm that these modified G-codes are safe to prevent any damage to the machine!"), _L("Modified G-codes"));
-                                dlg.show_dsa_button();
-                                auto  res = dlg.ShowModal();
-                                if (dlg.get_checkbox_state())
-                                    wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                if (!headless_note("the 3mf's filament/printer presets contain modified G-codes:" + warning_message)) {
+                                    MessageDialog dlg(q, _L("The 3mf has following modified G-codes in filament or printer presets:") + warning_message+ _L("Please confirm that these modified G-codes are safe to prevent any damage to the machine!"), _L("Modified G-codes"));
+                                    dlg.show_dsa_button();
+                                    auto  res = dlg.ShowModal();
+                                    if (dlg.get_checkbox_state())
+                                        wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                }
                             }
                             else if ((validated == VALIDATE_PRESETS_PRINTER_NOT_FOUND) || (validated == VALIDATE_PRESETS_FILAMENTS_NOT_FOUND)) {
                                 std::string warning_message;
@@ -8476,11 +8528,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     warning_message += "-" + *it + "\n";
                                 warning_message += "\n";
                                 //show_info(q, _L("The 3mf has following customized filament or printer presets:") + warning_message + _L("Please confirm that the G-codes within these presets are safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                MessageDialog dlg(q, _L("The 3mf has following customized filament or printer presets:") + from_u8(warning_message)+ _L("Please confirm that the G-codes within these presets are safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                dlg.show_dsa_button();
-                                auto  res = dlg.ShowModal();
-                                if (dlg.get_checkbox_state())
-                                    wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                if (!headless_note("the 3mf carries customized filament/printer presets:" + warning_message)) {
+                                    MessageDialog dlg(q, _L("The 3mf has following customized filament or printer presets:") + from_u8(warning_message)+ _L("Please confirm that the G-codes within these presets are safe to prevent any damage to the machine!"), _L("Customized Preset"));
+                                    dlg.show_dsa_button();
+                                    auto  res = dlg.ShowModal();
+                                    if (dlg.get_checkbox_state())
+                                        wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                }
                             }
                         }
 
