@@ -796,6 +796,26 @@ endfunction()
 if (BBS_PY_RUNTIME AND SLIC3R_GUI)
     # Embedded pyslic3r runtime (src/slic3r/Scripting -> libbambu_api).
     # M0 uses the distro toolchain: python3-dev + pybind11-dev.
+    #
+    # Windows: a build box typically has several Pythons and FindPython prefers the
+    # newest (e.g. 3.14) over the specific interpreter we build & bundle against.
+    # Pin it to the install named by the Python_ROOT_DIR env var (runbook step 5)
+    # so find_package(Python ... Development.Embed) resolves deterministically. Also
+    # honour pybind11_DIR from the env, since the app build overrides CMAKE_PREFIX_PATH
+    # with the deps destdir. No-op on Linux/macOS (distro paths already resolve).
+    if (WIN32)
+        if (NOT DEFINED Python_EXECUTABLE AND DEFINED ENV{Python_ROOT_DIR})
+            set(Python_ROOT_DIR "$ENV{Python_ROOT_DIR}")
+            set(Python_FIND_REGISTRY "LAST")
+            set(Python_FIND_STRATEGY "LOCATION")
+            if (EXISTS "$ENV{Python_ROOT_DIR}/python.exe")
+                set(Python_EXECUTABLE "$ENV{Python_ROOT_DIR}/python.exe")
+            endif ()
+        endif ()
+        if (NOT pybind11_DIR AND DEFINED ENV{pybind11_DIR})
+            set(pybind11_DIR "$ENV{pybind11_DIR}")
+        endif ()
+    endif ()
     find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Embed)
     find_package(pybind11 CONFIG REQUIRED)
     message(STATUS "pyslic3r runtime enabled: Python ${Python_VERSION}, pybind11 ${pybind11_VERSION}")

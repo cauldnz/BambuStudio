@@ -205,7 +205,7 @@ IF %ERRORLEVEL% NEQ 0 IF "%PS_STEPS_DIRTY%" NEQ "" (
     (del CMakeCache.txt && %PS_CMAKE_EXE% .. %PS_CMAKE_GENERATOR_ARGS% -DDESTDIR="%PS_DESTDIR%") || GOTO :END
 ) ELSE GOTO :END
 (echo %PS_DESTDIR%)> "%PS_DEPS_PATH_FILE%"
-msbuild /m ALL_BUILD.vcxproj /p:Configuration=%PS_CONFIG%  /v:quiet || GOTO :END
+msbuild /m%PS_DEPS_MSBUILD_JOBS% ALL_BUILD.vcxproj /p:Configuration=%PS_CONFIG%  /v:quiet || GOTO :END
 cd ..\..
 IF /I "%PS_STEPS:~0,4%" EQU "deps" GOTO :RUN_APP
 
