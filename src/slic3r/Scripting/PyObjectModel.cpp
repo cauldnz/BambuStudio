@@ -49,6 +49,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
 #include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
 #include "slic3r/GUI/GUI_App.hpp"
+#include "PyHost.hpp"                       // warnings()/clear_warnings() (#121)
 #include <pybind11/eval.h>                  // py::exec (embedded download helper)
 #include <boost/filesystem/fstream.hpp>
 #include <regex>
@@ -3008,6 +3009,9 @@ void register_object_model(py::module_ &m)
         // call model.clear() first for a clean replace.
         .def("open_project", [](const PyDocument &, const std::string &path) {
             auto *plater = plater_or_throw("Document.open_project");
+            // Warnings are per-load: what the previous open suppressed is not
+            // this open's problem.
+            clear_warnings();
             GUI::Plater::TakeSnapshot snap(plater, std::string("API: open project"));
             std::vector<boost::filesystem::path> paths{ boost::filesystem::path(path) };
             plater->load_files(paths,
@@ -3016,6 +3020,12 @@ void register_object_model(py::module_ &m)
                 /*ask_multi=*/false);
             return plater->model().objects.size();
         }, py::arg("path"))
+        // What the loader would have told a human in a dialog. Headless those
+        // dialogs are suppressed (#121) -- a batch job reads them here instead and
+        // decides for itself whether to proceed. Cleared by each open_project.
+        .def_property_readonly("warnings", [](const PyDocument &) {
+            return warnings();
+        })
         .def("to_script", [](const PyDocument &) {
             main_thread("Document.to_script");
             return build_state_script();

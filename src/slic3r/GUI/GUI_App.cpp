@@ -8146,6 +8146,19 @@ bool GUI_App::config_wizard_startup()
 
 void GUI_App::check_updates(const bool verbose)
 {
+#ifdef BBS_PY_RUNTIME
+    // pyslic3r: PresetUpdater::config_update() opens a modal when new vendor
+    // profiles are published upstream. Headless there is nobody to dismiss it,
+    // and because this runs from a pending event the block does not surface at
+    // startup -- it surfaces inside the NEXT wxYield, i.e. as an arrange() or
+    // slice() "hang". That wedged every Bambu arrange/slice test from ~2026-08-27
+    // (nightly matrix red, Bambu-only, all timeouts). Same guard as the config
+    // wizard and the beta-version check.
+    if (pyslic3r::headless_session()) {
+        BOOST_LOG_TRIVIAL(info) << "pyslic3r: skipping preset-update check (headless)";
+        return;
+    }
+#endif
     PresetUpdater::UpdateResult updater_result;
     try {
         //updater_result = preset_updater->config_update(app_config->orig_version(), verbose ? PresetUpdater::UpdateParams::SHOW_TEXT_BOX : PresetUpdater::UpdateParams::SHOW_NOTIFICATION);
