@@ -39,7 +39,8 @@ struct Calib_Params
     Calib_Params() : mode(CalibMode::Calib_None){}
     int extruder_id = 0;
     bool has_bowden_extruder = false;
-    double start, end, step;
+    // never indeterminate: these reach the pattern geometry and its G-code
+    double start = 0., end = 0., step = 0.;
     bool print_numbers = false;
     CalibMode mode;
 };
@@ -330,7 +331,19 @@ private:
 
     double    height_first_layer() const { return m_config.option<ConfigOptionFloat>("initial_layer_print_height")->value; };
     double    height_layer() const { return m_config.option<ConfigOptionFloat>("layer_height")->value; };
-    const int get_num_patterns() const { return std::ceil((m_params.end - m_params.start) / m_params.step + 1); }
+    // Bounded on purpose. A degenerate step (0) or a nonsense range makes this
+    // quotient non-finite or astronomically large, and converting either to int is
+    // undefined behaviour -- on x86 it yields INT_MIN, which the loop in
+    // max_numbering_height() then reads as a ~1.8e19 unsigned bound and never
+    // finishes (#95). The real size limit is the "model is too large" check in
+    // Plater::_calib_pa_pattern; this only keeps the conversion defined.
+    const int get_num_patterns() const
+    {
+        const double num = std::ceil((m_params.end - m_params.start) / m_params.step + 1);
+        if (!std::isfinite(num) || num < 1.)   // step == 0 lands here, and so does NaN
+            return 1;                          // a range that says nothing -> draw one
+        return num > 10000. ? 10000 : static_cast<int>(num);
+    }
 
     /*
     from slic3r documentation: spacing = extrusion_width - layer_height * (1 - PI/4)
@@ -353,7 +366,15 @@ private:
 
     double pattern_shift() const;
 
-    const Calib_Params &m_params;
+    // BY VALUE: the pattern outlives the Calib_Params it was built from.
+    // Plater::_calib_pa_pattern copies this object into Model::calib_pa_pattern,
+    // which every later reslice() re-reads to regenerate the custom G-code (and the
+    // background slicer copies the Model again on top of that). Holding a reference
+    // only ever worked because the params the GUI passes belong to MainFrame's PA
+    // dialog, which is constructed once and never destroyed; any other caller -- a
+    // script whose Calib_Params is a local -- left this dangling, and the garbage
+    // read back made get_num_patterns() spin forever (#95).
+    Calib_Params m_params;
 
     GCodeWriter m_writer;
     Vec3d       m_starting_point;
