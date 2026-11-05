@@ -35,6 +35,8 @@
 #include "slic3r/GUI/DeviceManager.hpp"
 #include "slic3r/GUI/DeviceCore/DevFilaSystem.h"
 #include "slic3r/GUI/Printer/BambuTunnel.h"
+#include "slic3r/Utils/FileTransferUtils.hpp"   // BRTC FileTransfer (cloud send)
+#include <boost/algorithm/string/predicate.hpp>
 #include "libslic3r/Utils.hpp"
 #include <dlfcn.h>
 #include <cstdio>
@@ -766,7 +768,7 @@ void register_device(py::module_ &m)
         // dry_run=True exports + prepares only (no upload).
         .def("stage", [](const PyDevice &, py::object plate, bool dry_run,
                          const std::string &project_name, bool use_ams,
-                         const std::string &ams_mapping) -> py::dict {
+                         const std::string &ams_mapping, bool verify) -> py::dict {
             GUI::Plater *plater = plater_dev("Device.stage");
             DeviceManager *dm = devmgr("Device.stage");
             NetworkAgent *a = GUI::wxGetApp().getAgent();
@@ -814,6 +816,21 @@ void register_device(py::module_ &m)
             if (!(use_ams && build_ams_mapping(mo, plater, idx, use_ams, params)))
                 params.ams_mapping = ams_mapping;
 
+            // BBL::PrintParams declares these with NO default initializer, so a bare
+            // `BBL::PrintParams params;` leaves them indeterminate. The GUI SendJob
+            // sets them (SendJob.cpp:129-130, 206-207) — mirror that, or the FTP
+            // fallback can negotiate the wrong transport security.
+            params.use_ssl_for_ftp  = mo->local_use_ssl_for_ftp;
+            params.use_ssl_for_mqtt = mo->local_use_ssl_for_mqtt;
+            std::string dest_name = project_name;
+            if (!boost::algorithm::iends_with(dest_name, ".gcode.3mf"))
+                dest_name += ".gcode.3mf";     // the container suffix the printer expects
+            params.project_name = dest_name;
+            try {
+                params.preset_name =
+                    GUI::wxGetApp().preset_bundle->prints.get_selected_preset_name();
+            } catch (...) {}
+
             py::dict out;
             out["dev_id"]          = params.dev_id;
             out["gcode_3mf"]       = params.filename;
@@ -823,53 +840,244 @@ void register_device(py::module_ &m)
             out["supports_sdcard"] = mo->is_support_send_to_sdcard;
 
             if (dry_run) {
-                out["dry_run"] = true;
-                out["staged"]  = false;
-                out["ready"]   = !params.filename.empty();
+                out["dry_run"]   = true;
+                out["staged"]    = false;
+                out["verified"]  = py::none();
+                out["transport"] = std::string(mo->is_support_brtc ? "brtc" : "ftp");
+                out["storage"]   = std::string();
+                out["dest_name"] = dest_name;
+                out["ready"]     = !params.filename.empty();
                 return out;
             }
 
-            // Upload to the printer's storage on a worker thread while pumping
-            // the main loop (mirrors the GUI's SendJob). NO print is started.
-            std::atomic<bool> done{false};
-            std::atomic<int>  sret{-999};
-            std::mutex        info_mtx;
-            std::string       info_snap;
-            int               stage_snap = -1;
-            auto update_fn = [&](int stage, int /*code*/, std::string info) {
-                std::lock_guard<std::mutex> lk(info_mtx);
-                stage_snap = stage; info_snap = std::move(info);
-            };
-            auto cancel_fn = []() { return false; };
-            auto wait_fn   = [](int, std::string) { return true; };
+            // ---- transport ------------------------------------------------
+            // A cloud-connected printer's "Send to Printer" does NOT use FTP: the
+            // GUI takes the BRTC FileTransfer path when the printer supports it
+            // (SendToPrinter.cpp:947, is_support_brtc = fun[31]) and only falls back
+            // to FTP. Staging over FTP against a cloud printer returns result_code:0
+            // while the file never reaches the printer's Files list — hence both
+            // paths here, BRTC first. NO print is started either way.
+            std::string transport   = "none";
+            std::string storage;
+            std::string terror;
+            int         result_code = -999;
+            bool        staged      = false;
+            py::object  verified    = py::none();
 
-            std::thread worker([&]() {
-                const int r = a->start_send_gcode_to_sdcard(params, update_fn,
-                                                            cancel_fn, wait_fn);
-                sret.store(r);
-                done.store(true);
-            });
-            {
-                py::gil_scoped_release nogil;
-                while (!done.load()) {
-                    if (wxTheApp != nullptr) wxTheApp->Yield(true);
-                    wxMilliSleep(80);
+            // Tunnel URL: TCP-direct when we know a LAN ip, else the TUTK relay.
+            std::string url;
+            std::atomic<bool> brtc_started{false};
+            if (mo->is_support_brtc) {
+                const std::string ip = mo->get_dev_ip();
+                if (!ip.empty()) {
+                    url = "bambu:///local/" + ip + "?port=6000&user=bblp&passwd="
+                        + mo->get_access_code();
+                } else {
+                    // Relay: the plugin hands back the URL through a callback, so
+                    // pump the main loop until it fires (same shape as camera_url).
+                    const std::string dev_ver = mo->get_ota_version();
+                    auto got = std::make_shared<std::atomic<bool>>(false);
+                    auto u   = std::make_shared<std::string>();
+                    a->get_camera_url(mo->get_dev_id() + "|" + dev_ver + "|\"tutk\"",
+                                      [u, got](std::string s2) {
+                                          *u = std::move(s2); got->store(true);
+                                      });
+                    for (int i = 0; i < 200 && !got->load(); ++i) {
+                        if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                        wxMilliSleep(50);
+                    }
+                    if (got->load() && boost::algorithm::starts_with(*u, "bambu:///"))
+                        url = *u + "&device=" + mo->get_dev_id()
+                                 + "&net_ver=" + a->get_version()
+                                 + "&dev_ver=" + dev_ver;
                 }
             }
-            worker.join();
+
+            if (!url.empty()) {
+                // sync_start_connect()/get_result() are blocking -> worker thread
+                // while the main loop is pumped (no CallAfter needed).
+                std::atomic<bool> tdone{false};
+                std::mutex        tmtx;
+                std::string       tstore, terr;
+                int               tec = -999;
+                bool              tok = false, tverified = false, tverify_ran = false;
+                const std::string local_file = params.filename;
+                const bool        want_verify = verify;
+
+                std::thread tworker([&]() {
+                    try {
+                        Slic3r::FileTransferTunnel tunnel(Slic3r::module(), url);
+                        brtc_started.store(true);   // a connection attempt began
+                        if (!tunnel.sync_start_connect()) {
+                            brtc_started.store(false);   // never established
+                            std::lock_guard<std::mutex> lk(tmtx);
+                            terr = "filetransfer tunnel connect failed";
+                            tdone.store(true);
+                            return;
+                        }
+                        int ec = -999, resp = 0;
+                        std::string js;
+                        std::vector<std::byte> bin;
+                        // media-ability (cmd_type 7) -> which storages the printer has
+                        {
+                            Slic3r::FileTransferJob ma(Slic3r::module(),
+                                                       std::string(R"({"cmd_type":7})"));
+                            ma.start_on(tunnel);
+                            if (ma.get_result(ec, resp, js, bin, 20000) && ec == 0 && !js.empty()) {
+                                try {
+                                    auto j = nlohmann::json::parse(js);
+                                    if (j.is_array() && !j.empty() && j[0].is_string())
+                                        tstore = j[0].get<std::string>();
+                                    else if (j.is_object() && j.contains("storage")
+                                             && j["storage"].is_array() && !j["storage"].empty()
+                                             && j["storage"][0].is_string())
+                                        tstore = j["storage"][0].get<std::string>();
+                                } catch (...) {}
+                            }
+                        }
+                        if (tstore.empty()) {
+                            // Do NOT guess the destination on a device transfer.
+                            // "emmc" is the common case, not a safe default: on a
+                            // printer without it the upload goes nowhere and the
+                            // call still reports a storage name.
+                            terr = "media-ability query returned no storage; refusing "
+                                   "to guess a destination";
+                            tec  = -1;
+                            tok  = false;
+                            return;
+                        }
+                        // upload (cmd_type 5)
+                        nlohmann::json up;
+                        up["cmd_type"]     = 5;
+                        up["dest_storage"] = tstore;
+                        up["dest_name"]    = dest_name;
+                        up["file_path"]    = local_file;
+                        Slic3r::FileTransferJob job(Slic3r::module(), up.dump());
+                        job.start_on(tunnel);
+                        ec = -999; js.clear(); bin.clear();
+                        if (job.get_result(ec, resp, js, bin, 20u * 60u * 1000u) && ec == 0) {
+                            tok = true;
+                        } else {
+                            std::lock_guard<std::mutex> lk(tmtx);
+                            terr = "filetransfer upload failed ec=" + std::to_string(ec);
+                        }
+                        tec = ec;
+                        // Optional download-back existence probe (cmd_type 4). There is
+                        // no list-files command in OSS, so this is the only real proof
+                        // the file landed — but the exact `path` format for a staged
+                        // file is the one ABI detail still to confirm against hardware,
+                        // so it is opt-in and never fails the stage.
+                        if (tok && want_verify) {
+                            tverify_ran = true;
+                            try {
+                                nlohmann::json dn;
+                                dn["cmd_type"]    = 4;
+                                dn["path"]        = "/" + tstore + "/" + dest_name;
+                                dn["is_mem_file"] = true;
+                                dn["target_path"] = local_file + ".verify";
+                                Slic3r::FileTransferJob vj(Slic3r::module(), dn.dump());
+                                vj.start_on(tunnel);
+                                int vec = -999, vresp = 0;
+                                std::string vjs;
+                                std::vector<std::byte> vbin;
+                                if (vj.get_result(vec, vresp, vjs, vbin, 120000) && vec == 0)
+                                    tverified = true;
+                            } catch (...) {}
+                        }
+                    } catch (const std::exception &e) {
+                        std::lock_guard<std::mutex> lk(tmtx); terr = e.what();
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lk(tmtx); terr = "filetransfer failed";
+                    }
+                    tdone.store(true);
+                });
+                {
+                    py::gil_scoped_release nogil;
+                    while (!tdone.load()) {
+                        if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                        wxMilliSleep(80);
+                    }
+                }
+                tworker.join();
+                transport   = "brtc";
+                staged      = tok;
+                result_code = tec;
+                storage     = tstore;
+                { std::lock_guard<std::mutex> lk(tmtx); terror = terr; }
+                if (tverify_ran) verified = py::bool_(tverified);
+            }
+
+            // GATE FTP LIKE THE GUI. It picks one transport and never FTP-retries a
+            // BRTC upload that has started: retrying can duplicate a file that did
+            // land, and an FTP code 0 on a cloud printer reports staged=true for a
+            // file that never arrived. So fall back ONLY when BRTC was unsupported,
+            // or when the connection never came up at all.
+            const bool ftp_allowed = !mo->is_support_brtc || !brtc_started.load();
+            if (!staged && !ftp_allowed) {
+                out["staged"]      = false;
+                out["transport"]   = transport;
+                out["result_code"] = result_code;
+                out["error"]       = terror.empty()
+                    ? std::string("BRTC upload did not complete and FTP fallback is not "
+                                  "safe once the transfer has started -- the file may or "
+                                  "may not be on the printer. Check the printer's file "
+                                  "list before retrying.")
+                    : terror;
+                out["verified"]    = py::none();
+                return out;
+            }
+            if (!staged) {
+                // ---- last resort: the legacy LAN FTP path (params fixed above) ----
+                std::atomic<bool> done{false};
+                std::atomic<int>  sret{-999};
+                std::mutex        info_mtx;
+                std::string       info_snap;
+                int               stage_snap = -1;
+                auto update_fn = [&](int stg, int /*code*/, std::string info) {
+                    std::lock_guard<std::mutex> lk(info_mtx);
+                    stage_snap = stg; info_snap = std::move(info);
+                };
+                auto cancel_fn = []() { return false; };
+                auto wait_fn   = [](int, std::string) { return true; };
+
+                std::thread worker([&]() {
+                    const int r = a->start_send_gcode_to_sdcard(params, update_fn,
+                                                                cancel_fn, wait_fn);
+                    sret.store(r);
+                    done.store(true);
+                });
+                {
+                    py::gil_scoped_release nogil;
+                    while (!done.load()) {
+                        if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                        wxMilliSleep(80);
+                    }
+                }
+                worker.join();
+                if (transport == "none") transport = "ftp";
+                else                     transport += "+ftp";   // brtc tried, fell back
+                staged      = (sret.load() == 0);
+                result_code = sret.load();
+                {
+                    std::lock_guard<std::mutex> lk(info_mtx);
+                    out["stage"] = stage_snap;
+                    out["info"]  = info_snap;
+                }
+            }
 
             out["dry_run"]     = false;
-            out["staged"]      = (sret.load() == 0);
-            out["result_code"] = sret.load();
-            {
-                std::lock_guard<std::mutex> lk(info_mtx);
-                out["stage"] = stage_snap;
-                out["info"]  = info_snap;
-            }
+            out["transport"]   = transport;
+            out["staged"]      = staged;
+            out["verified"]    = verified;
+            out["storage"]     = storage;
+            out["dest_name"]   = dest_name;
+            out["result_code"] = result_code;
+            out["error"]       = terror;
             return out;
         }, py::arg("plate") = py::none(), py::arg("dry_run") = false,
            py::arg("project_name") = std::string("pyslic3r"),
-           py::arg("use_ams") = false, py::arg("ams_mapping") = std::string());
+           py::arg("use_ams") = false, py::arg("ams_mapping") = std::string(),
+           py::arg("verify") = false);
 
     m.attr("_device_singleton") = py::cast(PyDevice{});
 }
