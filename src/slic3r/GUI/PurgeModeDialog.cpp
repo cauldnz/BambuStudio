@@ -31,8 +31,7 @@ PurgeModeDialog::PurgeModeDialog(wxWindow *parent, PurgeModeDialogType dialog_ty
     : DPIDialog(parent, wxID_ANY, _L("Purge Mode Settings"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE), m_dialog_type(dialog_type)
 {
     SetBackgroundColour(*wxWHITE);
-    SetMinSize(wxSize(FromDIP(520), FromDIP(320)));
-    SetMaxSize(wxSize(FromDIP(520), FromDIP(320)));
+    update_size_hints();
     std::string icon_path = (boost::format("%1%/images/BambuStudioTitle.ico") % Slic3r::resources_dir()).str();
     SetIcon(wxIcon(Slic3r::encode_path(icon_path.c_str()), wxBITMAP_TYPE_ICO));
 
@@ -52,9 +51,9 @@ PurgeModeDialog::PurgeModeDialog(wxWindow *parent, PurgeModeDialogType dialog_ty
     bool is_fast_mode = (m_dialog_type == PurgeModeDialogType::FastMode);
 
     // Standard option
-    m_standard_panel = new PurgeModeBtnPanel(options_panel, _L("Standard"), _L("Perform full purging with speed and temperature transition for the best print quality."),
+    m_standard_panel = new PurgeModeBtnPanel(options_panel, _L("Standard"), _L("Perform a full prime tower purge with speed and temperature transitions for optimal print quality."),
                                              "shield");
-    m_standard_panel->SetMinSize(wxSize(FromDIP(200), FromDIP(150)));
+    m_standard_panel->SetMinSize(wxSize(FromDIP(200), -1));
     m_standard_panel->Select(mode == pvmDefault);
     m_standard_panel->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &) { select_option(pvmDefault); });
     panels_sizer->Add(m_standard_panel, 1, wxEXPAND | wxRIGHT, FromDIP(12));
@@ -63,14 +62,14 @@ PurgeModeDialog::PurgeModeDialog(wxWindow *parent, PurgeModeDialogType dialog_ty
         PrimeVolumeMode fast_mode = pvmFast;
         m_saving_panel            = new PurgeModeBtnPanel(options_panel, _L("Fast"),
                                                           _L("Uses optimized purge temperature, multiplier and stronger extrusion for faster purging. May cause slight color mixing in some extreme cases."), "leaf");
-        m_saving_panel->SetMinSize(wxSize(FromDIP(200), FromDIP(150)));
+        m_saving_panel->SetMinSize(wxSize(FromDIP(200), -1));
         m_saving_panel->Select(mode == fast_mode);
         m_saving_panel->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &) { select_option(pvmFast); });
     } else {
         // Multi-nozzle: Prime Saving option
         m_saving_panel = new PurgeModeBtnPanel(options_panel, _L("Prime Saving"),
-                                               _L("Reduces prime waste and prints faster. May cause slight color mixing or small surface defects."), "leaf");
-        m_saving_panel->SetMinSize(wxSize(FromDIP(200), FromDIP(150)));
+                                               _L("Reduces prime waste and prints faster. May cause slight color mixing(only for H2C and H3C external 1st/2nd Gen AMS nozzles) or small surface defects."), "leaf");
+        m_saving_panel->SetMinSize(wxSize(FromDIP(200), -1));
         m_saving_panel->Select(mode == pvmSaving);
         m_saving_panel->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &) { select_option(pvmSaving); });
     }
@@ -79,18 +78,18 @@ PurgeModeDialog::PurgeModeDialog(wxWindow *parent, PurgeModeDialogType dialog_ty
 
     options_sizer->Add(panels_sizer, 0, wxEXPAND | wxALL, FromDIP(20));
 
-    if (!is_fast_mode) {
-        // Learn more text (only for multi-nozzle printers)
-        auto wiki_sizer      = new wxBoxSizer(wxHORIZONTAL);
-        auto learn_more_text = new wxStaticText(options_panel, wxID_ANY, _L("Learn more about prime mode"));
-        learn_more_text->SetFont(Label::Body_12);
-        learn_more_text->SetForegroundColour(wxColour("#6B6B6A"));
-        wiki_sizer->Add(learn_more_text, 0, wxALIGN_CENTER_VERTICAL);
-        auto wiki = new WikiPanel(options_panel);
+    auto wiki_sizer      = new wxBoxSizer(wxHORIZONTAL);
+    auto learn_more_text = new wxStaticText(options_panel, wxID_ANY, _L("Learn more about prime mode"));
+    learn_more_text->SetFont(Label::Body_12);
+    learn_more_text->SetForegroundColour(wxColour("#6B6B6A"));
+    wiki_sizer->Add(learn_more_text, 0, wxALIGN_CENTER_VERTICAL);
+    auto wiki = new WikiPanel(options_panel);
+    if (is_fast_mode)
+        wiki->SetWikiUrl("https://e.bambulab.com/t?c=hAKapVo084CyLBEV");
+     else
         wiki->SetWikiUrl("https://e.bambulab.com/t?c=whk9cGnoWcJbji1F");
-        wiki_sizer->Add(wiki, 0, wxLEFT, FromDIP(2));
-        options_sizer->Add(wiki_sizer, 0, wxLEFT | wxRIGHT, FromDIP(20));
-    }
+    wiki_sizer->Add(wiki, 0, wxLEFT, FromDIP(2));
+    options_sizer->Add(wiki_sizer, 0, wxLEFT | wxRIGHT, FromDIP(20));
 
     options_panel->SetSizer(options_sizer);
     main_sizer->Add(options_panel, 1, wxEXPAND);
@@ -165,14 +164,17 @@ void PurgeModeDialog::update_panel_selection()
     }
 }
 
+void PurgeModeDialog::update_size_hints()
+{
+    SetMinSize(wxSize(FromDIP(520), FromDIP(320)));
+    SetMaxSize(wxSize(FromDIP(520), -1));
+}
+
 void PurgeModeDialog::on_dpi_changed(const wxRect &suggested_rect)
 {
-    const int &em = em_unit();
+    msw_buttons_rescale(this, em_unit(), {wxID_OK, wxID_CANCEL});
 
-    msw_buttons_rescale(this, em, {wxID_OK, wxID_CANCEL});
-
-    const wxSize &size = wxSize(70 * em, 32 * em);
-    SetMinSize(size);
+    update_size_hints();
 
     Fit();
     Refresh();

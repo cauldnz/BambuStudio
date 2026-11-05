@@ -65,7 +65,7 @@ namespace Slic3r
 
         using MemoryedGroupHeap = std::priority_queue<MemoryedGroup, std::vector<MemoryedGroup>, std::greater<MemoryedGroup>>;
 
-        void update_memoryed_groups(const MemoryedGroup& item,const double gap_threshold, MemoryedGroupHeap& groups);
+        void update_memoryed_groups(const MemoryedGroup& item, const double one_change_budget, const double gap_threshold, MemoryedGroupHeap& groups);
     }
 
     struct FilamentGroupContext
@@ -75,6 +75,7 @@ namespace Slic3r
             std::vector<std::vector<unsigned int>> layer_filaments;
             std::vector<FilamentGroupUtils::FilamentInfo> filament_info;
             std::vector<std::string> filament_ids;
+            std::vector<std::string> selected_nozzle_diameters;
             std::vector<std::set<int>> unprintable_filaments;
             std::map<int, std::set<NozzleVolumeType>> unprintable_volumes;
         } model_info;
@@ -92,6 +93,7 @@ namespace Slic3r
         struct MachineInfo {
             std::vector<int> max_group_size;
             std::vector<std::vector<FilamentGroupUtils::MachineFilamentInfo>> machine_filament_info;
+            std::vector<FilamentGroupUtils::NozzleLoadedFilamentInfo>         nozzle_loaded_filaments;
             std::vector<bool> prefer_non_model_filament;
             int master_extruder_id;
         } machine_info;
@@ -109,7 +111,14 @@ namespace Slic3r
             std::map<int, std::vector<int>> extruder_nozzle_list;
             std::vector<MultiNozzleUtils::NozzleInfo> nozzle_list;
             std::unordered_map<int, int> nozzle_status;
+            // Explicit per-nozzle filament capacity, indexed by nozzle group_id (== nozzle_list index).
+            // Used by the single-extruder  model (AMS nozzle = AMS slots + native Ext, fixed nozzles = 1,
+            // empty slots = 0). Empty -> fall back to the flush-based heuristic.
+            std::vector<int> per_nozzle_capacity;
         } nozzle_info;
+
+        // 只保留可用喷嘴（已安装），重编号成紧凑 [0,k)；full_nozzle_ids 记录 紧凑id -> 原始id。
+        FilamentGroupContext available_only(std::vector<int>& full_nozzle_ids) const;
     };
 
     std::vector<int> select_best_group_for_ams(const std::vector<std::vector<int>> &filament_to_nozzles,
@@ -164,6 +173,9 @@ namespace Slic3r
         std::vector<int> calc_group_by_kmedoids(int k, const std::vector<unsigned int>& used_filaments,
             const std::unordered_map<int, std::vector<int>>& unplaceable_limits, int* cost = nullptr, int timeout_ms = 500);
 
+        // “多一次换料”的预算（与 evaluate_score 同尺度折算），用于自适应设定 memoryed 池容忍度
+        double calc_one_change_budget(const std::vector<unsigned int>& used_filaments) const;
+
         std::map<int, int> rebuild_unprintables(const std::vector<unsigned int>& used_filaments, const std::map<int,int>& extruder_unprintables);
         std::unordered_map<int, std::vector<int>> rebuild_nozzle_unprintables(const std::vector<unsigned int>& used_filaments, const std::unordered_map<int, std::vector<int>>& extruder_unprintables, const std::vector<int>& filament_volume_map);
 
@@ -183,6 +195,8 @@ namespace Slic3r
     std::vector<int> calc_filament_group_for_manual_multi_nozzle(const std::vector<int>& filament_map_manual,const FilamentGroupContext& ctx);
 
     std::vector<int> calc_filament_group_for_match_multi_nozzle(const FilamentGroupContext& ctx);
+
+    std::vector<int> calc_filament_group_for_nozzle_match(FilamentGroupContext &ctx);
 
     struct FilamentPlanRes
     {
@@ -219,6 +233,7 @@ namespace Slic3r
         void set_unplacable_limits(const std::unordered_map<int, std::vector<int>>& unplacable_limits) { m_unplaceable_limits = unplacable_limits; }
 
         void set_memory_threshold(double threshold) { memory_threshold = threshold; }
+        void set_one_change_budget(double budget) { m_one_change_budget = budget; }
         MemoryedGroupHeap get_memoryed_groups()const { return memoryed_groups; }
 
         void do_clustering(const FilamentGroupContext& context, int timeout_ms = 100, int retry = 10);
@@ -249,6 +264,7 @@ namespace Slic3r
         int m_elem_count;
         int m_default_group_id{ 0 };
         double memory_threshold{ 0 };
+        double m_one_change_budget{ 0 };
     };
 }
 #endif // !FILAMENT_GROUP_HPP

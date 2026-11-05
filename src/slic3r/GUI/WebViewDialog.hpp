@@ -26,6 +26,8 @@
 #include "wx/textctrl.h"
 #include <wx/timer.h>
 
+#include <chrono>
+#include <cstdint>
 
 namespace Slic3r {
 
@@ -58,6 +60,7 @@ public:
     void OnTitleChanged(wxWebViewEvent &evt);
     void OnNewWindow(wxWebViewEvent& evt);
     void OnScriptMessage(wxWebViewEvent& evt);
+    bool IsAllowedScriptCommand(wxWebViewEvent& evt);
     void OnScriptResponseMessage(wxCommandEvent& evt);
     void OnViewSourceRequest(wxCommandEvent& evt);
     void OnViewTextRequest(wxCommandEvent& evt);
@@ -70,7 +73,7 @@ public:
     void OnRedo(wxCommandEvent& evt);
     void OnMode(wxCommandEvent& evt);
     void RunScript(const wxString& javascript);
-    void RunScriptLeft(const wxString &javascript);
+    void RunScriptLeft(const wxString &javascript, bool force_execute = false);
     void OnRunScriptString(wxCommandEvent& evt);
     void OnRunScriptInteger(wxCommandEvent& evt);
     void OnRunScriptDouble(wxCommandEvent& evt);
@@ -121,6 +124,8 @@ public:
     void SetLeftMenuWidth(int nWidth);
     void        SwitchWebContent(std::string modelname, int refresh = 0);
     void        SwitchLeftMenu(std::string strMenu);
+    bool        IsMenuAccessDisabled(const std::string &menu) const;
+    void        RefreshMenuAccess();
 
     //Recent File
     void SendRecentList(int images);
@@ -152,6 +157,8 @@ public:
     bool     SaveBase64ToLocal(std::string Base64Buf, std::string FileName,std::string FileTail, wxString &download_path, wxString &download_file);
     void     SaveMakerlabStl(int SequenceID,std::string Base64Buf, std::string FileName);
     void     UpdateMakerlabStatus();
+    // macOS WKWebView cannot download blob: URLs; convert via JS to existing save bridge.
+    void     HandleBlobDownload(wxWebView *browser, const wxString &blob_url);
 
     //wiki
     bool m_WikiFirst;
@@ -179,6 +186,10 @@ private:
     wxBoxSizer *topsizer { nullptr };
 
     int         m_loginstatus;
+    bool        m_makerworld_sso_navigation_pending { false };
+    bool        m_makerworld_sso_redirect_completed { false };
+    std::uint64_t m_makerworld_sso_flow_id { 0 };
+    std::chrono::steady_clock::time_point m_makerworld_sso_navigation_started_at;
     bool m_isPerformingBack = false;
     bool m_online_history_cleared { false };
     bool m_makerlab_history_cleared { false };
@@ -249,6 +260,28 @@ private:
     wxString m_response_js;
 
     bool m_has_pending_staff_pick { false };
+
+    // Offline-start recovery. The online-models / MakerLab / academy menus and
+    // content areas are only revealed once their cloud request succeeds, so a
+    // fetch that fails while offline leaves them hidden with nothing left to
+    // retrigger it. The 2s login heartbeat re-fetches whatever is still missing,
+    // the same retry-until-success shape as ShowUserPrintTask (which is why
+    // print history already self-heals). Staff pick uses m_online_type as its
+    // success flag, like m_TaskInfo for print history.
+    bool m_makerlab_loaded { false };
+    bool m_academy_loaded { false };
+    // Access state applied by the last RefreshMenuAccess(); content cleared while
+    // restricted is fetched again only when this flips back to allowed.
+    bool m_online_access_disabled { false };
+    bool m_makerlab_access_disabled { false };
+    bool m_printhistory_access_disabled { false };
+    // Starts at construction so the first retry cannot race the OnLoaded fetch.
+    std::chrono::steady_clock::time_point m_content_retry_last { std::chrono::steady_clock::now() };
+    // Doubles after every round that still had something to retry, so a
+    // persistent failure (offline, or a server error) backs off to the cap.
+    static constexpr std::chrono::seconds CONTENT_RETRY_INTERVAL_MIN { 10 };
+    static constexpr std::chrono::seconds CONTENT_RETRY_INTERVAL_MAX { 120 };
+    std::chrono::seconds m_content_retry_interval { CONTENT_RETRY_INTERVAL_MIN };
 
     DECLARE_EVENT_TABLE()
 };

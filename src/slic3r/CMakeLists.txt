@@ -16,6 +16,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Widgets/AxisCtrlButton.hpp
     GUI/Widgets/Button.cpp
     GUI/Widgets/Button.hpp
+    GUI/Widgets/NozzleChipButton.cpp
+    GUI/Widgets/NozzleChipButton.hpp
     GUI/Widgets/CheckBox.cpp
     GUI/Widgets/CheckBox.hpp
     GUI/Widgets/RadioBox.hpp
@@ -24,6 +26,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Widgets/ProgressDialog.cpp
     GUI/Widgets/RoundedRectangle.hpp
     GUI/Widgets/RoundedRectangle.cpp
+    GUI/Widgets/BreathingDot.hpp
+    GUI/Widgets/BreathingDot.cpp
     GUI/Widgets/ComboBox.cpp
     GUI/Widgets/ComboBox.hpp
     GUI/Widgets/SideButton.hpp
@@ -48,6 +52,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Widgets/StaticGroup.hpp
     GUI/Widgets/ImageSwitchButton.cpp
     GUI/Widgets/ImageSwitchButton.hpp
+    GUI/Widgets/NozzleVariantSwitcher.cpp
+    GUI/Widgets/NozzleVariantSwitcher.hpp
     GUI/Widgets/SwitchButton.cpp
     GUI/Widgets/SwitchButton.hpp
     GUI/Widgets/SpinInput.cpp
@@ -60,6 +66,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Widgets/StateHandler.hpp
     GUI/Widgets/TabCtrl.cpp
     GUI/Widgets/TabCtrl.hpp
+    GUI/Widgets/TextTabbar.cpp
+    GUI/Widgets/TextTabbar.hpp
     GUI/Widgets/TextInput.cpp
     GUI/Widgets/TextInput.hpp
     GUI/Widgets/TempInput.cpp
@@ -68,24 +76,68 @@ set(SLIC3R_GUI_SOURCES
     GUI/Widgets/AMSControl.hpp
     GUI/Widgets/AMSItem.cpp
     GUI/Widgets/AMSItem.hpp
+    GUI/Widgets/FilamentView.cpp
+    GUI/Widgets/FilamentView.hpp
+    GUI/Widgets/AmsSlotPopup.cpp
+    GUI/Widgets/AmsSlotPopup.hpp
+    GUI/Widgets/IconView.cpp
+    GUI/Widgets/IconView.hpp
+    GUI/Widgets/MappingRow.cpp
+    GUI/Widgets/MappingRow.hpp
+    GUI/Widgets/PillView.cpp
+    GUI/Widgets/PillView.hpp
+    GUI/SyncAmsDialog.cpp
+    GUI/SyncAmsDialog.hpp
+    GUI/ModelPreview.cpp
+    GUI/ModelPreview.hpp
     GUI/Widgets/FilamentLoad.cpp
     GUI/Widgets/FilamentLoad.hpp
     GUI/Widgets/FanControl.cpp
     GUI/Widgets/FanControl.hpp
     GUI/Widgets/StepCtrl.cpp
     GUI/Widgets/StepCtrl.hpp
+    GUI/Widgets/wgtCircleItem.cpp
+    GUI/Widgets/wgtCircleItem.hpp
     GUI/Widgets/ProgressBar.cpp
     GUI/Widgets/ProgressBar.hpp
     GUI/Widgets/SideTools.cpp
     GUI/Widgets/SideTools.hpp
     GUI/Widgets/WebView.cpp
     GUI/Widgets/WebView.hpp
+    GUI/Widgets/WebViewTraceLogger.cpp
+    GUI/Widgets/WebViewTraceLogger.hpp
+    GUI/Widgets/WebViewWatcher.cpp
+    GUI/Widgets/WebViewWatcher.hpp
+    GUI/DeviceWeb/DeviceWebHealth.cpp
+    GUI/DeviceWeb/DeviceWebHealth.hpp
     GUI/Widgets/ErrorMsgStaticText.cpp
     GUI/Widgets/ErrorMsgStaticText.hpp
     GUI/Widgets/MultiNozzleSync.hpp
     GUI/Widgets/MultiNozzleSync.cpp
+    GUI/Widgets/SyncMachineInfoDialog.hpp
+    GUI/Widgets/SyncMachineInfoDialog.cpp
+    GUI/Widgets/SyncPresetWithPrinterDialog.hpp
+    GUI/Widgets/SyncPresetWithPrinterDialog.cpp
+    GUI/Widgets/NozzleSettingsListDialog.hpp
+    GUI/Widgets/NozzleSettingsListDialog.cpp
+    GUI/Widgets/NozzleSettingsCardDialog.hpp
+    GUI/Widgets/NozzleSettingsCardDialog.cpp
+    GUI/Widgets/NozzleAmsRow.hpp
+    GUI/Widgets/NozzleAmsRow.cpp
+    GUI/Widgets/NozzleDetailPopup.hpp
+    GUI/Widgets/NozzleDetailPopup.cpp
+    GUI/Widgets/RoundedPopupWindow.hpp
+    GUI/Widgets/RoundedPopupWindow.cpp
+    GUI/Widgets/CascadeMenu.hpp
+    GUI/Widgets/CascadeMenu.cpp
     GUI/MixedFilamentDialog.cpp
     GUI/MixedFilamentDialog.hpp
+    GUI/MixingKitsHelpDialog.cpp
+    GUI/MixingKitsHelpDialog.hpp
+    GUI/MixSupplementFilamentDialog.cpp
+    GUI/MixSupplementFilamentDialog.hpp
+    GUI/ColorDecomposeSupport.cpp
+    GUI/ColorDecomposeSupport.hpp
     GUI/GradientCurveEditor.cpp
     GUI/GradientCurveEditor.hpp
     GUI/AboutDialog.cpp
@@ -134,6 +186,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Gizmos/GLGizmosManager.hpp
     GUI/Gizmos/GLGizmosCommon.cpp
     GUI/Gizmos/GLGizmosCommon.hpp
+    GUI/Gizmos/FacetPicker.cpp
+    GUI/Gizmos/FacetPicker.hpp
     GUI/Gizmos/GLGizmoBase.cpp
     GUI/Gizmos/GLGizmoBase.hpp
     GUI/Gizmos/GLGizmoMove.cpp
@@ -180,6 +234,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/UIHelpers/MeshBooleanUI.hpp
     GUI/UIHelpers/TextEllipsis.cpp
     GUI/UIHelpers/TextEllipsis.hpp
+    GUI/UIHelpers/ImGuiFilamentWidgets.cpp
+    GUI/UIHelpers/ImGuiFilamentWidgets.hpp
     GUI/GLSelectionRectangle.cpp
     GUI/GLSelectionRectangle.hpp
     GUI/Gizmos/GizmoObjectManipulation.cpp
@@ -208,6 +264,10 @@ set(SLIC3R_GUI_SOURCES
     GUI/AMSDryControl.hpp
     GUI/AMSMaterialsSetting.cpp
     GUI/AMSMaterialsSetting.hpp
+    GUI/AMSNewFilamentDialogs.cpp
+    GUI/AMSNewFilamentDialogs.hpp
+    GUI/FilamentSelectDialog.cpp
+    GUI/FilamentSelectDialog.hpp
     GUI/ExtrusionCalibration.cpp
     GUI/ExtrusionCalibration.hpp
     GUI/PresetHints.cpp
@@ -236,6 +296,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Plater.hpp
     GUI/PartPlate.cpp
     GUI/PartPlate.hpp
+    GUI/WipeTowerPlacement.cpp
+    GUI/WipeTowerPlacement.hpp
     GUI/UserNotification.cpp
     GUI/UserNotification.hpp
     GUI/PresetComboBoxes.hpp
@@ -266,6 +328,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/TickCode.hpp
     GUI/Tab.cpp
     GUI/Tab.hpp
+    GUI/SupportComboAdvisor.cpp
+    GUI/SupportComboAdvisor.hpp
     GUI/ParamsDialog.cpp
     GUI/ParamsDialog.hpp
     GUI/ParamsPanel.cpp
@@ -286,6 +350,11 @@ set(SLIC3R_GUI_SOURCES
     GUI/HintNotification.cpp
     GUI/HMSPanel.hpp
     GUI/HMSPanel.cpp
+    GUI/PrintQueueManager.hpp
+    GUI/PrintQueueManager.cpp
+    GUI/QueuePrintContext.hpp
+    GUI/QueuePrintController.hpp
+    GUI/QueuePrintController.cpp
     GUI/MonitorPage.cpp
     GUI/MonitorPage.hpp
     GUI/StatusPanel.cpp
@@ -298,6 +367,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/SliceInfoPanel.hpp
     GUI/CameraPopup.cpp
     GUI/CameraPopup.hpp
+    GUI/DeviceOperationsTooltip.cpp
+    GUI/DeviceOperationsTooltip.hpp
     GUI/Monitor.cpp
     GUI/Monitor.hpp
     GUI/WebViewDialog.cpp
@@ -330,6 +401,10 @@ set(SLIC3R_GUI_SOURCES
     GUI/OG_CustomCtrl.hpp
     GUI/MarkdownTip.cpp
     GUI/MarkdownTip.hpp
+    GUI/ParamTooltip.cpp
+    GUI/ParamTooltip.hpp
+    GUI/WindowShadow.cpp
+    GUI/WindowShadow.hpp
     GUI/2DBed.cpp
     GUI/2DBed.hpp
     GUI/3DBed.cpp
@@ -346,14 +421,20 @@ set(SLIC3R_GUI_SOURCES
     GUI/Overview/AssemblyStepsUtilsImgui.cpp
     GUI/Overview/AssemblyStepsUtils.hpp
     GUI/Overview/AssemblyStepsUtilsInternal.hpp
+    GUI/Overview/OverviewUtils.cpp
+    GUI/Overview/OverviewUtils.hpp
     GUI/CameraUtils.cpp
     GUI/CameraUtils.hpp
     GUI/wxExtensions.cpp
     GUI/wxExtensions.hpp
-    GUI/ObjColorDialog.cpp
-    GUI/ObjColorDialog.hpp
     GUI/TextureImportDialog.hpp
     GUI/TextureImportDialog.cpp
+    GUI/MixingKitsHelpDialog.hpp
+    GUI/MixingKitsHelpDialog.cpp
+    GUI/TextureImportUi.hpp
+    GUI/TextureImportUi.cpp
+    GUI/TextureImportPopupDismiss.hpp
+    GUI/TextureImportPopupDismiss.cpp
     GUI/FilamentPickerDialog.cpp
     GUI/FilamentPickerDialog.hpp
     GUI/FilamentBitmapUtils.cpp
@@ -368,8 +449,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/StepMeshDialog.hpp
     GUI/BaseTransparentDPIFrame.cpp
     GUI/BaseTransparentDPIFrame.hpp
-    GUI/SyncAmsInfoDialog.cpp
-    GUI/SyncAmsInfoDialog.hpp
+    GUI/SyncAmsToasts.cpp
+    GUI/SyncAmsToasts.hpp
     GUI/SurfaceDrag.cpp
     GUI/SurfaceDrag.hpp
     GUI/TextLines.cpp
@@ -480,6 +561,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Search.hpp
     GUI/FilamentGroupPopup.hpp
     GUI/FilamentGroupPopup.cpp
+    GUI/FilamentNozzlePopup.hpp
+    GUI/FilamentNozzlePopup.cpp
     GUI/NotificationManager.cpp
     GUI/NotificationManager.hpp
     GUI/UnsavedChangesDialog.cpp
@@ -494,12 +577,22 @@ set(SLIC3R_GUI_SOURCES
     GUI/DesktopIntegrationDialog.hpp
     GUI/DragCanvas.cpp
     GUI/DragCanvas.hpp
+    GUI/ExtruderPanel.cpp
+    GUI/ExtruderPanel.hpp
+    GUI/ExtruderPanelGroup.cpp
+    GUI/ExtruderPanelGroup.hpp
+    GUI/ExtruderHelpers.cpp
+    GUI/ExtruderHelpers.hpp
+    GUI/NozzleSetupTelemetry.cpp
+    GUI/NozzleSetupTelemetry.hpp
     GUI/PublishDialog.cpp
     GUI/PublishDialog.hpp
     GUI/RecenterDialog.cpp
     GUI/RecenterDialog.hpp
     GUI/PrivacyUpdateDialog.cpp
     GUI/PrivacyUpdateDialog.hpp
+    GUI/MinorsLogoutDialog.cpp
+    GUI/MinorsLogoutDialog.hpp
     GUI/BonjourDialog.cpp
     GUI/BonjourDialog.hpp
     GUI/BindDialog.cpp
@@ -522,8 +615,14 @@ set(SLIC3R_GUI_SOURCES
     GUI/AmsMappingPopup.hpp
     GUI/AmsMappingPopup.cpp
     GUI/AmsMappingPopupUpdate.cpp
+    GUI/MaterialItemHotend.hpp
+    GUI/MaterialItemHotend.cpp
+    GUI/DevMappingHelpers.h
+    GUI/DevMappingHelpers.cpp
     GUI/ReleaseNote.hpp
     GUI/ReleaseNote.cpp
+    GUI/VersionPolicyDialog.hpp
+    GUI/VersionPolicyDialog.cpp
     GUI/HelioReleaseNote.hpp
     GUI/HelioReleaseNote.cpp
     GUI/HelioHistoryDialog.hpp
@@ -556,10 +655,16 @@ set(SLIC3R_GUI_SOURCES
     GUI/PrintOptionsDialog.cpp
     GUI/PurgeModeDialog.hpp
     GUI/PurgeModeDialog.cpp
+    GUI/MultiNozzleTpuTipsDialog.hpp
+    GUI/MultiNozzleTpuTipsDialog.cpp
     GUI/SafetyOptionsDialog.hpp
     GUI/SafetyOptionsDialog.cpp
     GUI/CreatePresetsDialog.hpp
     GUI/CreatePresetsDialog.cpp
+    GUI/CreateFilamentWebDialog.hpp
+    GUI/CreateFilamentWebDialog.cpp
+    GUI/EditFilamentWebDialog.hpp
+    GUI/EditFilamentWebDialog.cpp
     Utils/json_diff.hpp
     Utils/json_diff.cpp
     GUI/KBShortcutsDialog.hpp
@@ -605,10 +710,18 @@ set(SLIC3R_GUI_SOURCES
     Utils/FileHelp.hpp
     Utils/PresetUpdater.cpp
     Utils/PresetUpdater.hpp
+    Utils/VersionPolicyParser.cpp
+    Utils/VersionPolicyParser.hpp
+    Utils/VersionPolicyFetcher.cpp
+    Utils/VersionPolicyFetcher.hpp
+    Utils/VersionPolicyManager.cpp
+    Utils/VersionPolicyManager.hpp
     Utils/Process.cpp
     Utils/Process.hpp
     Utils/RaycastManager.cpp
     Utils/RaycastManager.hpp
+    Utils/OBB.cpp
+    Utils/OBB.hpp
     Utils/Profile.hpp
     Utils/UndoRedo.cpp
     Utils/UndoRedo.hpp
@@ -649,6 +762,10 @@ set(SLIC3R_GUI_SOURCES
     Utils/WxFontUtils.cpp
     Utils/HelioDragon.cpp
     Utils/HelioDragon.hpp
+    Utils/HelioRetryPolicy.cpp
+    Utils/HelioRetryPolicy.hpp
+    Utils/HelioSupportData.cpp
+    Utils/HelioSupportData.hpp
     Utils/FileTransferUtils.cpp
     Utils/FileTransferUtils.hpp
     Utils/FileTransferObject.cpp
@@ -681,6 +798,8 @@ if (APPLE)
     list(APPEND SLIC3R_GUI_SOURCES
             Utils/RetinaHelperImpl.mm
             Utils/MacDarkMode.mm
+            Utils/MacUtils.mm
+            Utils/MacUtils.hpp
             GUI/RemovableDriveManagerMM.mm
             GUI/RemovableDriveManagerMM.h
             GUI/Mouse3DHandlerMac.mm
@@ -688,9 +807,13 @@ if (APPLE)
             GUI/InstanceCheckMac.h
             GUI/CameraFullscreenMac.mm
             GUI/CameraFullscreenMac.hpp
+            GUI/TextureImportPopupDismiss.mm
+            GUI/MacIME.mm
+            GUI/MacIME.hpp
             GUI/wxMediaCtrl2.mm
             GUI/wxMediaCtrl2.h
             GUI/wxMediaCtrl3.h
+            GUI/WindowShadowMac.mm
         )
     FIND_LIBRARY(DISKARBITRATION_LIBRARY DiskArbitration)
 else ()
@@ -710,10 +833,22 @@ if (UNIX AND NOT APPLE)
     )
 endif ()
 
-add_library(libslic3r_gui STATIC ${SLIC3R_GUI_SOURCES})
+# MSVC+Ninja embeds debug info in every object (/Z7, see top-level CMakeLists),
+# which pushes a static libslic3r_gui.lib past the 4 GB .lib format limit
+# (LNK1248). An OBJECT library hands the objects straight to the linker and
+# never produces that archive.
+if (MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+    add_library(libslic3r_gui OBJECT ${SLIC3R_GUI_SOURCES})
+else ()
+    add_library(libslic3r_gui STATIC ${SLIC3R_GUI_SOURCES})
+endif ()
 
 if (TARGET device_page_build)
     add_dependencies(libslic3r_gui device_page_build)
+endif()
+
+if (TARGET device_page_html_build)
+    add_dependencies(libslic3r_gui device_page_html_build)
 endif()
 
 #if (MSVC)
@@ -744,7 +879,7 @@ if (WIN32)
         $<$<CONFIG:Debug>:${HPDF_LIBRARY_DEBUG}>
         $<$<NOT:$<CONFIG:Debug>>:${HPDF_LIBRARY_RELEASE}>)
 else ()
-    find_library(HPDF_LIBRARY NAMES hpdf)
+    find_library(HPDF_LIBRARY NAMES hpdf hpdfd HINTS lib REQUIRED)
 endif ()
 
 target_link_libraries(libslic3r_gui libslic3r cereal imgui imguizmo minilzo GLEW::GLEW OpenGL::GL hidapi
@@ -791,6 +926,40 @@ endif ()
 
 if (SLIC3R_PCH AND NOT SLIC3R_SYNTAXONLY)
     add_precompiled_header(libslic3r_gui pchheader.hpp FORCEINCLUDE)
+endif ()
+
+# Only Utils/FixModelByWin10.cpp uses the Windows 10 SDK. Keep HAS_WIN10SDK and the SDK
+# include path off the target, so a change of the SDK result rebuilds one file, not all.
+# WIN10SDK_PATH (CMake or environment variable) points to an SDK include directory and has
+# priority. Otherwise the SDK is found through the registry, so the result does not depend
+# on the shell that runs CMake. The vcvars variables (WindowsSdkDir, WindowsSDKVersion) are
+# the last fallback, for SDKs without a registry entry. The result is cached: remove
+# WIN10SDK_INCLUDE_PATH from the cache to search again.
+if (WIN32)
+    if (NOT DEFINED WIN10SDK_PATH AND DEFINED ENV{WIN10SDK_PATH})
+        set(WIN10SDK_PATH "$ENV{WIN10SDK_PATH}")
+    endif ()
+    get_filename_component(_win10sdk_root
+        "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots;KitsRoot10]" ABSOLUTE)
+    file(GLOB _win10sdk_versions LIST_DIRECTORIES true "${_win10sdk_root}/Include/10.*")
+    list(SORT _win10sdk_versions)
+    list(REVERSE _win10sdk_versions) # newest SDK first
+    if (DEFINED ENV{WindowsSdkDir})
+        list(APPEND _win10sdk_versions "$ENV{WindowsSdkDir}/Include/$ENV{WindowsSDKVersion}")
+    endif ()
+    find_path(WIN10SDK_INCLUDE_PATH winrt/windows.graphics.printing3d.h
+        HINTS ${WIN10SDK_PATH}
+        PATHS ${_win10sdk_versions}
+        NO_DEFAULT_PATH)
+    if (WIN10SDK_INCLUDE_PATH)
+        message("Building with Win10 Netfabb STL fixing service support")
+        set_source_files_properties(Utils/FixModelByWin10.cpp PROPERTIES
+            COMPILE_DEFINITIONS HAS_WIN10SDK
+            INCLUDE_DIRECTORIES "${WIN10SDK_INCLUDE_PATH}")
+    else ()
+        message("winrt/windows.graphics.printing3d.h was not found in the Windows 10 SDK")
+        message("Building without Win10 Netfabb STL fixing service support")
+    endif ()
 endif ()
 
 if (NOT APPLE)

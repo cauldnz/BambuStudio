@@ -10,7 +10,6 @@
 #include "libslic3r/Config.hpp"
 
 #include "boost/nowide/convert.hpp"
-#include <boost/log/trivial.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <iostream>
 #include <unordered_map>
@@ -18,6 +17,7 @@
 #include <errno.h>
 #include <optional>
 #include <cstdint>
+#include "libslic3r/Log.hpp"
 
 #ifdef _WIN32
 #include <strsafe.h>
@@ -164,9 +164,9 @@ namespace instance_check_internal
 		fl.l_len = 1;
 
         if (! boost::filesystem::is_directory(path)) {
-            BOOST_LOG_TRIVIAL(debug) << "get_lock(): datadir does not exist yet, creating...";
+            BOOST_LOG_TRIVIAL(debug) << "datadir does not exist yet, creating...";
             if (! boost::filesystem::create_directories(path))
-                BOOST_LOG_TRIVIAL(debug) << "get_lock(): unable to create datadir !!!";
+                BOOST_LOG_TRIVIAL(debug) << "unable to create datadir !!!";
         }
 
 		if ((fdlock = open(dest_dir.c_str(), O_WRONLY | O_CREAT, 0666)) == -1) {
@@ -239,7 +239,7 @@ namespace instance_check_internal
 			std::string		interface_name = "com.bambulab.BambuStudio.InstanceCheck.Object" + version;
 			std::string   	method_name = "AnotherInstance";
 			//std::string		object_name = "/com/prusa3d/prusaslicer/InstanceCheck";
-			std::string		object_name = "/com/BambuLab/BambuStudio/InstanceCheck/Object" + version;
+			std::string		object_name = "/com.bambulab/BambuStudio/InstanceCheck/Object" + version;
 
 
 			// initialise the error value
@@ -320,6 +320,7 @@ bool instance_check(int argc, char** argv, bool app_config_single_instance)
 				appimage_env_valid = true;
 			}
 		} catch (std::exception &) {
+			BOOST_LOG_TRIVIAL(warning) << current_exception_message();
 		}
 		if (! appimage_env_valid)
 			BOOST_LOG_TRIVIAL(error) << "APPIMAGE environment variable was set, but it does not point to a valid file: " << appimage_env;
@@ -576,7 +577,7 @@ namespace MessageHandlerDBusInternal
 	{
 		const char* interface_name = dbus_message_get_interface(message);
 	    const char* member_name    = dbus_message_get_member(message);
-	    std::string our_interface  = "com.BambuLab.BambuStudio.InstanceCheck.Object" + wxGetApp().get_instance_hash_string();
+	    std::string our_interface  = "com.bambulab.BambuStudio.InstanceCheck.Object" + wxGetApp().get_instance_hash_string();
 	    BOOST_LOG_TRIVIAL(trace) << "DBus message received: interface: " << interface_name << ", member: " << member_name;
 	    if (0 == strcmp("org.freedesktop.DBus.Introspectable", interface_name) && 0 == strcmp("Introspect", member_name)) {
 	        respond_to_introspect(connection, message);
@@ -596,8 +597,8 @@ void OtherInstanceMessageHandler::listen()
     int 				 name_req_val;
     DBusObjectPathVTable vtable;
     std::string 		 instance_hash  = wxGetApp().get_instance_hash_string();
-	std::string			 interface_name = "com.BambuLab.BambuStudio.InstanceCheck.Object" + instance_hash;
-    std::string			 object_name 	= "/com/BambuLab/BambuStudio/InstanceCheck/Object" + instance_hash;
+    std::string			 interface_name = "com.bambulab.BambuStudio.InstanceCheck.Object" + instance_hash;
+    std::string			 object_name 	= "/com.bambulab/BambuStudio/InstanceCheck/Object" + instance_hash;
 
     //BOOST_LOG_TRIVIAL(debug) << "init dbus listen " << interface_name << " " << object_name;
     dbus_error_init(&err);

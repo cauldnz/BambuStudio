@@ -33,13 +33,21 @@ const double GizmoObjectManipulation::g_to_oz = 0.035274;
 
 // Helper function to be used by drop to bed button. Returns lowest point of this
 // volume in world coordinate system.
-static double get_volume_min_z(const GLVolume* volume)
+static double get_volume_min_z(const GLVolume* volume, const Model& model)
 {
     const Transform3f& world_matrix = volume->world_matrix().cast<float>();
 
-    // need to get the ModelVolume pointer
-    const ModelObject* mo = wxGetApp().model().objects[volume->composite_id.object_id];
-    const ModelVolume* mv = mo->volumes[volume->composite_id.volume_id];
+    // The GLVolume's composite_id indexes the model bound to its canvas. In the assembly view that is the
+    // independent m_assemble_model, NOT wxGetApp().model() (the prepare model) -- indexing the wrong model
+    // yields a mismatched/out-of-range ModelVolume whose convex hull may be null and crashes get_convex_hull().
+    const int obj_id = volume->composite_id.object_id;
+    if (obj_id < 0 || obj_id >= (int) model.objects.size())
+        return 0.;
+    const ModelObject* mo = model.objects[obj_id];
+    const int vol_id = volume->composite_id.volume_id;
+    if (vol_id < 0 || vol_id >= (int) mo->volumes.size())
+        return 0.;
+    const ModelVolume* mv = mo->volumes[vol_id];
     const TriangleMesh& hull = mv->get_convex_hull();
 
     float min_z = std::numeric_limits<float>::max();
@@ -102,7 +110,7 @@ void GizmoObjectManipulation::update_ui_from_settings()
     }
 }
 void delete_negative_sign(Vec3d& value) {
-    for (size_t i = 0; i < value.size(); i++) {
+    for (int i = 0; i < value.size(); i++) {
         if (abs(value[i]) < 0.001)
             value[i] = 0.f;
     }
@@ -289,7 +297,10 @@ void GizmoObjectManipulation::update_reset_buttons_visibility()
         else {
             rotation = volume->get_volume_rotation();
             scale = volume->get_volume_scaling_factor();
-            min_z = get_volume_min_z(volume);
+            // Use the model that this selection (and thus the volume's composite_id) is bound to, so the
+            // assembly view resolves against m_assemble_model instead of the prepare model.
+            if (const Model* sel_model = selection.get_model())
+                min_z = get_volume_min_z(volume, *sel_model);
         }
         m_show_clear_rotation = !rotation.isApprox(m_init_rotation);
         m_show_reset_0_rotation = !rotation.isApprox(Vec3d::Zero());
@@ -1021,9 +1032,9 @@ void GizmoObjectManipulation::set_init_rotation(const Geometry::Transformation &
         ImGuiWrapper::pop_combo_style();
         float temp_tip_caption_max = imgui_wrapper->calc_text_size(_L("Align top-bottom center") + " (-X)").x * 1.3f;
         if (ImGui::IsItemHovered()) {
-            imgui_wrapper->tooltip(_L("Holded down Ctrl key continuously and click by left mouse button can select multiple objects, or holded down Alt key continuously and "
-                                      "click by left mouse button can select multiple parts"),
-                                   temp_tip_caption_max * 1.5);
+            // Negative wrap width disables ImGui word wrap; only the explicit newline breaks the tip.
+            imgui_wrapper->tooltip(_L("Ctrl+left-click:select multiple objects.\nAlt+left-click:select multiple parts."),
+                                   -1.0f);
         }
         float scale_icon           = 1.2f;
         float icon_size            = ImGui::GetFrameHeight() * scale_icon;

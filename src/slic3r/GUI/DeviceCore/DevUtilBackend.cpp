@@ -8,6 +8,7 @@
 
 #include <boost/lexical_cast.hpp>
 #include <wx/string.h>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r
 {
@@ -17,7 +18,7 @@ Slic3r::MultiNozzleUtils::NozzleInfo DevUtilBackend::GetNozzleInfo(const DevNozz
 {
     MultiNozzleUtils::NozzleInfo info;
     info.diameter = dev_nozzle.GetNozzleDiameterStr().ToStdString();
-    info.volume_type = (dev_nozzle.GetNozzleFlowType() == NozzleFlowType::H_FLOW ? NozzleVolumeType::nvtHighFlow : NozzleVolumeType::nvtStandard);
+    info.volume_type = DevNozzle::ToNozzleVolumeType(dev_nozzle.GetNozzleFlowType());
     info.extruder_id = dev_nozzle.GetLogicExtruderId();
 
     return info;
@@ -48,7 +49,7 @@ std::unordered_map<NozzleDef, int> DevUtilBackend::CollectNozzleInfo(MultiNozzle
             need_nozzle_map[data]++;
         } catch (const std::exception& e) {
             assert(0);
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "exception: " << e.what();
+            BOOST_LOG_TRIVIAL(error) << "exception: " << e.what();
         }
     }
 
@@ -58,7 +59,106 @@ std::unordered_map<NozzleDef, int> DevUtilBackend::CollectNozzleInfo(MultiNozzle
 static std::unordered_map<std::string, DevAmsType> s_ams_type_map = {
     {"0", DevAmsType::N3F},
     {"1", DevAmsType::N3S},
+    {"2", DevAmsType::ZMULTI_A},
 };
+
+namespace {
+// filament_dev_ams_drying_temperature / filament_dev_ams_drying_time share
+// the same linear array layout:
+//   [0]=N3F idle, [1]=N3S idle, [2]=N3F print, [3]=N3S print,
+//   [4]=ZMULTI_A idle, [5]=ZMULTI_A print
+constexpr size_t AMS_DRY_IDX_N3F_IDLE      = 0;
+constexpr size_t AMS_DRY_IDX_N3S_IDLE      = 1;
+constexpr size_t AMS_DRY_IDX_N3F_PRINT     = 2;
+constexpr size_t AMS_DRY_IDX_N3S_PRINT     = 3;
+constexpr size_t AMS_DRY_IDX_ZMULTI_A_IDLE = 4;
+constexpr size_t AMS_DRY_IDX_ZMULTI_A_PRINT = 5;
+
+// filament_dev_drying_softening_temperature / filament_dev_ams_drying_heat_distortion_temperature
+// share a per-type linear array layout (no idle/print split):
+//   [0]=N3F, [1]=N3S, [2]=ZMULTI_A, [3]=ZMULTI_B
+constexpr DevAmsType PER_TYPE_ORDER[] = {DevAmsType::N3F, DevAmsType::N3S, DevAmsType::ZMULTI_A, DevAmsType::ZMULTI_B};
+
+// Old single-value presets have length 1; out-of-range types fall back to index 0.
+void FillPerTypeMap(const ConfigOptionFloats* opt, std::unordered_map<DevAmsType, float>& out)
+{
+    const size_t count = opt->values.size();
+    size_t i = 0;
+    for (DevAmsType type : PER_TYPE_ORDER) {
+        out[type] = opt->get_at(i < count ? i : 0);
+        ++i;
+    }
+}
+} // namespace
+
+namespace {
+// PrintConfig default and custom-root user presets persist a single 0.
+bool HasUsableAmsDryingValues(const DynamicPrintConfig& config)
+{
+    if (!config.has("filament_dev_ams_drying_temperature") || !config.has("filament_dev_ams_drying_time")) {
+        return false;
+    }
+    const auto* temp = config.option<ConfigOptionFloats>("filament_dev_ams_drying_temperature");
+    const auto* time = config.option<ConfigOptionFloats>("filament_dev_ams_drying_time");
+    if (!temp || !time || temp->values.empty() || time->values.empty()) {
+        return false;
+    }
+    return temp->get_at(0) > 0.f && time->get_at(0) > 0.f;
+}
+
+std::optional<DevFilamentDryingPreset> FillDryingPresetFromConfig(const DynamicPrintConfig& config, const std::string& fila_id)
+{
+    if (!HasUsableAmsDryingValues(config)) {
+        return std::nullopt;
+    }
+
+    DevFilamentDryingPreset info;
+    info.filament_id = fila_id;
+    if (config.has("filament_dev_ams_drying_ams_limitations")) {
+        std::vector<std::string> types = config.option<ConfigOptionStrings>("filament_dev_ams_drying_ams_limitations")->values;
+        for (auto type : types) {
+            if (s_ams_type_map.count(type) == 0) {
+                continue;
+            }
+            info.ams_limitations.insert(s_ams_type_map[type]);
+        }
+    }
+
+    if (config.has("filament_dev_ams_drying_temperature")) {
+        auto opt = config.option<ConfigOptionFloats>("filament_dev_ams_drying_temperature");
+        info.filament_dev_ams_drying_temperature_on_idle[DevAmsType::N3F] = opt->get_at(AMS_DRY_IDX_N3F_IDLE);
+        info.filament_dev_ams_drying_temperature_on_idle[DevAmsType::N3S] = opt->get_at(AMS_DRY_IDX_N3S_IDLE);
+        info.filament_dev_ams_drying_temperature_on_print[DevAmsType::N3F] = opt->get_at(AMS_DRY_IDX_N3F_PRINT);
+        info.filament_dev_ams_drying_temperature_on_print[DevAmsType::N3S] = opt->get_at(AMS_DRY_IDX_N3S_PRINT);
+        info.filament_dev_ams_drying_temperature_on_idle[DevAmsType::ZMULTI_A] = opt->get_at(AMS_DRY_IDX_ZMULTI_A_IDLE);
+        info.filament_dev_ams_drying_temperature_on_print[DevAmsType::ZMULTI_A] = opt->get_at(AMS_DRY_IDX_ZMULTI_A_PRINT);
+    }
+
+    if (config.has("filament_dev_ams_drying_time")) {
+        auto opt = config.option<ConfigOptionFloats>("filament_dev_ams_drying_time");
+        info.filament_dev_ams_drying_time_on_idle[DevAmsType::N3F] = opt->get_at(AMS_DRY_IDX_N3F_IDLE);
+        info.filament_dev_ams_drying_time_on_idle[DevAmsType::N3S] = opt->get_at(AMS_DRY_IDX_N3S_IDLE);
+        info.filament_dev_ams_drying_time_on_print[DevAmsType::N3F] = opt->get_at(AMS_DRY_IDX_N3F_PRINT);
+        info.filament_dev_ams_drying_time_on_print[DevAmsType::N3S] = opt->get_at(AMS_DRY_IDX_N3S_PRINT);
+        info.filament_dev_ams_drying_time_on_idle[DevAmsType::ZMULTI_A] = opt->get_at(AMS_DRY_IDX_ZMULTI_A_IDLE);
+        info.filament_dev_ams_drying_time_on_print[DevAmsType::ZMULTI_A] = opt->get_at(AMS_DRY_IDX_ZMULTI_A_PRINT);
+    }
+
+    if (config.has("filament_dev_drying_softening_temperature")) {
+        FillPerTypeMap(config.option<ConfigOptionFloats>("filament_dev_drying_softening_temperature"), info.filament_dev_drying_softening_temperature);
+    }
+
+    if (config.has("filament_dev_ams_drying_heat_distortion_temperature")) {
+        FillPerTypeMap(config.option<ConfigOptionFloats>("filament_dev_ams_drying_heat_distortion_temperature"), info.filament_dev_ams_drying_heat_distortion_temperature);
+    }
+
+    if (config.has("filament_dev_drying_cooling_temperature")) {
+        info.filament_dev_drying_cooling_temperature = config.option<ConfigOptionFloats>("filament_dev_drying_cooling_temperature")->get_at(0);
+    }
+
+    return info;
+}
+} // namespace
 
 std::optional<Slic3r::DevFilamentDryingPreset> DevUtilBackend::GetFilamentDryingPreset(const std::string& fila_id)
 {
@@ -66,54 +166,35 @@ std::optional<Slic3r::DevFilamentDryingPreset> DevUtilBackend::GetFilamentDrying
         return std::nullopt;
     }
 
-    for (auto iter = GUI::wxGetApp().preset_bundle->filaments.begin(); iter != GUI::wxGetApp().preset_bundle->filaments.end(); ++iter) {
-        const Preset& filament_preset = *iter;
-        const auto& config = filament_preset.config;
-        if (filament_preset.filament_id == fila_id) {
-            DevFilamentDryingPreset info;
-            info.filament_id = fila_id;
-            try {
-                if (config.has("filament_dev_ams_drying_ams_limitations")) {
-                    std::vector<std::string> types = config.option<ConfigOptionStrings>("filament_dev_ams_drying_ams_limitations")->values;
-                    for (auto type : types) {
-                        if (s_ams_type_map.count(type) == 0) {
-                            // assert(0);
-                            continue;
-                        }
-                        info.ams_limitations.insert(s_ams_type_map[type]);
-                    }
-                }
+    auto& filaments = GUI::wxGetApp().preset_bundle->filaments;
+    auto try_fill = [&](const Preset& filament_preset) -> std::optional<DevFilamentDryingPreset> {
+        if (filament_preset.filament_id != fila_id) {
+            return std::nullopt;
+        }
+        try {
+            return FillDryingPresetFromConfig(filament_preset.config, fila_id);
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "exception: " << e.what();
+            return std::nullopt;
+        }
+    };
 
-                if (config.has("filament_dev_ams_drying_temperature")) {
-                    info.filament_dev_ams_drying_temperature_on_idle[DevAmsType::N3F] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_temperature")->get_at(0);
-                    info.filament_dev_ams_drying_temperature_on_idle[DevAmsType::N3S] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_temperature")->get_at(1);
-                    info.filament_dev_ams_drying_temperature_on_print[DevAmsType::N3F] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_temperature")->get_at(2);
-                    info.filament_dev_ams_drying_temperature_on_print[DevAmsType::N3S] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_temperature")->get_at(3);
-                }
-
-                if (config.has("filament_dev_ams_drying_time")) {
-                    info.filament_dev_ams_drying_time_on_idle[DevAmsType::N3F] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_time")->get_at(0);
-                    info.filament_dev_ams_drying_time_on_idle[DevAmsType::N3S] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_time")->get_at(1);
-                    info.filament_dev_ams_drying_time_on_print[DevAmsType::N3F] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_time")->get_at(2);
-                    info.filament_dev_ams_drying_time_on_print[DevAmsType::N3S] = config.option<ConfigOptionFloats>("filament_dev_ams_drying_time")->get_at(3);
-                }
-
-                if (config.has("filament_dev_drying_softening_temperature")) {
-                    info.filament_dev_drying_softening_temperature =  config.option<ConfigOptionFloats>("filament_dev_drying_softening_temperature")->get_at(0);
-                }
-
-                if (config.has("filament_dev_ams_drying_heat_distortion_temperature")){
-                    info.filament_dev_ams_drying_heat_distortion_temperature = config.option<ConfigOptionFloats>("filament_dev_ams_drying_heat_distortion_temperature")->get_at(0);
-                }
-
-                if (config.has("filament_dev_drying_cooling_temperature")) {
-                    info.filament_dev_drying_cooling_temperature = config.option<ConfigOptionFloats>("filament_dev_drying_cooling_temperature")->get_at(0);
-                }
-
-                return info;
-            } catch (const std::exception& e) {
-                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << " exception: " << e.what();
-            }
+    // Official RFID ids (e.g. GFA05) must not be stolen by a same-id user root
+    // preset that still carries PrintConfig's default drying value of 0.
+    for (auto iter = filaments.begin(); iter != filaments.end(); ++iter) {
+        if (!iter->is_system) {
+            continue;
+        }
+        if (auto info = try_fill(*iter)) {
+            return info;
+        }
+    }
+    for (auto iter = filaments.begin(); iter != filaments.end(); ++iter) {
+        if (iter->is_system) {
+            continue;
+        }
+        if (auto info = try_fill(*iter)) {
+            return info;
         }
     }
 

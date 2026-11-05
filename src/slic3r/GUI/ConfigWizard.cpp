@@ -8,7 +8,6 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <boost/format.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/nowide/convert.hpp>
 
@@ -38,6 +37,7 @@
 #include "libslic3r/Model.hpp"
 #include "GUI.hpp"
 #include "GUI_App.hpp"
+#include "EncodedFilament.hpp"
 #include "GUI_Utils.hpp"
 #include "I18N.hpp"
 #include "Field.hpp"
@@ -48,6 +48,7 @@
 #include "MsgDialog.hpp"
 #include "UnsavedChangesDialog.hpp"
 #include "MainFrame.hpp"
+#include "libslic3r/Log.hpp"
 
 #if defined(__linux__) && defined(__WXGTK3__)
 #define wxLinux_gtk3 true
@@ -2577,9 +2578,12 @@ bool ConfigWizard::priv::apply_config(AppConfig *app_config, PresetBundle *prese
 
     app_config->set_vendors(appconfig_new);
 
-    if (check_unsaved_preset_changes)
+    if (check_unsaved_preset_changes) {
         preset_bundle->load_presets(*app_config, ForwardCompatibilitySubstitutionRule::EnableSilentDisableSystem, 
                                     {preferred_model, preferred_variant, first_added_filament, first_added_sla_material});
+        // AppConfig-restored filament colors may predate the JSON primary-color alignment.
+        Slic3r::align_project_filament_primary_colors_with_json(preset_bundle);
+    }
 
     if (!only_sla_mode && page_custom->custom_wanted()) {
         // if unsaved changes was not cheched till this moment

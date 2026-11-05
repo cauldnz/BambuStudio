@@ -11,9 +11,9 @@
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/format.hpp>
-#include <boost/log/trivial.hpp>
 
 #include <curl/curl.h>
+#include "libslic3r/Log.hpp"
 
 #ifdef OPENSSL_CERT_OVERRIDE
 #include <openssl/x509.h>
@@ -196,7 +196,7 @@ bool Http::priv::ca_file_supported(::CURL *curl)
 
 	if (curl == nullptr) { return res; }
 
-#if LIBCURL_VERSION_MAJOR >= 7 && LIBCURL_VERSION_MINOR >= 48
+#if LIBCURL_VERSION_NUM >= 0x073000 /* 7.48.0 */
 	::curl_tlssessioninfo *tls;
 	if (::curl_easy_getinfo(curl, CURLINFO_TLS_SSL_PTR, &tls) == CURLE_OK) {
 		if (tls->backend == CURLSSLBACKEND_SCHANNEL || tls->backend == CURLSSLBACKEND_DARWINSSL) {
@@ -260,6 +260,7 @@ size_t Http::priv::form_file_read_cb(char *buffer, size_t size, size_t nitems, v
 		fstream->read(buffer, size * nitems);
 		return fstream->gcount();
 	} catch (const std::exception &) {
+		BOOST_LOG_TRIVIAL(warning) << current_exception_message();
 		return CURL_READFUNC_ABORT;
 	}
 
@@ -399,7 +400,7 @@ void Http::priv::http_perform()
 	::curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headers_cb);
 
 	::curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-#if LIBCURL_VERSION_MAJOR >= 7 && LIBCURL_VERSION_MINOR >= 32
+#if LIBCURL_VERSION_NUM >= 0x072000 /* 7.32.0 */
 	::curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xfercb);
 	::curl_easy_setopt(curl, CURLOPT_XFERINFODATA, static_cast<void*>(this));
 #ifndef _WIN32

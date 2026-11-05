@@ -10,8 +10,16 @@
 #include <wx/sizer.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
+#include <boost/thread.hpp>
+
 #include "GLGizmosCommon.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/GUI_Utils.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/AppConfig.hpp"
@@ -20,6 +28,7 @@
 
 #include <imgui/imgui_internal.h>
 #include "FixModelByWin10.hpp"
+#include "libslic3r/Log.hpp"
 namespace Slic3r {
 namespace GUI {
 
@@ -95,6 +104,22 @@ static void rotate_z_3d(std::array<Vec3d, 4>& verts, float radian_angle)
         rotate_point_2d(verts[i](0), verts[i](1), c, s);
 }
 
+namespace {
+
+// Rotation taking +Z onto `normal`, which must be unit length. Eigen's
+// setFromTwoVectors handles the antipodal case (normal == -Z) by picking an
+// arbitrary perpendicular axis, which is what we want: the plane's X direction
+// is unconstrained here, exactly as in process_cut_line().
+Transform3d rotation_from_plane_normal(const Vec3d &normal)
+{
+    Eigen::Quaterniond q;
+    Transform3d        m = Transform3d::Identity();
+    m.matrix().block(0, 0, 3, 3) = q.setFromTwoVectors(Vec3d::UnitZ(), normal).toRotationMatrix();
+    return m;
+}
+
+} // namespace
+
 const double GLGizmoAdvancedCut::Offset = 20.0;
 const double GLGizmoAdvancedCut::Margin = 20.0;
 const std::array<float, 4> GLGizmoAdvancedCut::GrabberColor      = { 1.0, 1.0, 0.0, 1.0 };
@@ -122,6 +147,20 @@ bool GLGizmoAdvancedCut::gizmo_event(SLAGizmoEventType action, const Vec2d &mous
 {
     CutConnectors &connectors = m_c->selection_info()->model_object()->cut_connectors;
 
+    // While the part preview is built in the background, the plane and the parts must stay
+    // as they were at the click, otherwise the finished preview would describe a stale cut.
+    // Swallow right-clicks, cut-line drawing, and left presses that would start a grabber drag
+    // or a face pick. Everything else takes the normal path below, so a free left drag still
+    // rotates the camera.
+    if (is_part_job_running()) {
+        if (action == SLAGizmoEventType::RightDown || action == SLAGizmoEventType::RightUp)
+            return true;
+        if (shift_down && (action == SLAGizmoEventType::LeftDown || action == SLAGizmoEventType::LeftUp || action == SLAGizmoEventType::Dragging))
+            return true;
+        if (action == SLAGizmoEventType::LeftDown && (m_hover_id != -1 || m_facet_picker.is_active()))
+            return true;
+    }
+
     if (shift_down && !m_connectors_editing &&
         (action == SLAGizmoEventType::LeftDown || action == SLAGizmoEventType::LeftUp || action == SLAGizmoEventType::Dragging)) {
         process_cut_line(action, mouse_position);
@@ -131,6 +170,17 @@ bool GLGizmoAdvancedCut::gizmo_event(SLAGizmoEventType action, const Vec2d &mous
     }
 
     if (action == SLAGizmoEventType::LeftDown) {
+        // Pick-face mode is armed deliberately by the user, so while it is on, a click
+        // means "pick that facet" and nothing else. Grabbers and the cut plane itself are
+        // ignored on purpose: the wanted face is often behind the translucent plane, and
+        // gating on m_hover_id made those faces unclickable. gizmo_event runs before the
+        // manager's grabber handling, so returning true here suppresses the drag.
+        if (m_facet_picker.is_active() && !m_connectors_editing) {
+            m_facet_picker.update(mouse_position, m_c, m_parent.get_selection(), wxGetApp().plater()->get_camera());
+            if (apply_picked_facet())
+                m_facet_picker.set_active(false); // one-shot: press the button again to pick another
+            return true; // on a miss, stay armed rather than starting a rotate/pan
+        }
         if (m_hover_id == c_plate_move_id) {
             Vec3d pos;
             Vec3d pos_world;
@@ -172,7 +222,10 @@ bool GLGizmoAdvancedCut::gizmo_event(SLAGizmoEventType action, const Vec2d &mous
         if (!m_connectors_editing && m_cut_mode == CutMode::cutPlanar) { //&& control_down
             // Check the internal part raycasters.
             if (m_part_selection && !m_part_selection->valid()) {
-                process_contours();
+                // The first click only starts the background preview build, so the canvas keeps
+                // drawing. Its flip is applied by poll_part_selection_job() once the build is done.
+                process_contours(mouse_position);
+                return true;
             }
             m_part_selection->toggle_selection(mouse_position);
             check_and_update_connectors_state(); // after a contour is deactivated, its connectors are inside the object
@@ -231,11 +284,18 @@ std::string GLGizmoAdvancedCut::get_tooltip() const
         return tooltip;
     }
 
-    if (!m_dragging && m_hover_id == c_plate_move_id) {
-        if (m_cut_mode == CutMode::cutTongueAndGroove) return _u8L("Drag to move the cut plane");
-        return _u8L("Drag to move the cut plane\n"
-                    "Right-click a part to assign it to the other side");
+    if (!m_dragging && m_cut_mode == CutMode::cutPlanar && !m_connectors_editing) {
+        // Hybrid hover: GLVolume picking works before PartSelection hides source volumes;
+        // once cut-part preview is active, raycast cut-part meshes instead (overlay is not pickable).
+        const bool hovering_source_volume = m_parent.get_hover_volume_idx_before_gizmo() >= 0;
+        const bool hovering_cut_part      = m_part_selection && m_part_selection->valid() && !m_part_selection->is_one_object()
+            && m_part_selection->is_mouse_over_part(m_parent.get_local_mouse_position());
+        if (hovering_source_volume || hovering_cut_part)
+            return _u8L("Right-click a part to assign it to the other side");
     }
+
+    if (!m_dragging && m_hover_id == c_plate_move_id)
+        return _u8L("Drag to move the cut plane");
 
     if (tooltip.empty() && (m_hover_id == X || m_hover_id == Y || m_hover_id == Z)) {
         std::string axis = m_hover_id == X ? "X" : m_hover_id == Y ? "Y" : "Z";
@@ -338,6 +398,58 @@ bool GLGizmoAdvancedCut::unproject_on_cut_plane(const Vec2d &mouse_pos, Vec3d &p
     pos       = hit_d;
     pos_world = hit;
 
+    return true;
+}
+
+bool GLGizmoAdvancedCut::apply_picked_facet()
+{
+    const FacetPicker::Hit &picked = m_facet_picker.hit();
+    if (!picked.valid() || picked.world_normal.isZero())
+        return false;
+
+    const Transform3d m = rotation_from_plane_normal(picked.world_normal);
+
+    // Plane lands flush with the facet; the user offsets it afterwards with Movement.
+    const Vec3d new_plane_center = picked.world_pos;
+
+    const auto new_tbb = transformed_bounding_box(new_plane_center, m);
+
+    // transformed_bounding_box() maps a point to R^-1 * (p_world - plane_center), so new_tbb
+    // is the model's bounding box in the cut plane's own frame and the plane is z = 0 there.
+    // The pick is meaningful when the model actually spans that plane, which is exactly the
+    // test set_center_pos() applies before it will accept the new centre. Asking the same
+    // question here is the point: a guard that disagrees with the function it guards would
+    // either reject a good pick or apply the rotation while the position is silently refused.
+    //
+    // Do not reuse process_cut_line()'s containment check here. It tests
+    //   m.inverse() * (plane_center - instance_offset) + new_tbb.center()
+    // which is not the plane's position in this frame. The two terms cancel in X and Y
+    // because an instance origin sits at the model's bounding-box centre in those axes, but
+    // in Z the origin sits at the object's base, so the error is the object's half-height.
+    // process_cut_line() hides that by always cutting through m_bb_center, where the stale Z
+    // still lands inside a tall box. A plane placed flush with a facet - especially on a cut
+    // piece, whose geometry is offset from its instance origin - falls outside and the pick
+    // is silently dropped.
+    const double limit_val = 0.5;
+    if (!(new_tbb.max.z() > -limit_val && new_tbb.min.z() < limit_val))
+        return false;
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Cut plane from face");
+
+    m_transformed_bounding_box = new_tbb;
+    set_center(new_plane_center);
+    m_start_dragging_m = m_rotate_matrix = m;
+    m_plane_normal                       = m_rotate_matrix * Vec3d::UnitZ();
+    m_ar_plane_center                    = m_plane_center;
+
+    reset_cut_by_contours();
+
+    // Keep the Rotation / Movement boxes in step with the new plane.
+    m_movement = 0.0;
+    m_rotation = Geometry::extract_euler_angles(m_rotate_matrix);
+    update_buffer_data();
+
+    m_parent.request_extra_frame();
     return true;
 }
 
@@ -487,10 +599,7 @@ std::string GLGizmoAdvancedCut::on_get_name() const
 
 void GLGizmoAdvancedCut::apply_color_clip_plane_colors()
 {
-    if (CutMode(m_cut_mode) == CutMode::cutTongueAndGroove)
-        m_parent.set_color_clip_plane_colors({CUT_PLANE_DEF_COLOR, CUT_PLANE_DEF_COLOR});
-    else
-        m_parent.set_color_clip_plane_colors({UPPER_PART_COLOR, LOWER_PART_COLOR});
+    m_parent.set_color_clip_plane_colors({UPPER_PART_COLOR, LOWER_PART_COLOR});
 }
 
 void GLGizmoAdvancedCut::on_load(cereal::BinaryInputArchive &ar)
@@ -566,6 +675,7 @@ void GLGizmoAdvancedCut::on_set_state()
         }
         m_hover_id           = -1;
         m_connectors_editing = false;
+        m_facet_picker.set_active(false);
 
         update_bb();
         reset_cut_plane();//according to boundingbox
@@ -580,7 +690,12 @@ void GLGizmoAdvancedCut::on_set_state()
         m_parent.request_extra_frame();
     }
     else if (get_state() == Off) {
+        // The worker reads its own model snapshot only, but it must be stopped and joined
+        // before the gizmo forgets it; a split already in progress cannot be interrupted, so
+        // closing may wait for it to return.
+        cancel_part_selection_job(true);
         toggle_model_objects_visibility(true);
+        m_parent.set_use_dovetail_clip(false);
         if (auto oc = m_c->object_clipper()) {
             oc->set_behaviour(true, true, 0.);
             oc->release();
@@ -776,10 +891,14 @@ void GLGizmoAdvancedCut::on_render()
         // SelectionInfo object to lie about the actual shift.
         m_c->selection_info()->set_use_shift(true);
     }
+    // Install a finished background part preview. This runs inside the render pass on
+    // purpose: the preview meshes are uploaded here and need the current GL context.
+    poll_part_selection_job();
     // check objects visibility
     toggle_model_objects_visibility();
     update_clipper();
     init_picking_models();
+    update_dovetail_preview_clip();
 
     // Show placed connectors
     if (m_connectors_editing) {
@@ -799,6 +918,8 @@ void GLGizmoAdvancedCut::on_render()
     if (!m_connectors_editing) {
         render_cut_plane_and_grabbers();
     }
+    if (m_facet_picker.is_active() && !m_connectors_editing)
+        m_facet_picker.render(wxGetApp().plater()->get_camera());
     // render_clipper_cut for get the cut plane result
     render_clipper_cut();
     // render a cut line on screen by shift key and mouse move
@@ -812,6 +933,16 @@ void GLGizmoAdvancedCut::on_render()
 
 bool GLGizmoAdvancedCut::on_mouse(const wxMouseEvent &mouse_event)
 {
+    if (m_facet_picker.is_active() && !m_connectors_editing) {
+        if (mouse_event.Moving() || mouse_event.Dragging()) {
+            m_facet_picker.update(Vec2d(mouse_event.GetX(), mouse_event.GetY()), m_c, m_parent.get_selection(),
+                                  wxGetApp().plater()->get_camera());
+            m_parent.request_extra_frame();
+        } else if (mouse_event.Leaving()) {
+            m_facet_picker.reset();
+        }
+    }
+
     // If we are in connector mode and the mouse is hovering...
     if (m_connectors_editing && mouse_event.Moving()) {
         Vec3d pos;
@@ -994,8 +1125,23 @@ void GLGizmoAdvancedCut::on_render_input_window(float x, float y, float bottom_l
         init_connectors_input_window_data();
         render_connectors_input_window(x, y, bottom_limit);
     }
-    else
+    else {
+        // Grey out the whole card while the part preview is built: any edit there would move
+        // the plane away from the cut the worker is computing. Raw ImGui flags are used because
+        // ImGuiWrapper::disabled_begin() cannot nest and the card already uses it inside.
+        const bool part_job_busy = is_part_job_running();
+        if (part_job_busy) {
+            ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+        }
         render_cut_plane_input_window(x, y, bottom_limit);
+        if (part_job_busy) {
+            ImGui::PopStyleVar();
+            ImGui::PopItemFlag();
+        }
+        // Drawn after the disabled block so its cancel button stays clickable.
+        render_part_job_progress();
+    }
 
     render_input_window_warning();
 
@@ -1112,10 +1258,38 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
     Plater *     plater = wxGetApp().plater();
     ModelObject *mo     = plater->model().objects[object_idx];
     if (!mo) return;
+
+    // Cutting rebuilds/splits the mesh; painted color, supports, seam and
+    // fuzzy-skin may not transfer cleanly. Warn the user when any exist.
+    if (mo->is_mm_painted() || mo->is_fuzzy_skin_painted() ||
+        mo->is_fdm_support_painted() || mo->is_seam_painted()) {
+        if (!wxGetApp().confirm_mesh_paint_warning())
+            return;
+    }
+
     // deactivate CutGizmo and than perform a cut
     m_parent.reset_all_gizmos();
     // m_cut_z is the distance from the bed. Subtract possible SLA elevation.
     // const GLVolume* first_glvolume = selection.get_volume(*selection.get_volume_idxs().begin());
+
+    // Shared with the worker below. Declared outside the snapshot scope, together with a guard
+    // that rolls the model back once the snapshot is closed: baking the connectors into the model
+    // and stamping the cut id already modified it, so a cancel is not just "don't commit".
+    //
+    // Roll back to an absolute point in the undo stack rather than one step back: the main thread
+    // pumps the event loop while the worker runs, so a CallAfter or a background notification can
+    // push snapshots of its own in between, and undo() would then land on the wrong state and
+    // leave the baked connectors and the stamped cut_id behind.
+    const size_t      pre_cut_snapshot_time = plater->get_active_snapshot_time();
+    std::atomic<bool> canceled(false);
+    ScopeGuard        cut_rollback([plater, pre_cut_snapshot_time, &canceled]() {
+        if (!canceled)
+            return;
+        if (plater->get_active_snapshot_time() != pre_cut_snapshot_time + 1)
+            BOOST_LOG_TRIVIAL(warning) << "snapshots were taken while the cut was running, "
+                                       << "rolling back to " << pre_cut_snapshot_time;
+        plater->undo_redo_to(pre_cut_snapshot_time);
+    });
 
     // perform cut
     {
@@ -1140,8 +1314,6 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
         // update connectors pos as offset of its center before cut performing
         apply_connectors_in_model(cut_mo, dowels_count);
 
-        wxBusyCursor wait;
-
         ModelObjectCutAttributes attributes = only_if(has_connectors ? true : m_keep_upper, ModelObjectCutAttribute::KeepUpper) |
                                               only_if(has_connectors ? true : m_keep_lower, ModelObjectCutAttribute::KeepLower) |
                                               only_if(has_connectors ? false : m_cut_to_parts, ModelObjectCutAttribute::CutToParts) |
@@ -1155,13 +1327,125 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
         update_object_cut_id(cut_mo->cut_id, attributes, dowels_count);
 
         Cut cut(cut_mo, instance_idx, get_cut_matrix(selection), attributes);
-        cut.set_offset_for_two_part        = true;
-        const ModelObjectPtrs &new_objects = cut_by_contour  ? cut.perform_by_contour(m_part_selection->get_cut_parts(), dowels_count) :
-                                             cut_with_groove ? cut.perform_with_groove(m_groove, m_rotate_matrix) :
-                                                               cut.perform_with_plane();
+        cut.set_offset_for_two_part = true;
+
+        // reset_all_gizmos() above posted a CallAfter() that replaces m_part_selection, which owns
+        // cut_mo when cutting by contour. The event loop runs while we wait for the worker below, so
+        // that replacement can happen mid-cut: read everything still needed from cut_mo here, on the
+        // main thread, and never touch it again afterwards. The Cut already holds its own deep copy.
+        const std::vector<Cut::Part> cut_parts = cut_by_contour ? m_part_selection->get_cut_parts() : std::vector<Cut::Part>();
+        // Snapshot the groove parameters too, for the same reason: the worker must not read gizmo
+        // state that the pumped event loop could change under it.
+        const Groove      groove        = m_groove;
+        const Transform3d rotate_matrix = m_rotate_matrix;
+        // save cut_id to post update synchronization
+        const CutObjectBase cut_id = cut_mo->cut_id;
+
+        const ModelObjectPtrs *new_objects_ptr = nullptr;
+        {
+            // Structured like fix_model_by_win10_sdk_gui(): the cut runs in a worker while the main
+            // thread keeps pumping the event loop, so the window stays responsive and the Cancel
+            // click is never missed. Scoped so this dialog is gone before the repair dialog below
+            // opens its own app-modal one.
+            std::mutex              mutex;
+            std::condition_variable condition;
+            struct Progress {
+                std::string message;
+                int         percent = 0;
+                bool        updated = false;
+            } progress;
+            std::atomic<bool> finished(false);
+            std::string       cut_error;
+
+            cut.set_progress(
+                [&mutex, &condition, &progress](int percent, const char *message) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // Geometry steps always pass "Cutting model object"; paint steps pass the
+                    // Restoring labels. Null only bumps the percent and leaves the label alone.
+                    if (message)
+                        progress.message = message;
+                    // Each nesting level maps onto its own slice of the range, but keep the bar
+                    // monotonic even if a level reports the start of its slice late.
+                    if (percent > progress.percent)
+                        progress.percent = percent;
+                    progress.updated = true;
+                    condition.notify_all();
+                },
+                [&canceled]() { return canceled.load(); });
+
+            ProgressDialog progress_dlg(_L("Cutting model object"), "", 100, find_toplevel_parent(plater),
+                                        wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
+            progress_dlg.EnableYield(true);
+
+            boost::thread worker_thread([&]() {
+                try {
+                    new_objects_ptr = &(cut_by_contour  ? cut.perform_by_contour(cut_parts, dowels_count) :
+                                        cut_with_groove ? cut.perform_with_groove(groove, rotate_matrix) :
+                                                          cut.perform_with_plane());
+                } catch (std::exception &ex) {
+                    cut_error = ex.what();
+                } catch (...) {
+                    BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+                    // Anything escaping a boost::thread function terminates the process, so the
+                    // catch-all has to stay even though nothing here is expected to throw one.
+                    cut_error = "unknown exception";
+                }
+                {
+                    // Set under the lock: the waiter evaluates its predicate while holding it, so
+                    // notifying from the outside can slip through the gap and cost a 50ms timeout.
+                    std::lock_guard<std::mutex> lock(mutex);
+                    finished = true;
+                }
+                condition.notify_all();
+            });
+
+            wxString                     last_label;
+            std::unique_lock<std::mutex> lock(mutex);
+            while (!finished) {
+                const std::string message = progress.message;
+                const int         percent = progress.percent;
+                progress.updated          = false;
+                lock.unlock();
+                // Report one percent less so wxPD_AUTO_HIDE does not close the dialog early.
+                const int      dialog_percent = percent > 0 ? percent - 1 : 0;
+                const wxString label          = message.empty() ? _L("Cutting model object") : _L(message);
+                if (progress_dlg.WasCancelled() || !progress_dlg.Update(dialog_percent, label)) {
+                    canceled = true;
+                } else if (label != last_label) {
+                    // Only when the stage label changes: fitting on every tick makes the dialog
+                    // jitter as the width is recomputed 20 times a second.
+                    last_label = label;
+                    progress_dlg.Fit();
+                }
+                lock.lock();
+                condition.wait_for(lock, std::chrono::milliseconds(50),
+                                   [&progress, &finished]() { return progress.updated || finished.load(); });
+            }
+            lock.unlock();
+            worker_thread.join();
+
+            if (!cut_error.empty()) {
+                // Treat a failure like a cancellation: nothing gets written back and the model is
+                // rolled back, rather than letting the exception cross the thread boundary.
+                BOOST_LOG_TRIVIAL(error) << "the cut failed: " << cut_error;
+                canceled = true;
+            }
+            if (cut.was_canceled() || new_objects_ptr == nullptr)
+                canceled = true;
+            // The callbacks reference locals of this scope, and cut outlives it because it owns
+            // the resulting objects.
+            cut.set_progress(nullptr, nullptr);
+        }
+
+        if (canceled) {
+            BOOST_LOG_TRIVIAL(info) << "the cut was canceled, rolling back";
+            // cut_rollback below undoes the snapshot once this scope closes.
+            return;
+        }
+
+        const ModelObjectPtrs &new_objects = *new_objects_ptr;
         check_objects_after_cut(new_objects);// Fix for #11487 - Cut Connectors Broken when assigning part to other side
         // fix_non_manifold_edges
-#ifdef HAS_WIN10SDK
         if (is_windows10()) {
             bool is_showed_dialog = false;
             bool user_fix_model   = false;
@@ -1188,18 +1472,17 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
                         auto                                             plater = wxGetApp().plater();
                         auto fix_and_update_progress = [this, plater](ModelObject *model_object, const int vol_idx, const string &model_name, ProgressDialog &progress_dlg,
                                                                       std::vector<std::string> &succes_models, std::vector<std::pair<std::string, std::string>> &failed_models) {
-                            wxString msg = _L("Repairing model object");
-                            msg += ": " + from_u8(model_name) + "\n";
+                            wxString msg = wxString::Format(_L("Repair object: %s"), from_u8(model_name));
                             std::string res;
                             if (!fix_model_by_win10_sdk_gui(*model_object, vol_idx, progress_dlg, msg, res))
                                 return false;
                             return true;
                         };
-                        ProgressDialog progress_dlg(_L("Repairing model object"), "", 100, find_toplevel_parent(plater), wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
+                        ProgressDialog progress_dlg(_L("Repairing model object"), "", 100, find_toplevel_parent(plater), wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_SHOW_PERCENT);
 
                         auto model_name = new_objects[i]->name;
                         if (!fix_and_update_progress(new_objects[i], j, model_name, progress_dlg, succes_models, failed_models)) {
-                            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "run fix_and_update_progress error";
+                            BOOST_LOG_TRIVIAL(error) << "run fix_and_update_progress error";
                             plater->take_snapshot("RepairingModelObjectInCut");
                             all_break = true;
                             break;
@@ -1211,11 +1494,7 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
                 }
             }
         }
- #endif
         // set offset for new_objects
-
-        // save cut_id to post update synchronization
-        const CutObjectBase cut_id = cut_mo->cut_id;
 
         // update cut results on plater and in the model
         plater->apply_cut_object_to_model(object_idx, new_objects);
@@ -1362,16 +1641,36 @@ void GLGizmoAdvancedCut::update_clipper()
     }
 }
 
+void GLGizmoAdvancedCut::update_dovetail_preview_clip()
+{
+    if (m_cut_mode != CutMode::cutTongueAndGroove || m_connectors_editing || m_dragging || m_groove_editing || !has_valid_groove_shape()) {
+        m_parent.set_use_dovetail_clip(false);
+        return;
+    }
+
+    const Transform3d groove_to_world = Geometry::translation_transform(m_plane_center) * m_rotate_matrix;
+    m_parent.set_dovetail_clip(
+        groove_to_world.inverse(),
+        Vec4f(m_groove.depth, m_groove.width, m_groove.flaps_angle, m_groove.angle),
+        Vec2f(m_groove.depth_tolerance, m_groove.width_tolerance));
+    m_parent.set_use_dovetail_clip(true);
+}
+
 void GLGizmoAdvancedCut::render_cut_plane_and_grabbers()
 {
     // plane points is in object coordinate
-    // draw plane
+    const auto& ogl_manager = wxGetApp().get_opengl_manager();
+    if (!ogl_manager) {
+        return;
+    }
+    // Draw cut plane above PartPlate / scene geometry (same idea as grabbers below).
+    glsafe(::glClear(GL_DEPTH_BUFFER_BIT));
     glsafe(::glEnable(GL_DEPTH_TEST));
     glsafe(::glDisable(GL_CULL_FACE));
     glsafe(::glEnable(GL_BLEND));
     glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
 
-    bool      is_valid = can_perform_cut() && has_valid_groove();
+    bool      is_valid = m_cut_mode == CutMode::cutTongueAndGroove ? has_valid_groove() : can_perform_cut();
     ColorRGBA cp_clr   = is_valid ? CUT_PLANE_DEF_COLOR : CUT_PLANE_ERR_COLOR;
     if (m_cut_mode == CutMode::cutTongueAndGroove) {
         cp_clr.a(cp_clr.a() - 0.1f);
@@ -1443,12 +1742,11 @@ void GLGizmoAdvancedCut::render_cut_plane_and_grabbers()
 
         p_flat_shader->set_uniform("projection_matrix", proj_matrix);
 
-        const auto& p_ogl_manager = wxGetApp().get_opengl_manager();
-        p_ogl_manager->set_line_width(m_hover_id != -1 ? 2.0f : 1.5f);
+        ogl_manager->set_line_width(m_hover_id != -1 ? 2.0f : 1.5f);
 
         // to do: remove deprecated api: glLineStipple
 #ifdef __APPLE__
-        const auto& gl_info = p_ogl_manager->get_gl_info();
+        const auto &gl_info            = ogl_manager->get_gl_info();
         const auto formated_gl_version = gl_info.get_formated_gl_version();
         if (formated_gl_version < 30)
 #endif
@@ -1607,6 +1905,9 @@ void GLGizmoAdvancedCut::render_connectors()
 
 void GLGizmoAdvancedCut::render_clipper_cut()
 {
+    if (m_cut_mode == CutMode::cutTongueAndGroove)
+        return;
+
     if (!m_connectors_editing)
         ::glDisable(GL_DEPTH_TEST);
 
@@ -1669,8 +1970,11 @@ void GLGizmoAdvancedCut::render_cut_line()
     m_cut_line_model.set_color({ 0.0f, 1.0f, 0.0f, 1.0f});
 
 #ifdef __APPLE__
-    const auto& p_ogl_manager = wxGetApp().get_opengl_manager();
-    const auto& gl_info = p_ogl_manager->get_gl_info();
+    const auto &ogl_manager = wxGetApp().get_opengl_manager();
+    if (!ogl_manager) {
+        return;
+    }
+    const auto &gl_info            = ogl_manager->get_gl_info();
     const auto formated_gl_version = gl_info.get_formated_gl_version();
     if (formated_gl_version < 30)
 #endif
@@ -1726,6 +2030,8 @@ void GLGizmoAdvancedCut::set_connectors_editing(bool connectors_editing)
         return;
 
     m_connectors_editing = connectors_editing;
+    if (m_connectors_editing)
+        m_facet_picker.set_active(false);
     m_c->object_clipper()->set_behaviour(m_connectors_editing, m_connectors_editing, double(m_contour_width));
     m_parent.request_extra_frame();
     // todo: zhimin need a better method
@@ -1955,7 +2261,11 @@ void GLGizmoAdvancedCut::switch_to_mode(CutMode new_mode) {
     m_cut_mode = new_mode;
     if (m_cut_mode == CutMode::cutTongueAndGroove) {
         m_cut_to_parts = false;//into Groove function,cancel m_cut_to_parts
+    } else {
+        m_parent.set_use_dovetail_clip(false);
     }
+    if (m_cut_mode != CutMode::cutPlanar)
+        m_facet_picker.set_active(false);
     apply_color_clip_plane_colors();
     if (auto oc = m_c->object_clipper()) {
         m_contour_width = m_cut_mode == CutMode::cutTongueAndGroove ? 0.f : 0.4f;
@@ -2011,14 +2321,17 @@ bool GLGizmoAdvancedCut::has_valid_groove() const
     if (m_cut_mode != CutMode::cutTongueAndGroove)
         return true;
 
-    const float flaps_width = -2.f * m_groove.depth / tan(m_groove.flaps_angle);
-    if (flaps_width > m_groove.width) return false;
+    if (!has_valid_groove_shape())
+        return false;
 
     const Selection &selection = m_parent.get_selection();
     const auto &     list      = selection.get_volume_idxs();
     // is more volumes selected?
     if (list.empty())
         return false;
+    // Groove edge samples are filled when the plane mesh is built.
+    if (m_groove_vertices.size() < 2)
+        return true;
 
     const Transform3d cp_matrix = Geometry::translation_transform(m_plane_center) * m_rotate_matrix;
     if (!m_c->raycaster()) {
@@ -2048,6 +2361,18 @@ bool GLGizmoAdvancedCut::has_valid_groove() const
     return true;
 }
 
+bool GLGizmoAdvancedCut::has_valid_groove_shape() const
+{
+    if (m_cut_mode != CutMode::cutTongueAndGroove)
+        return true;
+
+    if (m_groove.depth <= 0.f || m_groove.width <= 0.f)
+        return false;
+
+    const float sin_flap = std::abs(std::sin(m_groove.flaps_angle));
+    return sin_flap > 0.01f;
+}
+
 bool GLGizmoAdvancedCut::has_valid_contour() const
 {
     const auto clipper = m_c->object_clipper();
@@ -2059,18 +2384,64 @@ void GLGizmoAdvancedCut::reset_cut_by_contours()
     update_buffer_data();
     update_plane_normal();
 
+    // A preview still being built describes the previous plane. Drop its result without
+    // blocking the UI; poll_part_selection_job() joins the worker once it returns.
+    cancel_part_selection_job(false);
     m_part_selection.reset(new PartSelection());
 
     if (m_cut_mode == CutMode::cutTongueAndGroove) {
-        if (m_dragging || m_groove_editing || !has_valid_groove())
+        if (m_dragging || m_groove_editing || !has_valid_groove_shape())
             return;
-        process_contours();
+        update_dovetail_preview_clip();
+        toggle_model_objects_visibility();
     } else {
         toggle_model_objects_visibility();
     }
 }
 
-void GLGizmoAdvancedCut::process_contours()
+// State of one background part-preview build. The worker only reads the snapshot fields
+// and writes `percent` (under `mutex`), then `built` / `error` before setting `finished`.
+// Everything else is UI-thread only. The gizmo always joins `worker` before it drops the
+// job, so the worker may keep a raw pointer to it.
+struct GLGizmoAdvancedCut::PartSelectionJob
+{
+    // Inputs, captured on the UI thread at the click.
+    Model                                 snapshot;
+    Transform3d                           cut_matrix{Transform3d::Identity()};
+    Vec3d                                 center{Vec3d::Zero()};
+    Vec3d                                 normal{Vec3d::UnitZ()};
+    std::vector<Vec3d>                    contour_pts;
+    double                                sla_shift_z{0.};
+    int                                   instance_idx{-1};
+    // The click is replayed against the camera it was made with, so rotating the view while
+    // waiting does not change which part gets flipped.
+    Vec2d                                 click_pos{Vec2d::Zero()};
+    Camera                                click_camera;
+    std::chrono::steady_clock::time_point started;
+
+    boost::thread                         worker;
+    std::mutex                            mutex;
+    int                                   percent{0};
+    std::atomic<bool>                     finished{false};
+    // Set by the card's cancel button: the progress stays visible until the worker returns.
+    std::atomic<bool>                     canceled{false};
+    // Set when the plane or the selection changed: the result is dropped silently.
+    std::atomic<bool>                     discarded{false};
+    // At most one wake-up queued on the event loop at a time.
+    std::atomic<bool>                     wake_pending{false};
+    std::shared_ptr<PartSelection>        built;
+    std::string                           error;
+
+    ~PartSelectionJob()
+    {
+        if (worker.joinable()) {
+            canceled = true;
+            worker.join();
+        }
+    }
+};
+
+void GLGizmoAdvancedCut::process_contours(const Vec2d &mouse_position)
 {
     const Selection &      selection     = m_parent.get_selection();
     const ModelObjectPtrs &model_objects = selection.get_model()->objects;
@@ -2080,23 +2451,172 @@ void GLGizmoAdvancedCut::process_contours()
         return;
     const int object_idx = selection.get_object_idx();
 
-    wxBusyCursor wait;
-
     if (m_cut_mode == CutMode::cutTongueAndGroove) {
-        if (has_valid_groove()) {
-            Cut                    cut(model_objects[object_idx], instance_idx, get_cut_matrix(selection));
-            const ModelObjectPtrs &new_objects = cut.perform_with_groove(m_groove, m_rotate_matrix, true);
-            if (!new_objects.empty()) {
-                m_part_selection.reset(new PartSelection(new_objects.front(), instance_idx));
-            }
+        // Dovetail preview is shader-based. Avoid running the expensive temporary
+        // boolean here; the real perform_with_groove() still runs on confirmation.
+        update_dovetail_preview_clip();
+        toggle_model_objects_visibility();
+        return;
+    }
+    if (!m_c->object_clipper() || object_idx < 0 || m_part_job)
+        return;
+
+    // Snapshot everything the worker needs. It must not touch the gizmo, the selection,
+    // or OpenGL. The model is copied here so later edits on the UI thread cannot mutate
+    // the mesh the worker is reading.
+    auto job = std::make_shared<PartSelectionJob>();
+    job->snapshot.add_object(*model_objects[object_idx]);
+    job->cut_matrix   = get_cut_matrix(selection);
+    job->center       = m_plane_center;
+    job->normal       = m_plane_normal;
+    job->contour_pts  = m_c->object_clipper()->point_per_contour();
+    job->instance_idx = instance_idx;
+    if (const GLVolume *glvol = selection.get_first_volume())
+        job->sla_shift_z = glvol->get_sla_shift_z();
+    job->click_pos    = mouse_position;
+    job->click_camera = wxGetApp().plater()->get_camera();
+    job->started      = std::chrono::steady_clock::now();
+
+    PartSelectionJob *              raw  = job.get();
+    std::weak_ptr<PartSelectionJob> weak = job;
+    // Wake the UI thread so on_render() sees new progress or the finished result. Only
+    // CallAfter is used from the worker; the canvas itself is touched on the UI thread.
+    auto wake = [this, raw, weak]() {
+        if (raw->wake_pending.exchange(true))
+            return;
+        wxGetApp().CallAfter([this, weak]() {
+            if (auto j = weak.lock())
+                j->wake_pending = false;
+            if (m_state != On)
+                return;
+            set_dirty();
+            m_parent.set_as_dirty();
+            m_parent.request_extra_frame();
+        });
+    };
+
+    // The progress callback captures the thread's own copy of `wake`, which lives as long as
+    // the thread body. Percent is kept monotonic so the bar never moves backwards.
+    raw->worker = boost::thread([raw, wake]() {
+        try {
+            raw->built = std::make_shared<PartSelection>(
+                raw->snapshot.objects.front(), raw->cut_matrix, raw->instance_idx, raw->center, raw->normal, raw->contour_pts,
+                raw->sla_shift_z,
+                [raw, &wake](int percent, const char *) {
+                    {
+                        std::lock_guard<std::mutex> lock(raw->mutex);
+                        if (percent > raw->percent)
+                            raw->percent = percent;
+                    }
+                    wake();
+                },
+                [raw]() { return raw->canceled.load() || raw->discarded.load(); });
+        } catch (std::exception &ex) {
+            raw->error = ex.what();
+        } catch (...) {
+            raw->error = "unknown exception";
         }
-    } else {
-        if (m_c->object_clipper()) {
-            m_part_selection.reset(new PartSelection(model_objects[object_idx], get_cut_matrix(selection), instance_idx, m_plane_center, m_plane_normal, *m_c->object_clipper()));
-        }
+        raw->finished = true;
+        wake();
+    });
+
+    m_part_job = std::move(job);
+    set_dirty();
+    m_parent.request_extra_frame();
+}
+
+void GLGizmoAdvancedCut::poll_part_selection_job()
+{
+    if (!m_part_job)
+        return;
+    if (!m_part_job->finished) {
+        // Progress callbacks can be seconds apart inside one split(), so keep a slow tick
+        // running: it makes the card appear at 1.5s and keeps the bar responsive.
+        m_parent.schedule_extra_frame(100);
+        return;
     }
 
+    // The worker has already returned, so this join does not block.
+    std::shared_ptr<PartSelectionJob> job = std::move(m_part_job);
+    if (job->worker.joinable())
+        job->worker.join();
+
+    if (!job->error.empty())
+        BOOST_LOG_TRIVIAL(error) << "PartSelection preview failed: " << job->error;
+    // A canceled, discarded or failed build leaves m_part_selection invalid, so the next
+    // right-click starts a fresh build.
+    if (job->discarded || job->canceled || !job->error.empty() || !job->built || !job->built->valid() ||
+        !job->built->upload_glmodels()) {
+        set_dirty();
+        m_parent.request_extra_frame();
+        return;
+    }
+    m_part_selection = std::move(job->built);
+
+    // Apply the flip the first right-click asked for.
+    m_part_selection->toggle_selection(job->click_pos, job->click_camera);
+    check_and_update_connectors_state(); // after a contour is deactivated, its connectors are inside the object
     toggle_model_objects_visibility();
+
+    set_dirty();
+    m_parent.request_extra_frame();
+}
+
+void GLGizmoAdvancedCut::cancel_part_selection_job(bool wait)
+{
+    if (!m_part_job)
+        return;
+    // `discarded` also stops the build at its next cancel check and hides the card progress.
+    m_part_job->discarded = true;
+    if (!wait)
+        return;
+    if (m_part_job->worker.joinable())
+        m_part_job->worker.join();
+    m_part_job.reset();
+}
+
+void GLGizmoAdvancedCut::render_part_job_progress()
+{
+    // Fast builds finish before the threshold and never show anything.
+    if (!m_part_job || m_part_job->discarded)
+        return;
+    if (std::chrono::steady_clock::now() - m_part_job->started < std::chrono::milliseconds(1500))
+        return;
+
+    int percent = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_part_job->mutex);
+        percent = m_part_job->percent;
+    }
+    percent = std::clamp(percent, 0, 100);
+
+    // Same look as MeshBooleanUI::draw_progress_bar().
+    ImGui::Separator();
+    const float text_padding  = 8.0f;
+    const float content_width = ImGui::GetWindowContentRegionMax().x - ImGui::GetWindowContentRegionMin().x;
+    const float percent_width = ImGui::CalcTextSize("100%").x;
+    const float bar_width     = std::max(content_width - percent_width - text_padding, 50.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.00f, 0.68f, 0.26f, 1.00f));
+    ImGui::BBLProgressBar2(float(percent) / 100.0f, ImVec2(bar_width, 0.0f));
+    ImGui::PopStyleColor(1);
+    ImGui::PopStyleVar();
+    ImGui::SameLine(0, text_padding);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImVec4(0.42f, 0.42f, 0.42f, 1.00f), "%d%%", percent);
+
+    // One status line for the whole build. "Computing..." is translated as a mesh-boolean
+    // message in some languages, so the boolean tool's per-stage strings are not reused here.
+    m_imgui->text(_u8L("Preparing data..."));
+
+    // Cancellation is cooperative: a split() already running finishes first, then the
+    // worker returns and poll_part_selection_job() drops the result.
+    const bool cancel_requested = m_part_job->canceled;
+    m_imgui->disabled_begin(cancel_requested);
+    if (m_imgui->button(_L("Cancel")))
+        m_part_job->canceled = true;
+    m_imgui->disabled_end();
 }
 
 void GLGizmoAdvancedCut::render_flip_plane_button(bool disable_pred /*=false*/)
@@ -2369,6 +2889,29 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
     ImGui::Separator();
     m_imgui->disabled_end();
 
+#if 0 // hide Pick-face entry
+    // Pick-face mode is planar-cut only; the groove mode has its own plane state machine.
+    const bool pick_face_available = (m_cut_mode == CutMode::cutPlanar) && !m_connectors_editing;
+    m_imgui->disabled_begin(!pick_face_available);
+    // Keep the button looking pressed while armed - it is a mode, and the only other
+    // cue that it is on is the facet highlight, which needs the cursor over the model.
+    const bool picking = m_facet_picker.is_active();
+    if (picking)
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImGuiCol_ButtonActive));
+    if (m_imgui->button(_L("Pick face")))
+        m_facet_picker.set_active(!picking);
+    if (picking)
+        ImGui::PopStyleColor();
+    m_imgui->disabled_end();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Click a face of the model to set the cut plane. The plane lands flush with that face; use Movement to offset it."), ImGui::GetFontSize() * 20.0f);
+    if (m_facet_picker.is_active()) {
+        ImGui::SameLine();
+        m_imgui->text(_L("Click a face of the model."));
+    }
+    ImGui::Separator();
+#endif
+
     ImGui::PushItemWidth(caption_size);
     ImGui::Dummy(ImVec2(caption_size, -1));
     ImGui::SameLine(caption_size + 1 * space_size);
@@ -2564,8 +3107,19 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
     ImGui::SameLine();
     // Cut button
     m_imgui->disabled_begin(!can_perform_cut());
-    if (m_imgui->button(_L("Perform cut")))
-        perform_cut(m_parent.get_selection());
+    if (m_imgui->button(_L("Perform cut")) && !m_perform_cut_requested) {
+        // This window is rendered from inside GLCanvas3D::render(), which refuses to re-enter
+        // itself (m_in_render). perform_cut() then pumps the event loop for its progress dialog,
+        // so every repaint yielded from there would return immediately and leave the 3D view
+        // frozen on a stale frame. Run it from the event loop instead, outside the render pass.
+        m_perform_cut_requested = true;
+        wxGetApp().plater()->CallAfter([this]() {
+            m_perform_cut_requested = false;
+            // The gizmo may have been closed or the selection changed before this ran.
+            if (m_state == On && can_perform_cut())
+                perform_cut(m_parent.get_selection());
+        });
+    }
     m_imgui->disabled_end();
     ImGui::SameLine();
     const bool reset_clicked = m_imgui->button(_L("Reset"));
@@ -3054,32 +3608,68 @@ bool GLGizmoAdvancedCut::process_cut_line(SLAGizmoEventType action, const Vec2d 
 }
 
 PartSelection::PartSelection(
-    const ModelObject *mo, const Transform3d &cut_matrix, int instance_idx_in, const Vec3d &center, const Vec3d &normal, const CommonGizmosDataObjects::ObjectClipper &oc)
+    const ModelObject *mo, const Transform3d &cut_matrix, int instance_idx_in, const Vec3d &center, const Vec3d &normal,
+    const std::vector<Vec3d> &contour_pts, double sla_shift_z,
+    const CutProgressCallback &progress, const CutCancelCallback &cancel)
     : m_instance_idx(instance_idx_in)
 {
+    // Progress budget of the build (percent of the card bar):
+    //   0..40  plane cut and paint restore (Cut::perform_with_plane)
+    //  40..75  splitting the cut halves into shells, weighted by face count
+    //  75..88  raycaster and up/down side per shell
+    //  88..96  contour rays
+    //  96..100 GPU upload, done later on the UI thread by upload_glmodels()
+    auto stopped = [&cancel]() { return cancel && cancel(); };
+    auto report  = [&progress](int percent) {
+        if (progress)
+            progress(std::clamp(percent, 0, 96), nullptr);
+    };
+
     Cut cut(mo, instance_idx_in, cut_matrix);
-    add_object(cut.perform_with_plane().front());
+    cut.set_progress([&report](int percent, const char *) { report(int(percent * 0.40)); }, cancel);
+    const ModelObjectPtrs &cut_objects = cut.perform_with_plane();
+    if (cut.was_canceled() || stopped() || cut_objects.empty() || cut_objects.front() == nullptr)
+        return;
+    add_object(cut_objects.front(), sla_shift_z, true);
 
     const ModelVolumePtrs &volumes = model_object()->volumes;
 
     // split to parts
-    for (int id = int(volumes.size()) - 1; id >= 0; id--) {
+    // Weights are taken before the loop because split() inserts the new shells into `volumes`.
+    // split() itself cannot be interrupted, so cancel is checked between volumes.
+    const int           split_count = int(volumes.size());
+    std::vector<double> split_weight(size_t(split_count), 0.);
+    double              split_weight_sum = 0.;
+    for (int id = 0; id < split_count; ++id) {
+        if (volumes[id]->is_model_part())
+            split_weight[size_t(id)] = double(volumes[id]->mesh().its.indices.size());
+        split_weight_sum += split_weight[size_t(id)];
+    }
+    split_weight_sum  = std::max(split_weight_sum, 1.);
+    double split_done = 0.;
+    for (int id = split_count - 1; id >= 0; id--) {
+        if (stopped())
+            return;
         auto look = volumes[id]->is_model_part();
         if (volumes[id]->is_splittable() && volumes[id]->is_model_part()) // we have to split just solid volumes
             volumes[id]->split(1);
+        split_done += split_weight[size_t(id)];
+        report(40 + int(35. * split_done / split_weight_sum));
     }
 
     const Vec3d inst_offset = model_object()->instances[m_instance_idx]->get_offset();
     int         i           = 0;
     m_cut_parts.resize(volumes.size());
+    const size_t preview_count = std::max<size_t>(volumes.size(), 1);
     for (const ModelVolume *volume : volumes) {
+        if (stopped())
+            return;
         assert(volume != nullptr);
         m_cut_parts[i].is_modifier = !volume->is_model_part();
         m_cut_parts[i].is_up_part = false;
         if (m_cut_parts[i].raycaster) { delete m_cut_parts[i].raycaster; }
         m_cut_parts[i].raycaster = new MeshRaycaster(volume->mesh());
-        m_cut_parts[i].glmodel.reset();
-        m_cut_parts[i].glmodel.init_from(volume->mesh_ptr()->its);
+        // The GLModel is filled later by upload_glmodels(): it needs the GL context.
         m_cut_parts[i].trans = Geometry::translation_transform(inst_offset) * model_object()->volumes[i]->get_matrix();
         // Now check whether this part is below or above the plane.
         Transform3d tr   = (model_object()->instances[m_instance_idx]->get_matrix() * volume->get_matrix()).inverse();
@@ -3094,6 +3684,7 @@ PartSelection::PartSelection(
             }
         }
         i++;
+        report(75 + int(13. * double(i) / double(preview_count)));
     }
 
     m_back_cut_parts_state.resize(m_cut_parts.size());
@@ -3101,13 +3692,18 @@ PartSelection::PartSelection(
         m_back_cut_parts_state[i] = m_cut_parts[i].is_up_part;
     }
     // Now go through the contours and create a map from contours to parts.
+    // The contour points were captured from the object clipper on the UI thread.
     m_contour_points.clear();
     m_contour_to_parts.clear();
     m_debug_pts = std::vector<std::vector<Vec3d>>(m_cut_parts.size(), std::vector<Vec3d>());
-    if (std::vector<Vec3d> pts = oc.point_per_contour(); !pts.empty()) {
+    if (!contour_pts.empty()) {
+        const std::vector<Vec3d> &pts = contour_pts;
         m_contour_to_parts.resize(pts.size());
 
         for (size_t pt_idx = 0; pt_idx < pts.size(); ++pt_idx) {
+            if (stopped())
+                return;
+            report(88 + int(8. * double(pt_idx + 1) / double(pts.size())));
             const Vec3d &pt  = pts[pt_idx];
             const Vec3d  dir = (center - pt).dot(normal) * normal;
             m_contour_points.emplace_back(dir + pt); // the result is in world coordinates.
@@ -3139,6 +3735,21 @@ PartSelection::PartSelection(
     }
 
     m_valid = true;
+}
+
+bool PartSelection::upload_glmodels()
+{
+    if (!m_valid || m_model.objects.empty())
+        return false;
+    const ModelVolumePtrs &volumes = model_object()->volumes;
+    if (volumes.size() != m_cut_parts.size())
+        return false;
+
+    for (size_t i = 0; i < m_cut_parts.size(); ++i) {
+        m_cut_parts[i].glmodel.reset();
+        m_cut_parts[i].glmodel.init_from(volumes[i]->mesh_ptr()->its);
+    }
+    return true;
 }
 
 // In CutMode::cutTongueAndGroove we use PartSelection just for rendering
@@ -3200,12 +3811,13 @@ void PartSelection::part_render(const Vec3d *cut_center, const Vec3d *normal)
     }
 }
 
-void PartSelection::add_object(const ModelObject *object)
+void PartSelection::add_object(const ModelObject *object, double sla_shift_z, bool sla_shift_known)
 {
     m_model = Model();
     m_model.add_object(*object);
 
-    const double sla_shift_z = wxGetApp().plater()->canvas3D()->get_selection().get_first_volume()->get_sla_shift_z();
+    if (!sla_shift_known)
+        sla_shift_z = wxGetApp().plater()->canvas3D()->get_selection().get_first_volume()->get_sla_shift_z();
     if (!is_approx(sla_shift_z, 0.)) {
         Vec3d inst_offset = model_object()->instances[m_instance_idx]->get_offset();
         inst_offset[Z] += sla_shift_z;
@@ -3244,9 +3856,18 @@ bool PartSelection::has_modified_cut_parts()
     return false;
 }
 
-void PartSelection::toggle_selection(const Vec2d &mouse_pos)
+// Read-only hit test shared by hover tooltip and right-click part assignment.
+// Returns the cut-part index under the mouse, or -1 when nothing is hit.
+int PartSelection::pick_part_id(const Vec2d &mouse_pos) const
 {
-    const Camera &camera     = wxGetApp().plater()->get_camera();
+    return pick_part_id(mouse_pos, wxGetApp().plater()->get_camera());
+}
+
+int PartSelection::pick_part_id(const Vec2d &mouse_pos, const Camera &camera) const
+{
+    if (!valid())
+        return -1;
+
     const Vec3d & camera_pos = camera.get_position();
 
     Vec3f pos;
@@ -3255,19 +3876,37 @@ void PartSelection::toggle_selection(const Vec2d &mouse_pos)
     std::vector<std::pair<size_t, double>> hits_id_and_sqdist;
 
     for (size_t id = 0; id < m_cut_parts.size(); ++id) {
-        //        const Vec3d volume_offset = model_object()->volumes[id]->get_offset();
-        Transform3d tr = Geometry::translation_transform(model_object()->instances[m_instance_idx]->get_offset()) *
-                         Geometry::translation_transform(model_object()->volumes[id]->get_offset());
-        if (m_cut_parts[id].raycaster->unproject_on_mesh(mouse_pos, tr, camera, pos, normal)) {
-            hits_id_and_sqdist.emplace_back(id, (camera_pos - tr * (pos.cast<double>())).squaredNorm());
-        }
+        const Transform3d &tr = m_cut_parts[id].trans;
+        if (m_cut_parts[id].raycaster->unproject_on_mesh(mouse_pos, tr, camera, pos, normal))
+            hits_id_and_sqdist.emplace_back(id, (camera_pos - tr * pos.cast<double>()).squaredNorm());
     }
-    if (!hits_id_and_sqdist.empty()) {
-        size_t id = std::min_element(hits_id_and_sqdist.begin(), hits_id_and_sqdist.end(), [](const std::pair<size_t, double> &a, const std::pair<size_t, double> &b) {
-                        return a.second < b.second;
-                    })->first;
+    if (hits_id_and_sqdist.empty())
+        return -1;
+
+    return int(std::min_element(hits_id_and_sqdist.begin(), hits_id_and_sqdist.end(), [](const std::pair<size_t, double> &a, const std::pair<size_t, double> &b) {
+                   return a.second < b.second;
+               })->first);
+}
+
+// Hover-only query for tooltip; must not call toggle_selection() which mutates part side.
+bool PartSelection::is_mouse_over_part(const Vec2d &mouse_pos) const
+{
+    return valid() && !is_one_object() && pick_part_id(mouse_pos) >= 0;
+}
+
+void PartSelection::toggle_selection(const Vec2d &mouse_pos)
+{
+    // Reuse the same raycast as hover detection, then flip the picked part side.
+    const int id = pick_part_id(mouse_pos);
+    if (id >= 0)
         toggle_selection(id);
-    }
+}
+
+void PartSelection::toggle_selection(const Vec2d &mouse_pos, const Camera &camera)
+{
+    const int id = pick_part_id(mouse_pos, camera);
+    if (id >= 0)
+        toggle_selection(id);
 }
 
 void PartSelection::toggle_selection(int id)

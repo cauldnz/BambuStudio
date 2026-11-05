@@ -6,6 +6,8 @@
 #include "libslic3r/AppConfig.hpp"
 #include "slic3r/GUI/wxExtensions.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/EncodedFilament.hpp"
+#include "slic3r/GUI/MsgDialog.hpp"
 #include "libslic3r_version.h"
 
 #include <wx/sizer.h>
@@ -32,6 +34,7 @@
 #include <libslic3r/Utils.hpp>
 #include <tbb/parallel_for.h>
 #include "CreatePresetsDialog.hpp"
+#include "libslic3r/Log.hpp"
 
 #define PARALLEL_READ 1
 
@@ -57,8 +60,15 @@ static wxString update_custom_filaments()
         temp_filament_id_to_presets[preset.filament_id].push_back(&preset);
     }
 
-    std::vector<std::pair<std::string, std::string>>   need_sort;
-    bool                                             need_delete_some_filament = false;
+    struct CustomFilaData {
+        std::string name;
+        std::string id;
+        std::string type;
+        std::string time;
+    };
+    std::vector<CustomFilaData> custom_filas;
+    bool need_delete_some_filament = false;
+
     for (std::pair<std::string, std::vector<Preset const *>> filament_id_to_presets : temp_filament_id_to_presets) {
         std::string filament_id = filament_id_to_presets.first;
         if (filament_id.empty()) continue;
@@ -68,6 +78,9 @@ static wxString update_custom_filaments()
         bool filament_with_base_id = false;
         bool not_need_show = false;
         std::string filament_name;
+        std::string filament_type;
+        std::string create_time;
+
         for (const Preset *preset : filament_id_to_presets.second) {
             if (preset->is_system || preset->is_project_embedded) {
                 not_need_show = true;
@@ -78,7 +91,17 @@ static wxString update_custom_filaments()
 
             if (!not_need_show) {
                 auto filament_vendor = dynamic_cast<ConfigOptionStrings *>(const_cast<Preset *>(preset)->config.option("filament_vendor", false));
-                if (filament_vendor && filament_vendor->values.size() && filament_vendor->values[0] == "Generic") not_need_show = true;
+                // Filter out user presets that carry an official Bambu vendor. These are
+                // almost always Bambu system presets that were duplicated/edited via the
+                // native "Save As" flow or an old wizard build that lacked the reserved
+                // vendor check — they visually collide with Bambu's own products and
+                // aren't what users think of as their own "custom" materials. Same
+                // treatment as the existing "Generic" filter above.
+                if (filament_vendor && filament_vendor->values.size()) {
+                    const std::string &v = filament_vendor->values[0];
+                    if (v == "Generic" || v == "Bambu" || v == "Bambu Lab" || v == "BBL")
+                        not_need_show = true;
+                }
             }
 
             if (filament_name.empty()) {
@@ -86,31 +109,123 @@ static wxString update_custom_filaments()
                 size_t      index_at    = preset_name.find(" @");
                 if (std::string::npos != index_at) { preset_name = preset_name.substr(0, index_at); }
                 filament_name = preset_name;
+                
+                auto opt_type = dynamic_cast<ConfigOptionStrings *>(const_cast<Preset *>(preset)->config.option("filament_type", false));
+                if (opt_type && opt_type->values.size() > 0) {
+                    filament_type = opt_type->values[0];
+                }
+                
+                // Prefer Preset::updated_time (persisted in the .info file, sourced from
+                // the cloud's update_time for synced presets) over any filesystem timestamp.
+                // Filesystem times reflect the LOCAL write moment — for a preset synced from
+                // another account they collapse to "when I synced", which puts every synced
+                // preset under "today" regardless of the original author's creation time.
+                // updated_time survives sync intact and stays comparable across accounts.
+                std::time_t t = static_cast<std::time_t>(preset->updated_time);
+                if (t > 0) {
+                    char buf[100];
+                    struct tm tm_info;
+#ifdef _WIN32
+                    localtime_s(&tm_info, &t);
+#else
+                    localtime_r(&t, &tm_info);
+#endif
+                    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+                    create_time = buf;
+                }
             }
         }
         if (not_need_show) continue;
         if (!filament_name.empty()) {
+            CustomFilaData data;
             if (filament_with_base_id) {
-                need_sort.push_back(std::make_pair("[Action Required] " + filament_name, filament_id));
+                data.name = "[Action Required] " + filament_name;
             } else {
-
-                need_sort.push_back(std::make_pair(filament_name, filament_id));
+                data.name = filament_name;
             }
+            data.id = filament_id;
+            data.type = filament_type;
+            data.time = create_time;
+            custom_filas.push_back(data);
         }
     }
-    std::sort(need_sort.begin(), need_sort.end(), [](const std::pair<std::string, std::string> &a, const std::pair<std::string, std::string> &b) { return a.first < b.first; });
+    std::sort(custom_filas.begin(), custom_filas.end(), [](const CustomFilaData &a, const CustomFilaData &b) { return a.name < b.name; });
+
     if (need_delete_some_filament) {
-        need_sort.push_back(std::make_pair("[Action Required]", "null"));
+        CustomFilaData data;
+        data.name = "[Action Required]";
+        data.id = "null";
+        custom_filas.push_back(data);
     }
+
     json temp_j;
-    for (std::pair<std::string, std::string> &filament_name_to_id : need_sort) {
-        temp_j["name"] = filament_name_to_id.first;
-        temp_j["id"]   = filament_name_to_id.second;
+    for (const CustomFilaData &data : custom_filas) {
+        temp_j["name"] = data.name;
+        temp_j["id"]   = data.id;
+        temp_j["type"] = data.type;
+        temp_j["create_time"] = data.time;
         m_CustomFilaments.push_back(temp_j);
     }
     m_Res["data"]  = m_CustomFilaments;
     wxString strJS = wxString::Format("HandleStudio(%s)", wxString::FromUTF8(m_Res.dump(-1, ' ', false, json::error_handler_t::ignore)));
     return strJS;
+}
+
+// Delete every user filament preset that shares the given filament_id (one custom
+// filament in the UI list may span multiple presets — one per printer). Prompts the
+// user for confirmation first, and refreshes the list once the delete is done.
+static void run_delete_all_presets_with_filament_id(const std::string &filament_id)
+{
+    PresetBundle *pb = wxGetApp().preset_bundle;
+    if (!pb) return;
+    PresetCollection &filaments = pb->filaments;
+
+    // Collect names first — mutating m_presets while iterating it is unsafe.
+    std::vector<std::string> to_delete;
+    for (const Preset &p : filaments.get_presets()) {
+        if (!p.is_user() || p.is_project_embedded) continue;
+        if (p.filament_id.empty()) continue;
+        if (p.filament_id == filament_id)
+            to_delete.push_back(p.name);
+    }
+
+    // Push cloud-side delete notifications and wipe the local record for each. Mirrors
+    // CreatePresetsDialog.cpp's delete_filament_preset_by_name path.
+    std::string selected = filaments.get_selected_preset_name();
+    for (const std::string &name : to_delete) {
+        try {
+            Preset *pr = filaments.find_preset(name);
+            if (!pr) continue;
+            if (!pr->setting_id.empty()) {
+                filaments.set_sync_info_and_save(pr->name, pr->setting_id, "delete", 0);
+                wxGetApp().delete_preset_from_cloud(pr->setting_id);
+            }
+            if (filaments.get_edited_preset().name == pr->name)
+                filaments.discard_current_changes();
+            filaments.delete_preset(pr->name);
+        } catch (const std::exception &ex) {
+            BOOST_LOG_TRIVIAL(error) << "exception deleting " << name << ": " << ex.what();
+        }
+    }
+}
+
+void GuideFrame::delete_custom_filament(const std::string &filament_id, const std::string &filament_name)
+{
+    // Reuse the exact confirm dialog EditFilamentPresetDialog uses for its own
+    // "Delete Material" button (CreatePresetsDialog.cpp:4974): same wording, same
+    // title, same buttons — one canonical confirmation across all delete-material
+    // entry points, no drift between them.
+    WarningDialog dlg(this,
+        _L("All the filament presets belong to this filament would be deleted. \nIf you are using this filament on your printer, please reset the filament information for that slot."),
+        _L("Delete filament"),
+        wxYES | wxCANCEL | wxCANCEL_DEFAULT | wxCENTRE);
+    if (dlg.ShowModal() != wxID_YES) return;
+
+    run_delete_all_presets_with_filament_id(filament_id);
+
+    // Push the refreshed list back to the page so the deleted row disappears.
+    wxString strJS = update_custom_filaments();
+    wxGetApp().CallAfter([this, strJS] { RunScript(strJS); });
 }
 
 GuideFrame::GuideFrame(GUI_App *pGUI, long style)
@@ -132,7 +247,7 @@ GuideFrame::GuideFrame(GUI_App *pGUI, long style)
     wxBoxSizer *topsizer = new wxBoxSizer(wxVERTICAL);
 
     wxString TargetUrl = SetStartPage(BBL_WELCOME, false);
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  set start page to welcome ");
+    BOOST_LOG_TRIVIAL(info) << boost::format("set start page to welcome ");
 
     // Create the webview
     m_browser = WebView::CreateWebView(this, TargetUrl);
@@ -191,7 +306,7 @@ GuideFrame::GuideFrame(GUI_App *pGUI, long style)
     // UI
     SetStartPage(BBL_REGION);
 
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  finished");
+    BOOST_LOG_TRIVIAL(info) << boost::format("finished");
     wxGetApp().UpdateDlgDarkUI(this);
 }
 
@@ -211,18 +326,18 @@ GuideFrame::~GuideFrame()
 
 void GuideFrame::load_url(wxString &url)
 {
-    BOOST_LOG_TRIVIAL(trace) << __FUNCTION__<< " enter, url=" << url.ToStdString();
+    BOOST_LOG_TRIVIAL(trace) << "enter, url=" << url;
     WebView::LoadUrl(m_browser, url);
     m_browser->SetFocus();
     UpdateState();
 
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< " exit";
+    BOOST_LOG_TRIVIAL(info) << "exit";
 }
 
-wxString GuideFrame::SetStartPage(GuidePage startpage, bool load)
+wxString GuideFrame::SetStartPage(GuidePage startpage, bool load, bool default_custom_tab)
 {
     m_page = startpage;
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(" enter, load=%1%, start_page=%2%")%load%int(startpage);
+    BOOST_LOG_TRIVIAL(info) << boost::format("enter, load=%1%, start_page=%2%")%load%int(startpage);
     //wxLogMessage("GUIDE: webpage_1  %s", (boost::filesystem::path(resources_dir()) / "web\\guide\\1\\index.html").make_preferred().string().c_str() );
     wxString TargetUrl = from_u8( (boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=1").make_preferred().string() );
     //wxLogMessage("GUIDE: webpage_2  %s", TargetUrl.mb_str());
@@ -248,6 +363,11 @@ wxString GuideFrame::SetStartPage(GuidePage startpage, bool load)
     } else if (startpage == BBL_FILAMENT_ONLY) {
         SetTitle("");
         TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=23").make_preferred().string());
+        // Reopening right after creating/editing a custom filament (see Plater::priv::
+        // on_create_filament / on_modify_filament) should land on the Custom tab instead
+        // of the default System tab used by the first-run wizard and other entry points.
+        if (default_custom_tab)
+            TargetUrl = wxString::Format("%s&custom=1", TargetUrl);
     } else if (startpage == BBL_MODELS_ONLY) {
         SetTitle("");
         TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=24").make_preferred().string());
@@ -258,7 +378,7 @@ wxString GuideFrame::SetStartPage(GuidePage startpage, bool load)
     }
 
     wxString strlang = wxGetApp().current_language_code_safe();
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(", strlang=%1%") % into_u8(strlang);
+    BOOST_LOG_TRIVIAL(info) << boost::format("strlang=%1%") % into_u8(strlang);
     if (strlang != "")
         TargetUrl = wxString::Format("%s&lang=%s", w2s(TargetUrl), strlang);
 
@@ -266,7 +386,7 @@ wxString GuideFrame::SetStartPage(GuidePage startpage, bool load)
     if (load)
         load_url(TargetUrl);
 
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< " exit";
+    BOOST_LOG_TRIVIAL(info) << "exit";
     return TargetUrl;
 }
 
@@ -382,11 +502,11 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
 {
     try {
         wxString strInput = evt.GetString();
-        BOOST_LOG_TRIVIAL(trace) << "GuideFrame::OnScriptMessage;OnRecv:" << strInput.c_str();
+        BOOST_LOG_TRIVIAL(trace) << "OnRecv:" << strInput.c_str();
         json     j        = json::parse(strInput);
 
         wxString strCmd = j["command"];
-        BOOST_LOG_TRIVIAL(trace) << "GuideFrame::OnScriptMessage;Command:" << strCmd;
+        BOOST_LOG_TRIVIAL(trace) << "Command:" << strCmd;
 
         if (strCmd == "close_page") {
             this->EndModal(wxID_CANCEL);
@@ -435,6 +555,13 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
         } else if (strCmd == "modify_custom_filament") {
             m_editing_filament_id = j["id"];
             this->EndModal(wxID_EDIT);
+        }
+        else if (strCmd == "delete_custom_filament")
+        {
+            std::string del_filament_id = j.value("id", "");
+            std::string del_filament_name = j.value("name", "");
+            if (!del_filament_id.empty())
+                delete_custom_filament(del_filament_id, del_filament_name);
         }
         else if (strCmd == "save_userguide_models")
         {
@@ -537,7 +664,7 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
         }
     } catch (std::exception &e) {
         // wxMessageBox(e.what(), "json Exception", MB_OK);
-        BOOST_LOG_TRIVIAL(trace) << "GuideFrame::OnScriptMessage;Error:" << e.what();
+        BOOST_LOG_TRIVIAL(trace) << "Error:" << e.what();
     }
 
     wxString strAll = m_ProfileJson.dump(-1,' ',false, json::error_handler_t::ignore);
@@ -608,7 +735,7 @@ void GuideFrame::OnError(wxWebViewEvent &evt)
     // Show the info bar with an error
     // m_info->ShowMessage(_L("An error occurred loading ") + evt.GetURL() +
     // "\n" + "'" + category + "'", wxICON_ERROR);
-    BOOST_LOG_TRIVIAL(trace) << "GuideFrame::OnError: An error occurred loading " << evt.GetURL() << category;
+    BOOST_LOG_TRIVIAL(trace) << "An error occurred loading " << evt.GetURL() << category;
 
     UpdateState();
 }
@@ -746,7 +873,7 @@ int GuideFrame::SaveProfile()
 
     /*std::string strAll = m_ProfileJson.dump(-1, ' ', false, json::error_handler_t::ignore);
 
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "before save to app_config: "<< std::endl<<strAll;*/
+    BOOST_LOG_TRIVIAL(info) << "before save to app_config: "<< std::endl<<strAll;*/
 
     //set filaments to app_config
     const std::string &section_name = AppConfig::SECTION_FILAMENTS;
@@ -776,13 +903,13 @@ int GuideFrame::SaveProfile()
                 if (pos != std::string::npos) {
                     nozzle   = selected.substr(0, pos);
                     m_appconfig_new.set_variant(vendor_name, model_name, nozzle, "true");
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format("vendor_name %1%, model_name %2%, nozzle %3% selected")%vendor_name %model_name %nozzle;
+                    BOOST_LOG_TRIVIAL(info) << boost::format("vendor_name %1%, model_name %2%, nozzle %3% selected")%vendor_name %model_name %nozzle;
                     selected = selected.substr(pos + 1);
                     boost::trim(selected);
                 }
                 else {
                     m_appconfig_new.set_variant(vendor_name, model_name, selected, "true");
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format("vendor_name %1%, model_name %2%, nozzle %3% selected")%vendor_name %model_name %selected;
+                    BOOST_LOG_TRIVIAL(info) << boost::format("vendor_name %1%, model_name %2%, nozzle %3% selected")%vendor_name %model_name %selected;
                     break;
                 }
             }
@@ -974,6 +1101,8 @@ bool GuideFrame::apply_config(AppConfig *app_config, PresetBundle *preset_bundle
             { preferred_model, preferred_variant, first_added_filament, std::string() });
         if (!errors_cummulative.empty())
             show_error(nullptr, errors_cummulative);
+        // AppConfig-restored filament colors may predate the JSON primary-color alignment.
+        Slic3r::align_project_filament_primary_colors_with_json(preset_bundle);
     }
 
     // Update the selections from the compatibilty.
@@ -1033,6 +1162,8 @@ bool GuideFrame::run(bool& config_applied)
                 PresetBundle::BBL_DEFAULT_PRINTER_MODEL, PresetBundle::BBL_DEFAULT_PRINTER_VARIANT, "true");
             app.app_config->clear_section(AppConfig::SECTION_FILAMENTS);
             app.preset_bundle->load_selections(*app.app_config, {PresetBundle::BBL_DEFAULT_PRINTER_MODEL, PresetBundle::BBL_DEFAULT_PRINTER_VARIANT, PresetBundle::BBL_DEFAULT_FILAMENT, std::string()});
+            // AppConfig-restored filament colors may predate the JSON primary-color alignment.
+            Slic3r::align_project_filament_primary_colors_with_json(app.preset_bundle);
 
             app.app_config->set_legacy_datadir(false);
             app.update_mode();
@@ -1051,7 +1182,7 @@ bool GuideFrame::run(bool& config_applied)
         return false;
 }
 
-int GuideFrame::GetFilamentInfo( std::string VendorDirectory, json & pFilaList, std::string filepath, std::string &sVendor, std::string &sType)
+int GuideFrame::GetFilamentInfo( std::string VendorDirectory, json & pFilaList, std::string filepath, std::string &sVendor, std::string &sType, std::string &sIsSupport)
 {
     std::string VendorDir_safe = PathSanitizer::sanitize(VendorDirectory);
     std::string filepath_safe = PathSanitizer::sanitize(filepath);
@@ -1066,7 +1197,7 @@ int GuideFrame::GetFilamentInfo( std::string VendorDirectory, json & pFilaList, 
             if (jLocal.contains("filament_vendor"))
                 sVendor = jLocal["filament_vendor"][0];
             else {
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << filepath_safe << " - Not Contains filament_vendor";
+                BOOST_LOG_TRIVIAL(info) << filepath_safe << " - Not Contains filament_vendor";
             }
         }
 
@@ -1074,8 +1205,19 @@ int GuideFrame::GetFilamentInfo( std::string VendorDirectory, json & pFilaList, 
             if (jLocal.contains("filament_type"))
                 sType = jLocal["filament_type"][0];
             else {
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << filepath_safe << " - Not Contains filament_type";
+                BOOST_LOG_TRIVIAL(info) << filepath_safe << " - Not Contains filament_type";
             }
+        }
+
+        // filament_is_support is usually only declared on the "@base" profile a
+        // concrete per-printer preset inherits from (see "Bambu Support for ABS
+        // @base.json"), never on the leaf file itself, so this is captured
+        // opportunistically at whichever level in the inherits chain happens to
+        // carry it; it does not gate the recursion below (sVendor/sType still
+        // drive that), so it has no effect on existing resolution behavior.
+        if (sIsSupport == "") {
+            if (jLocal.contains("filament_is_support"))
+                sIsSupport = jLocal["filament_is_support"][0];
         }
 
         if (sVendor == "" || sType == "")
@@ -1084,45 +1226,48 @@ int GuideFrame::GetFilamentInfo( std::string VendorDirectory, json & pFilaList, 
                 std::string FName = jLocal["inherits"];
 
                 if (!pFilaList.contains(FName)) {
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "pFilaList - Not Contains inherits filaments: " << FName;
+                    BOOST_LOG_TRIVIAL(info) << "pFilaList - Not Contains inherits filaments: " << FName;
                     return -1;
                 }
 
                 std::string FPath = pFilaList[FName]["sub_path"];
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " Before Format Inherits Path: VendorDirectory - " << VendorDir_safe << ", sub_path - " << FPath;
+                BOOST_LOG_TRIVIAL(info) << "Before Format Inherits Path: VendorDirectory - " << VendorDir_safe << ", sub_path - " << FPath;
                 std::string             strNewFile = VendorDirectory + "/" + FPath;
                 boost::filesystem::path inherits_path(strNewFile);
 
                 //boost::filesystem::path nf(strNewFile.c_str());
                 if (boost::filesystem::exists(inherits_path))
-                    return GetFilamentInfo(VendorDirectory,pFilaList, inherits_path.string(), sVendor, sType);
+                    return GetFilamentInfo(VendorDirectory,pFilaList, inherits_path.string(), sVendor, sType, sIsSupport);
                 else {
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " inherits File Not Exist: " << PathSanitizer::sanitize(inherits_path);
+                    BOOST_LOG_TRIVIAL(info) << "inherits File Not Exist: " << PathSanitizer::sanitize(inherits_path);
                     return -1;
                 }
             } else {
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << filepath_safe << " - Not Contains inherits";
+                BOOST_LOG_TRIVIAL(info) << filepath_safe << " - Not Contains inherits";
                 if (sType == "") {
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "sType is Empty";
+                    BOOST_LOG_TRIVIAL(info) << "sType is Empty";
                     return -1;
                 }
                 else
                     sVendor = "Generic";
+                    if (sIsSupport == "") sIsSupport = "0";
                     return 0;
             }
         }
-        else
+        else {
+            if (sIsSupport == "") sIsSupport = "0";
             return 0;
+        }
     }
     catch(nlohmann::detail::parse_error &err) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": parse " << filepath_safe << " got a nlohmann::detail::parse_error, reason = " << err.what();
+        BOOST_LOG_TRIVIAL(error) << "parse " << filepath_safe << " got a nlohmann::detail::parse_error, reason = " << err.what();
         return -1;
     }
     catch (std::exception &e)
     {
         // wxLogMessage("GUIDE: load_profile_error  %s ", e.what());
         // wxMessageBox(e.what(), "", MB_OK);
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": parse " << filepath_safe << " got exception: " << e.what();
+        BOOST_LOG_TRIVIAL(error) << "parse " << filepath_safe << " got exception: " << e.what();
         return -1;
     }
 
@@ -1163,7 +1308,7 @@ int GuideFrame::LoadProfileData()
                 || !boost::filesystem::exists(vendor_bbl_json))
             {
                 bbl_bundle_rsrc = true;
-                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__<< boost::format(", can not find subdirectory in data bbl, will use resource dir");
+                BOOST_LOG_TRIVIAL(warning) << boost::format("can not find subdirectory in data bbl, will use resource dir");
             }
             else {
                 auto is_file = [](const boost::filesystem::directory_entry& entry) {
@@ -1176,7 +1321,7 @@ int GuideFrame::LoadProfileData()
                 int file_count = std::count_if(begin, end, is_file);
                 if (file_count < 10) {
                     bbl_bundle_rsrc = true;
-                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__<< boost::format(", can not find enough files under printer directory of data, will use resource dir");
+                    BOOST_LOG_TRIVIAL(warning) << boost::format("can not find enough files under printer directory of data, will use resource dir");
                 }
             }
         }
@@ -1231,7 +1376,7 @@ int GuideFrame::LoadProfileData()
     } catch (std::exception& e) {
         // wxLogMessage("GUIDE: load_profile_error  %s ", e.what());
         //  wxMessageBox(e.what(), "", MB_OK);
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ", error: " << e.what() << std::endl;
+        BOOST_LOG_TRIVIAL(error) << "error: " << e.what() << std::endl;
     }
 
     return 0;
@@ -1308,7 +1453,7 @@ int GuideFrame::SaveProfileData()
     catch (std::exception &e) {
         //wxLogMessage("GUIDE: load_profile_error  %s ", e.what());
         // wxMessageBox(e.what(), "", MB_OK);
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ", error: "<< e.what() <<std::endl;
+        BOOST_LOG_TRIVIAL(error) << "error: "<< e.what() <<std::endl;
     }
 
     return 0;
@@ -1331,7 +1476,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
     // wxString strFolder = strFilePath.BeforeLast(boost::filesystem::path::preferred_separator);
     boost::filesystem::path file_path(strFilePath);
     boost::filesystem::path vendor_dir = boost::filesystem::absolute(file_path.parent_path() / strVendor).make_preferred();
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  vendor path %1%.") % PathSanitizer::sanitize(vendor_dir);
+    BOOST_LOG_TRIVIAL(info) << boost::format("vendor path %1%.") % PathSanitizer::sanitize(vendor_dir);
     try {
         // wxLogMessage("GUIDE: json_path1  %s", w2s(strFilePath));
 
@@ -1343,7 +1488,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
         json pmodels = jLocal["machine_model_list"];
         int  nsize   = pmodels.size();
 
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  got %1% machine models") % nsize;
+        BOOST_LOG_TRIVIAL(info) << boost::format("got %1% machine models") % nsize;
 
         for (int n = 0; n < nsize; n++) {
             if(m_destroy) return 0;
@@ -1384,7 +1529,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
         // BBS:Machine
         json pmachine = jLocal["machine_list"];
         nsize         = pmachine.size();
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  got %1% machines") % nsize;
+        BOOST_LOG_TRIVIAL(info) << boost::format("got %1% machines") % nsize;
 #if PARALLEL_READ
         std::mutex mutex;
         tbb::parallel_for(tbb::blocked_range<int>(0, nsize), [this, &pmachine, &vendor_dir, &mutex](const tbb::blocked_range<int> &range) {
@@ -1450,10 +1595,10 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
             std::string s2    = OneFF["sub_path"];
 
             tFilaList[s1] = OneFF;
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Vendor: " << strVendor << ", tFilaList Add: " << s1;
+            BOOST_LOG_TRIVIAL(info) << "Vendor: " << strVendor << ", tFilaList Add: " << s1;
         }
 
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  got %1% filaments") % nsize;
+        BOOST_LOG_TRIVIAL(info) << boost::format("got %1% filaments") % nsize;
 
 #if PARALLEL_READ
         tbb::parallel_for(tbb::blocked_range<int>(0, nsize), [this, &tFilaList, &pFilament, &vendor_dir, &mutex](const tbb::blocked_range<int> &range) {
@@ -1475,20 +1620,22 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
                     ifs >> pm;
 
                     std::string strInstant = pm["instantiation"];
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Load Filament:" << s1 << ",Path:" << PathSanitizer::sanitize(sub_file) << ",instantiation：" << strInstant;
+                    BOOST_LOG_TRIVIAL(info) << "Load Filament:" << s1 << ",Path:" << PathSanitizer::sanitize(sub_file) << ",instantiation：" << strInstant;
 
                     if (strInstant == "true") {
                         std::string sV;
                         std::string sT;
+                        std::string sIsSupport;
 
-                        int nRet = GetFilamentInfo(vendor_dir.string(), tFilaList, sub_file, sV, sT);
+                        int nRet = GetFilamentInfo(vendor_dir.string(), tFilaList, sub_file, sV, sT, sIsSupport);
                         if (nRet != 0) {
-                            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Load Filament:" << s1 << ",GetFilamentInfo Failed, Vendor:" << sV << ",Type:" << sT;
+                            BOOST_LOG_TRIVIAL(info) << "Load Filament:" << s1 << ",GetFilamentInfo Failed, Vendor:" << sV << ",Type:" << sT;
                             continue;
                         }
 
-                        OneFF["vendor"] = sV;
-                        OneFF["type"]   = sT;
+                        OneFF["vendor"]     = sV;
+                        OneFF["type"]       = sT;
+                        OneFF["is_support"] = sIsSupport;
 
                         OneFF["models"] = "";
 
@@ -1534,20 +1681,22 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
                 ifs >> pm;
 
                 std::string strInstant = pm["instantiation"];
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Load Filament:" << s1 << ",Path:" << PathSanitizer::sanitize(sub_file) << ",instantiation：" << strInstant;
+                BOOST_LOG_TRIVIAL(info) << "Load Filament:" << s1 << ",Path:" << PathSanitizer::sanitize(sub_file) << ",instantiation：" << strInstant;
 
                 if (strInstant == "true") {
                     std::string sV;
                     std::string sT;
+                    std::string sIsSupport;
 
-                    int nRet = GetFilamentInfo(vendor_dir.string(),tFilaList, sub_file, sV, sT);
+                    int nRet = GetFilamentInfo(vendor_dir.string(),tFilaList, sub_file, sV, sT, sIsSupport);
                     if (nRet != 0) {
-                        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Load Filament:" << s1 << ",GetFilamentInfo Failed, Vendor:" << sV << ",Type:"<< sT;
+                        BOOST_LOG_TRIVIAL(info) << "Load Filament:" << s1 << ",GetFilamentInfo Failed, Vendor:" << sV << ",Type:"<< sT;
                         continue;
                     }
 
-                    OneFF["vendor"] = sV;
-                    OneFF["type"]   = sT;
+                    OneFF["vendor"]     = sV;
+                    OneFF["type"]       = sT;
+                    OneFF["is_support"] = sIsSupport;
 
                     OneFF["models"]   = "";
 
@@ -1581,7 +1730,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
         // process
         json pProcess = jLocal["process_list"];
         nsize         = pProcess.size();
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  got %1% processes") % nsize;
+        BOOST_LOG_TRIVIAL(info) << boost::format("got %1% processes") % nsize;
 #if PARALLEL_READ
         tbb::parallel_for(tbb::blocked_range<int>(0, nsize), [this, &pProcess, &vendor_dir, &mutex](const tbb::blocked_range<int> &range) {
             for (auto i = range.begin(); i != range.end(); ++i) {
@@ -1624,12 +1773,12 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
         }
 #endif
     } catch (nlohmann::detail::parse_error &err) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": parse " << PathSanitizer::sanitize(strFilePath) << " got a nlohmann::detail::parse_error, reason = " << err.what();
+        BOOST_LOG_TRIVIAL(error) << "parse " << PathSanitizer::sanitize(strFilePath) << " got a nlohmann::detail::parse_error, reason = " << err.what();
         return -1;
     } catch (std::exception &e) {
         // wxMessageBox(e.what(), "", MB_OK);
         // wxLogMessage("GUIDE: LoadFamily Error: %s", e.what());
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": parse " << PathSanitizer::sanitize(strFilePath) << " got exception: " << e.what();
+        BOOST_LOG_TRIVIAL(error) << "parse " << PathSanitizer::sanitize(strFilePath) << " got exception: " << e.what();
         return -1;
     }
 

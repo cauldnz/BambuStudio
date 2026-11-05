@@ -9,6 +9,7 @@
 #include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem.hpp>
+#include "libslic3r/Log.hpp"
 
 namespace fs = boost::filesystem;
 
@@ -48,11 +49,17 @@ struct FilamentInfo
     float       used_g{0.f};
     int         tray_id{0}; // start with 0
     float       distance{0.f};
+    int         remain{-1};    // filament remain on the mapped tray: 0~100, -1 = unknown / not reported by the printer
     int         ctype = 0;
     std::vector<std::string> colors = std::vector<std::string>();
     int         mapping_result = 0;
     bool        used_for_support{false};
     bool        used_for_object{false};
+    // True when this project filament slot is used directly; false when it only
+    // appears in slice statistics as a component of a mixed (virtual) filament.
+    bool        directly_used{true};
+    double      total_load_time{0.0};
+    double      total_unload_time{0.0};
 
     /*for multi nozzle*/
     std::vector<int> group_id;
@@ -72,7 +79,9 @@ public:
         {
             return stoi(ams_id);
         }
-        catch (...) {};
+        catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        };
 
         return -1;
     };
@@ -83,7 +92,9 @@ public:
 
         try {
             return stoi(slot_id);
-        } catch (...) {};
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        };
 
         return -1;
     };
@@ -164,6 +175,11 @@ public:
     std::string                 model_id;
     std::string                 model_name;
     std::string                 profile_name;
+
+    std::string                 design_title;
+    std::string                 title;
+    std::string                 instance_title;
+    std::string                 create_client;
 };
 
 class BBLSubTask {

@@ -24,10 +24,12 @@ class MenuWithSeparators;
 namespace Slic3r {
 class ConfigOptionsGroup;
 class DynamicPrintConfig;
+class Model;
 class ModelConfig;
 class ModelObject;
 class ModelVolume;
 class TriangleMesh;
+class GLVolume;
 struct TextInfo;
 enum class ModelVolumeType : int;
 
@@ -47,6 +49,8 @@ struct ObjectVolumeID {
     ModelVolume* volume{ nullptr };
 };
 
+class Selection;
+
 typedef Event<ObjectVolumeID> ObjectSettingEvent;
 
 class PartPlate;
@@ -54,6 +58,14 @@ class PartPlate;
 wxDECLARE_EVENT(EVT_OBJ_LIST_OBJECT_SELECT, SimpleEvent);
 wxDECLARE_EVENT(EVT_PARTPLATE_LIST_PLATE_SELECT, IntEvent);
 class BitmapComboBox;
+
+// Per-object / per-volume config keys (besides "extruder") that store a 1-based filament index.
+// Single source of truth shared by the delete remap (update_filament_values_for_items_when_delete_filament)
+// and the delete warning (models_using_filament), so detection and remap never drift apart.
+const std::vector<std::string>& filament_index_object_keys();
+
+// True when any part, color painting, height range or feature filament override of the object prints with a mixed filament.
+bool model_object_uses_mixed_filament(const ModelObject &object);
 
 struct ItemForDelete
 {
@@ -86,11 +98,12 @@ struct MeshErrorsInfo
 
 struct MeshIssueCounts
 {
-    int non_manifold_edges    = 0;
-    int non_manifold_vertices = 0;
-    int open_edges            = 0;
+    int  non_manifold_edges    = 0;
+    int  non_manifold_vertices = 0;
+    int  open_edges            = 0;
+    bool has_reversed_faces    = false;
 
-    bool has_error() const { return non_manifold_edges > 0 || non_manifold_vertices > 0; }
+    bool has_error() const { return non_manifold_edges > 0 || non_manifold_vertices > 0 || has_reversed_faces; }
     bool has_info() const { return open_edges > 0; }
     bool has_any_issue() const { return has_error() || has_info(); }
 };
@@ -254,8 +267,15 @@ public:
     // Refresh a list item's displayed name from the model, without relying on the
     // current selection (vol_idx < 0 targets the object row).
     void                sync_name_from_model(int obj_idx, int vol_idx);
+    // Refresh filament-column numbers/icons from ModelObject/ModelVolume config
+    // (no config rewrite). Used after assembly-view filament edits are written back.
+    void                sync_filament_from_model();
     void                update_filament_values_for_items(const size_t filaments_count);
     void                update_filament_values_for_items_when_delete_filament(const size_t filament_id, const int replace_id = -1);
+    // Point objects, parts and height ranges that print with from_id at to_id (0-based). Support filaments are kept.
+    void                update_filament_values_for_items_when_replace_filament(const size_t from_id, const size_t to_id);
+    // Show each height range row's current "extruder" value from its layer config.
+    void                update_layer_range_filament_values();
 
     //BBS: update plate
     void                update_plate_values_for_items();
@@ -317,9 +337,18 @@ public:
     void                del_layers_from_object(const int obj_idx);
     bool                del_from_cut_object(bool is_connector, bool is_model_part = false, bool is_negative_volume = false);
     bool                del_subobject_from_object(const int obj_idx, const int idx, const int type);
+    bool                del_object_if_no_solid_part(const int obj_idx);
     void                del_info_item(const int obj_idx, InfoItemType type);
-    void                split();
+    void                split(bool ignore_warning = false);
+    // Split every selected whole object into objects, reusing the single-object "To objects" path.
+    void                split_objects();
+    // Enabled when at least two objects are selected and at least one of them is splittable to objects.
+    bool                can_split_objects();
+    // Distinct whole-object indices in the current selection (volume / instance sub-items ignored).
+    std::vector<int>    selected_object_idxs() const;
     void                merge(bool to_multipart_object);
+    // Merge the given whole objects (indices into the plater model) into one multipart object.
+    void                merge_objects(const std::vector<size_t>& obj_idxs);
     void                merge_volumes(); // BBS: merge parts to single part
     void                layers_editing();
 
@@ -363,6 +392,8 @@ public:
     void delete_instance_from_list(const size_t obj_idx, const size_t inst_idx);
     void delete_from_model_and_list(const ItemType type, const int obj_idx, const int sub_obj_idx);
     void delete_from_model_and_list(const std::vector<ItemForDelete>& items_for_delete);
+    // Rebuild the UI -> 3D volume index map of the object from its current ModelObject::volumes
+    void update_ui_and_3d_volume_map(const int obj_idx);
     void update_lock_icons_for_model();
     // Delete all objects from the list
     void delete_all_objects_from_list();
@@ -487,6 +518,11 @@ public:
     void selected_object(ObjectDataViewModelNode* item);
 
 private:
+    // Map assembly-canvas (object_idx, volume_idx) to the prepare model via part_guid /
+    // assembly_src_guid. On success overwrites obj_idx / vol_idx and returns true.
+    bool resolve_prepare_object_volume_idx(int& obj_idx, int& vol_idx, const GLVolume* assembly_gl_volume,
+                                           const Model& assemble_model, Selection& prepare_selection) const;
+
 #ifdef __WXOSX__
 //    void OnChar(wxKeyEvent& event);
     wxAcceleratorTable m_accel;

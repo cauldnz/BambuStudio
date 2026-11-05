@@ -6,12 +6,14 @@
 
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/DeviceManager.hpp"
+#include "../DeviceCore/DevManager.h"
 
 #include <wx/app.h>
-#include <boost/log/trivial.hpp>
 #include <chrono>
 #include <cmath>
 #include <set>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -71,7 +73,7 @@ std::string filament_type_by_setting_id(const std::string& setting_id)
 
 std::string tray_id_name_by_filament_color(const FilamentSpool& s)
 {
-    if (s.setting_id.size() <= 2)
+    if (s.filament_id.size() <= 2)
         return {};
 
     auto* clr_query = wxGetApp().get_filament_color_code_query();
@@ -92,12 +94,12 @@ std::string tray_id_name_by_filament_color(const FilamentSpool& s)
 
     const int color_type = to_fila_manager_color_type_int(
         normalize_fila_manager_color_type(s.color_type, hex_colors.size()));
-    auto* color_info = clr_query->GetFilaInfo(wxString::FromUTF8(s.setting_id), hex_colors, color_type);
+    auto* color_info = clr_query->GetFilaInfo(wxString::FromUTF8(s.filament_id), hex_colors, color_type);
     if (!color_info)
         return {};
 
     const std::string color_code = color_info->GetColorCode().utf8_string();
-    return color_code.empty() ? std::string{} : s.setting_id.substr(2) + "-" + color_code;
+    return color_code.empty() ? std::string{} : s.filament_id.substr(2) + "-" + color_code;
 }
 
 } // namespace
@@ -165,7 +167,7 @@ FilamentSpool wgtFilaManagerCloudSync::cloud_json_to_spool(const nlohmann::json&
 
     // Identity / preset linkage (cloud FilamentV2 uses int64 id + camelCase).
     s.spool_id      = str_any({"id", "spool_id"});
-    s.setting_id    = str_any({"filamentId", "setting_id"});
+    s.filament_id   = str_any({"filamentId", "setting_id"});
     s.tag_uid       = str_any({"RFID", "rfid", "tag_uid"});
     s.tray_id_name  = str_any({"trayIdName", "tray_id_name"});
     if (!FilamentSpool::is_valid_tag_uid(s.tag_uid))
@@ -258,6 +260,18 @@ FilamentSpool wgtFilaManagerCloudSync::cloud_json_to_spool(const nlohmann::json&
 
     s.favorite        = j.contains("favorite") && j["favorite"].is_boolean() && j["favorite"].get<bool>();
 
+    // 在位挂载状态（云端 camelCase → 本地 snake_case）。
+    // 机器在线时这些字段由 MQTT apply_mount_diff 维护，优先级高于云端值；
+    // 未连接机器时以云端历史数据兜底（pull_from_cloud 落地时处理优先级）。
+    s.in_printer  = j.contains("inPrinter") && j["inPrinter"].is_boolean()
+                        && j["inPrinter"].get<bool>();
+    s.dev_id      = str_any({"devId",      "dev_id"});
+    s.ams_sn      = str_any({"amsSn",      "ams_sn"});
+    s.ams_id      = num_i_any({"amsId",    "ams_id"},   -1);
+    s.ams_type    = num_i_any({"amsType",  "ams_type"}, -1);
+    s.slot_id     = str_any({"slotId",     "slot_id"});
+    s.device_name = str_any({"deviceName", "device_name"});
+
     return s;
 }
 
@@ -279,8 +293,8 @@ nlohmann::json wgtFilaManagerCloudSync::spool_to_cloud_json(const FilamentSpool&
     // models only a single-colour spool and may leave `series` empty, so fall
     // back to the material type for the display name and encode monochrome as 2.
     j["filamentName"]   = s.series.empty() ? s.material_type : s.series;
-    j["filamentId"]     = s.setting_id;
-    j["isSupport"]      = filament_is_support_by_setting_id(s.setting_id);
+    j["filamentId"]     = s.filament_id;
+    j["isSupport"]      = filament_is_support_by_setting_id(s.filament_id);
     if (has_valid_rfid)
         j["RFID"]       = s.tag_uid;
     j["color"]          = s.color_code;
@@ -318,6 +332,15 @@ nlohmann::json wgtFilaManagerCloudSync::spool_to_cloud_json(const FilamentSpool&
 
     if (!s.note.empty())
         j["note"] = s.note;
+
+    // 在位字段：新建时若 spool 已挂载（如从 AMS 读取），一并写入 CREATE body。
+    j["inPrinter"] = s.in_printer;
+    if (!s.dev_id.empty())      j["devId"]      = s.dev_id;
+    if (!s.ams_sn.empty())      j["amsSn"]      = s.ams_sn;
+    if (s.ams_id   != -1)       j["amsId"]      = s.ams_id;
+    if (s.ams_type != -1)       j["amsType"]    = s.ams_type;
+    if (!s.slot_id.empty())     j["slotId"]     = s.slot_id;
+    if (!s.device_name.empty()) j["deviceName"] = s.device_name;
 
     return j;
 }
@@ -360,16 +383,44 @@ void wgtFilaManagerCloudSync::pull_from_cloud()
                     std::set<std::string> cloud_ids;
                     int dropped_local_only = 0;
 
-                    for (const auto& item : list) {
-                        FilamentSpool spool = cloud_json_to_spool(item);
-                        if (spool.spool_id.empty()) continue;
-                        spool.cloud_synced = true;
-                        cloud_ids.insert(spool.spool_id);
+                    // 判断某台机器当前是否在线（有实时 MQTT 数据）。
+                    // 用 get_my_machine 而非 get_user_machine，避免跨账号误判。
+                    auto machine_is_online = [](const std::string& dev_id) -> bool {
+                        if (dev_id.empty()) return false;
+                        auto* mgr = wxGetApp().getDeviceManager();
+                        if (!mgr) return false;
+                        MachineObject* obj = mgr->get_my_machine(dev_id);
+                        return obj && obj->is_online();
+                    };
 
-                        if (m_store->get_spool(spool.spool_id))
-                            m_store->update_spool(spool);
-                        else
-                            m_store->add_spool(spool);
+                    for (const auto& item : list) {
+                        FilamentSpool cloud_spool = cloud_json_to_spool(item);
+                        if (cloud_spool.spool_id.empty()) continue;
+                        cloud_spool.cloud_synced = true;
+                        cloud_ids.insert(cloud_spool.spool_id);
+
+                        if (const FilamentSpool* existing = m_store->get_spool(cloud_spool.spool_id)) {
+                            // 判断本地是否有来自该机器的实时 MQTT 数据。
+                            // 条件：existing->dev_id 对应的机器当前在线。
+                            // 不单独判断 in_printer==true，因为断连后该值仍可能为 true。
+                            const bool local_is_live = machine_is_online(existing->dev_id);
+                            if (local_is_live) {
+                                // 机器在线时以本地为准，保留本地在位字段，不用云端值覆盖。
+                                // 不在 pull 里反向 push 修正——下次 MQTT 到来时
+                                // notify_ams_synced 会把最新在位字段推上云端。
+                                cloud_spool.in_printer  = existing->in_printer;
+                                cloud_spool.dev_id      = existing->dev_id;
+                                cloud_spool.ams_sn      = existing->ams_sn;
+                                cloud_spool.ams_id      = existing->ams_id;
+                                cloud_spool.ams_type    = existing->ams_type;
+                                cloud_spool.slot_id     = existing->slot_id;
+                                cloud_spool.device_name = existing->device_name;
+                            }
+                            // local_is_live==false：云端在位字段直接作为历史数据落地
+                            m_store->update_spool(cloud_spool);
+                        } else {
+                            m_store->add_spool(cloud_spool);
+                        }
                     }
 
                     for (const auto& existing : m_store->spools_to_json()) {
@@ -381,7 +432,6 @@ void wgtFilaManagerCloudSync::pull_from_cloud()
                         }
                     }
 
-                    m_store->save();
                     m_last_pull_succeeded = true;
                     BOOST_LOG_TRIVIAL(info) << "[FilaCloudSync] pull_from_cloud completed, "
                                             << list.size() << " items kept, "
@@ -539,6 +589,24 @@ nlohmann::json wgtFilaManagerCloudSync::spool_to_cloud_update_patch(const nlohma
     take_int("total_net_weight","totalNetWeight");
     take_str("note",            "note");
 
+    // 在位挂载状态字段（随 AMS sync / pull 冲突修正一起上行）。
+    // ams_id / ams_type 的哨兵值为 -1（未挂载），需透传负数，用 get<int64_t> 而非
+    // get<double>+0.5 避免符号丢失。
+    take_bool("in_printer",  "inPrinter");
+    take_str ("dev_id",      "devId");
+    take_str ("ams_sn",      "amsSn");
+    take_str ("slot_id",     "slotId");
+    take_str ("device_name", "deviceName");
+    // ams_id / ams_type 单独处理以保留 -1 哨兵值
+    auto take_int_signed = [&](const char* local_key, const char* cloud_key) {
+        if (!p.contains(local_key)) return;
+        const auto& v = p.at(local_key);
+        if (v.is_null()) return;
+        if (v.is_number()) j[cloud_key] = v.get<int64_t>();
+    };
+    take_int_signed("ams_id",   "amsId");
+    take_int_signed("ams_type", "amsType");
+
     // swagger 白名单之外的常见本地字段（series / color_name / initial_weight /
     // spool_weight / diameter / status / remain_percent / favorite ...）不映射，
     // 它们只存在于本地 store，不上报给云端 Update 接口。
@@ -578,9 +646,9 @@ nlohmann::json wgtFilaManagerCloudSync::spool_to_cloud_update_json(const Filamen
         FilamentSpool updated = s;
         std::string setting_id = patch_str("setting_id");
         if (setting_id.empty()) setting_id = patch_str("filamentId");
-        if (!setting_id.empty()) updated.setting_id = setting_id;
-        if (!updated.setting_id.empty()) {
-            std::string filament_type = filament_type_by_setting_id(updated.setting_id);
+        if (!setting_id.empty()) updated.filament_id = setting_id;
+        if (!updated.filament_id.empty()) {
+            std::string filament_type = filament_type_by_setting_id(updated.filament_id);
             if (filament_type.empty()) filament_type = updated.material_type;
             if (!filament_type.empty()) j["filamentType"] = filament_type;
         }
@@ -731,6 +799,7 @@ void wgtFilaManagerCloudSync::notify_ams_synced(
 
     const auto    now = std::chrono::steady_clock::now();
     AutoPushTally tally;
+    BBL::AmsSyncParams pending_params;
 
     for (const auto& item : changed) {
         if (!FilamentSpool::is_valid_tag_uid(item.tag_uid)) {
@@ -742,13 +811,30 @@ void wgtFilaManagerCloudSync::notify_ams_synced(
 
         switch (decision) {
         case AmsAutoPushThrottle::Decision::Push: {
-            // PUT body 只放 net_weight，其余字段留给 spool_to_cloud_update_json
-            // 兜底（filamentName 防 STUDIO-18117 重现）。其余 sync 关心字段
-            // (status / bound_*) 云端 PUT 不接受 → 不放进 patch。
-            nlohmann::json patch = {
-                {"net_weight", static_cast<double>(item.net_weight)}
-            };
-            disp->enqueue_push_update(item.spool_id, patch);
+            const FilamentSpool* sp = m_store->get_spool(item.spool_id);
+            if (!sp) { ++tally.skipped_no_rfid; break; }
+
+            BBL::AmsSyncItem si;
+            si.RFID           = sp->tag_uid;
+            si.filamentVendor = sp->brand;
+            si.filamentType   = sp->material_type;
+            si.filamentName   = sp->series;
+            si.filamentId     = sp->filament_id;
+            si.trayIdName     = sp->tray_id_name;
+            si.color          = sp->color_code;
+            si.colorType      = sp->color_type >= 0 ? sp->color_type : 0;
+            si.colors         = sp->colors;
+            si.netWeight      = static_cast<int>(std::round(item.net_weight));
+            si.totalNetWeight = static_cast<int>(sp->effective_total_net_weight());
+            si.note           = sp->note;
+            if (sp->in_printer) {
+                si.amsSn   = sp->ams_sn;
+                si.slotId  = sp->slot_id;
+                si.amsId   = sp->ams_id   >= 0 ? sp->ams_id   : 0;
+                si.amsType = sp->ams_type >= 0 ? sp->ams_type : 0;
+            }
+            pending_params.items.push_back(std::move(si));
+            if (pending_params.devId.empty()) pending_params.devId = sp->dev_id;
             // 乐观 record：先记 cooldown 起点。设计权衡：失败时下次 sync 仍
             // 等 10 min cooldown 才重试，把"网络抽风时无意义请求"的攻击面
             // 关掉。用户着急可以用"推送本地到云端"按钮绕过 throttle。
@@ -764,6 +850,9 @@ void wgtFilaManagerCloudSync::notify_ams_synced(
             ++tally.skipped_no_rfid;  break;
         }
     }
+
+    if (!pending_params.items.empty())
+        disp->enqueue_sync_ams(std::move(pending_params));
 
     BOOST_LOG_TRIVIAL(info)
         << "[FilaCloudSync] auto_push device_state=" << device_state_label(device_state)
@@ -799,6 +888,8 @@ void wgtFilaManagerCloudSync::push_all_now()
     int        skipped_no_rfid       = 0;
     int        skipped_no_total_nw   = 0;
 
+    BBL::AmsSyncParams params;
+
     for (const auto& spool_id : m_store->all_spool_ids()) {
         const FilamentSpool* sp = m_store->get_spool(spool_id);
         if (!sp) continue;
@@ -812,16 +903,37 @@ void wgtFilaManagerCloudSync::push_all_now()
             continue;
         }
 
-        const int64_t nw = static_cast<int64_t>(std::round(sp->net_weight));
-        nlohmann::json patch = {
-            {"net_weight", static_cast<double>(nw)}
-        };
-        disp->enqueue_push_update(spool_id, patch);
+        BBL::AmsSyncItem si;
+        si.RFID           = sp->tag_uid;
+        si.filamentVendor = sp->brand;
+        si.filamentType   = sp->material_type;
+        si.filamentName   = sp->series;
+        si.filamentId     = sp->filament_id;
+        si.trayIdName     = sp->tray_id_name;
+        si.color          = sp->color_code;
+        si.colorType      = sp->color_type >= 0 ? sp->color_type : 0;
+        si.colors         = sp->colors;
+        si.netWeight      = static_cast<int>(std::round(sp->net_weight));
+        si.totalNetWeight = static_cast<int>(sp->effective_total_net_weight());
+        si.note           = sp->note;
+        if (sp->in_printer) {
+            si.amsSn   = sp->ams_sn;
+            si.slotId  = sp->slot_id;
+            si.amsId   = sp->ams_id   >= 0 ? sp->ams_id   : 0;
+            si.amsType = sp->ams_type >= 0 ? sp->ams_type : 0;
+        }
+        if (params.devId.empty()) params.devId = sp->dev_id;
+        params.items.push_back(std::move(si));
+
         // 绕过 throttle.evaluate，但仍 record_success：保持 cooldown 状态
         // 一致，避免手动按钮触发后下一次 AMS sync 又重复推一遍。
-        m_throttle.record_success(sp->tag_uid, nw, now);
+        m_throttle.record_success(sp->tag_uid,
+                                  static_cast<int64_t>(std::round(sp->net_weight)), now);
         ++enqueued;
     }
+
+    if (!params.items.empty())
+        disp->enqueue_sync_ams(std::move(params));
 
     BOOST_LOG_TRIVIAL(info)
         << "[FilaCloudSync] push_all_now enqueued=" << enqueued
@@ -860,6 +972,213 @@ void wgtFilaManagerCloudSync::fetch_filament_config(
         },
         [](int code, const std::string& err) {
             BOOST_LOG_TRIVIAL(error) << "[FilaCloudSync] fetch_filament_config failed: " << code << err_body_tail(err);
+        });
+}
+
+void wgtFilaManagerCloudSync::sync_ams_to_cloud(
+    const std::string& dev_id, const std::vector<std::string>& spool_ids)
+{
+    if (spool_ids.empty() || !m_client) {
+        BOOST_LOG_TRIVIAL(info)
+            << "[FilaCloudSync] sync_ams_to_cloud early-return: dev=" << dev_id
+            << " spool_ids_empty=" << spool_ids.empty()
+            << " client_null=" << (!m_client);
+        return;
+    }
+
+    BBL::AmsSyncParams params;
+    params.devId = dev_id;
+
+    for (const auto& sid : spool_ids) {
+        const FilamentSpool* s = m_store->get_spool(sid);
+        if (!s) {
+            BOOST_LOG_TRIVIAL(info)
+                << "[FilaCloudSync] sync_ams_to_cloud: skip sid=" << sid
+                << " reason=spool_not_found";
+            continue;
+        }
+
+        BBL::AmsSyncItem item;
+        item.RFID           = s->tag_uid;
+        item.filamentVendor = s->brand;
+        item.filamentType   = s->material_type;
+        item.filamentName   = s->series;
+        item.filamentId     = s->filament_id;
+        item.trayIdName     = s->tray_id_name;
+        item.color          = s->color_code;
+        item.colorType      = s->color_type >= 0 ? s->color_type : 0;
+        item.colors         = s->colors;
+        item.netWeight      = static_cast<int>(std::round(s->net_weight));
+        item.totalNetWeight = static_cast<int>(s->effective_total_net_weight());
+        item.note           = s->note;
+
+        if (s->in_printer) {
+            item.amsSn   = s->ams_sn;
+            item.slotId  = s->slot_id;
+            item.amsId   = s->ams_id   >= 0 ? s->ams_id   : 0;
+            item.amsType = s->ams_type >= 0 ? s->ams_type : 0;
+        } else {
+            BOOST_LOG_TRIVIAL(trace)
+                << "[FilaCloudSync] sync_ams_to_cloud: unplug event, sid=" << sid;
+            item.amsSn   = "";
+            item.slotId  = "";
+            item.amsId   = 0;
+            item.amsType = 0;
+        }
+
+        if (item.amsSn.empty()) {
+            BOOST_LOG_TRIVIAL(info)
+                << "[FilaCloudSync] sync_ams_to_cloud: skip sid=" << sid
+                << " reason=amsSn_empty";
+            continue;
+        }
+
+        item.createNew = false;
+        params.items.push_back(std::move(item));
+    }
+
+    if (params.items.empty()) return;
+
+    m_client->sync_ams(std::move(params),
+        [](const nlohmann::json&) {},
+        [dev_id](int code, const std::string& msg) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "[FilaCloudSync] sync_ams_to_cloud failed: dev=" << dev_id
+                << " code=" << code << " msg=" << msg;
+        });
+}
+
+void wgtFilaManagerCloudSync::sync_slot_mappings_to_cloud(
+    const std::string& dev_id,
+    const std::vector<EjectedSlotSnapshot>& ejected)
+{
+    if (ejected.empty() || !m_client) {
+        BOOST_LOG_TRIVIAL(info)
+            << "[FilaCloudSync] sync_slot_mappings_to_cloud early-return: dev=" << dev_id
+            << " ejected_empty=" << ejected.empty()
+            << " client_null=" << (!m_client);
+        return;
+    }
+
+    BBL::SlotMappingsSyncParams params;
+    params.devId = dev_id;
+
+    for (const auto& snap : ejected) {
+        BBL::SlotMappingItem item;
+        item.amsSn   = snap.ams_sn;
+        item.slotId  = snap.slot_id;
+        item.amsId   = snap.ams_id   >= 0 ? snap.ams_id   : 0;
+        item.amsType = snap.ams_type >= 0 ? snap.ams_type : 0;
+
+        if (item.amsSn.empty()) {
+            BOOST_LOG_TRIVIAL(info)
+                << "[FilaCloudSync] sync_slot_mappings_to_cloud: skip spool=" << snap.spool_id
+                << " reason=amsSn_empty";
+            continue;
+        }
+
+        params.mappings.push_back(std::move(item));
+
+        BOOST_LOG_TRIVIAL(info)
+            << "[FilaCloudSync] sync_slot_mappings_to_cloud: unplug spool="
+            << snap.spool_id << " amsSn=" << snap.ams_sn
+            << " slotId=" << snap.slot_id;
+    }
+
+    if (params.mappings.empty()) {
+        BOOST_LOG_TRIVIAL(info)
+            << "[FilaCloudSync] sync_slot_mappings_to_cloud: no valid mappings, skip send";
+        return;
+    }
+
+    m_client->sync_slot_mappings(std::move(params),
+        [](const nlohmann::json&) {},
+        [dev_id](int code, const std::string& msg) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "[FilaCloudSync] sync_slot_mappings_to_cloud failed: dev=" << dev_id
+                << " code=" << code << " msg=" << msg;
+        });
+}
+
+void wgtFilaManagerCloudSync::sync_slot_bindings_to_cloud(
+    const std::string&              dev_id,
+    const std::vector<std::string>& spool_ids,
+    bool                            is_bind)
+{
+    if (spool_ids.empty() || !m_client) return;
+
+    BBL::SlotMappingsSyncParams params;
+    params.devId = dev_id;
+
+    for (const auto& sid : spool_ids) {
+        const FilamentSpool* s = m_store->get_spool(sid);
+        if (!s) {
+            BOOST_LOG_TRIVIAL(info)
+                << "[FilaCloudSync] sync_slot_bindings_to_cloud: skip sid=" << sid
+                << " reason=spool_not_found";
+            continue;
+        }
+
+
+        BBL::SlotMappingItem item;
+        item.amsSn   = s->ams_sn;
+        item.slotId  = s->slot_id;
+        item.amsId   = s->ams_id   >= 0 ? s->ams_id   : 0;
+        item.amsType = s->ams_type >= 0 ? s->ams_type : 0;
+
+        if (item.amsSn.empty()) {
+            BOOST_LOG_TRIVIAL(info)
+                << "[FilaCloudSync] sync_slot_bindings_to_cloud: skip sid=" << sid
+                << " reason=amsSn_empty";
+            continue;
+        }
+
+        if (is_bind) {
+            // spoolId 只在云端已同步（cloud_synced）且 spool_id 能解析为 int64 时发送。
+            // 本地离线创建的 spool_id 是 UUID 字符串，stoll 会抛异常 → 整条跳过，
+            // 不发错误的 spoolId=0（那会被云端解读为解绑）。
+            if (!s->cloud_synced) {
+                BOOST_LOG_TRIVIAL(info)
+                    << "[FilaCloudSync] sync_slot_bindings_to_cloud: skip sid=" << sid
+                    << " reason=not_cloud_synced";
+                continue;
+            }
+            try {
+                item.spoolId = static_cast<int>(std::stoll(s->spool_id));
+            } catch (...) {
+                BOOST_LOG_TRIVIAL(info)
+                    << "[FilaCloudSync] sync_slot_bindings_to_cloud: skip sid=" << sid
+                    << " reason=spool_id_not_int64 spool_id=" << s->spool_id;
+                continue;
+            }
+            // rfid 只在 spool 有有效 tag_uid 时填（官方 RFID 录入后 tag_uid 非空非零）。
+            if (FilamentSpool::is_valid_tag_uid(s->tag_uid))
+                item.rfid = s->tag_uid;
+
+            BOOST_LOG_TRIVIAL(info)
+                << "[FilaCloudSync] sync_slot_bindings_to_cloud: bind spool_id=" << sid
+                << " spoolId=" << item.spoolId
+                << " amsSn=" << item.amsSn
+                << " slotId=" << item.slotId;
+        } else {
+            // is_bind=false：spoolId=0, rfid="" → 云端解读为解绑
+            BOOST_LOG_TRIVIAL(info)
+                << "[FilaCloudSync] sync_slot_bindings_to_cloud: unbind spool_id=" << sid
+                << " amsSn=" << item.amsSn
+                << " slotId=" << item.slotId;
+        }
+
+        params.mappings.push_back(std::move(item));
+    }
+
+    if (params.mappings.empty()) return;
+
+    m_client->sync_slot_mappings(std::move(params),
+        [](const nlohmann::json&) {},
+        [dev_id](int code, const std::string& msg) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "[FilaCloudSync] sync_slot_bindings_to_cloud failed: dev=" << dev_id
+                << " code=" << code << " msg=" << msg;
         });
 }
 

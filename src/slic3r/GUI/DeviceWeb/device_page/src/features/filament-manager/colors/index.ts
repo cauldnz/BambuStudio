@@ -13,12 +13,19 @@ export {
   canonicalizeHexList,
   hexEqual,
   hexMultisetKey,
+  isTransparentHex,
+  getAlphaByte,
+  hasPartialTransparency,
 } from './hex';
 
 export {
   cssBackgroundFor,
   hexLabelFor,
   colorNameWithHexLabel,
+  TRANSPARENT_CHECKERED_BG,
+  isTransparentRenderInput,
+  translucentBackground,
+  isPartiallyTransparentRenderInput,
 } from './render';
 export type { ColorRenderInput } from './render';
 

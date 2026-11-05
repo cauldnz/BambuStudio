@@ -1,15 +1,16 @@
 #include "AssemblyStepsJson.hpp"
 
+#include "libslic3r/Log.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Utils.hpp"
 
 #include <boost/filesystem.hpp>
 #include <boost/nowide/fstream.hpp>
-#include <boost/log/trivial.hpp>
 
 #include <cmath>
 #include <functional>
 #include <map>
+#include <set>
 
 namespace Slic3r {
 namespace {
@@ -46,6 +47,26 @@ static bool json_get_bool(const nlohmann::json &j, const char *key, bool &value)
         return false;
     value = j[key].get<bool>();
     return true;
+}
+
+// Read is_final_assembly as int.
+// Legacy bool true → FinalAssembly (1) so old Default/final-assembly data is kept.
+// OverallPreview (2) is runtime UI-only and must not appear in persisted JSON;
+// if an older mid-migration file still has 2, callers skip it on restore.
+static bool json_get_assembly_step_kind(const nlohmann::json &j, const char *key, int &value)
+{
+    if (!j.contains(key))
+        return false;
+    const auto &v = j[key];
+    if (v.is_boolean()) {
+        value = v.get<bool>() ? AssemblyStepKind::FinalAssembly : AssemblyStepKind::Normal;
+        return true;
+    }
+    if (v.is_number_integer()) {
+        value = v.get<int>();
+        return true;
+    }
+    return false;
 }
 
 static bool json_get_double(const nlohmann::json &j, const char *key, double &value)
@@ -145,34 +166,66 @@ static Transform3d transform3d_from_json(const nlohmann::json &j)
     }
     return t;
 }
+// ---- ArrowSvgRay ----
+void ArrowSvgRay::to_json(nlohmann::json &j) const
+{
+    bound_volumes_to_json(j, "bound_volumes", bound_volumes);
+    j["arrow_start_offset"] = {arrow_start_offset.x(), arrow_start_offset.y()};
+    j["arrow_end_offset"]   = {arrow_end_offset.x(), arrow_end_offset.y()};
+}
+
+void ArrowSvgRay::from_json(const nlohmann::json &j)
+{
+    bound_volumes_from_json(j, "bound_volumes", bound_volumes);
+    json_get_vec2d(j, "arrow_start_offset", arrow_start_offset);
+    json_get_vec2d(j, "arrow_end_offset", arrow_end_offset);
+}
+
 // ---- ArrowSvgNote ----
 void ArrowSvgNote::to_json(nlohmann::json &j) const
 {
-    j["svg_name"]           = svg_name;
-    nlohmann::json bv = nlohmann::json::array();
-    for (const auto &p : bound_volumes)
-        bv.push_back({p.first, p.second});
-    j["bound_volumes"]      = bv;
-    j["arrow_start_offset"] = {arrow_start_offset.x(), arrow_start_offset.y()};
-    j["arrow_end_offset"]   = {arrow_end_offset.x(), arrow_end_offset.y()};
-    j["label_size"]         = {label_size.x(), label_size.y()};
+    j["svg_name"] = svg_name;
+    j["label_size"] = {label_size.x(), label_size.y()};
     color_to_json(j, "color", color);
+
+    nlohmann::json rays_arr = nlohmann::json::array();
+    for (const auto &ray : rays) {
+        nlohmann::json rj;
+        ray.to_json(rj);
+        rays_arr.push_back(std::move(rj));
+    }
+    j["rays"] = std::move(rays_arr);
+
+    // Mirror the first ray into the legacy flat fields so older readers that
+    // only know bound_volumes / arrow_*_offset still get a usable single arrow.
+    if (!rays.empty()) {
+        bound_volumes_to_json(j, "bound_volumes", rays.front().bound_volumes);
+        j["arrow_start_offset"] = {rays.front().arrow_start_offset.x(), rays.front().arrow_start_offset.y()};
+        j["arrow_end_offset"]   = {rays.front().arrow_end_offset.x(), rays.front().arrow_end_offset.y()};
+    }
 }
 
 void ArrowSvgNote::from_json(const nlohmann::json &j)
 {
     json_get_string(j, "svg_name", svg_name);
-    bound_volumes.clear();
-    if (j.contains("bound_volumes") && j["bound_volumes"].is_array()) {
-        for (const auto &item : j["bound_volumes"]) {
-            if (item.is_array() && item.size() == 2 && item[0].is_number_integer() && item[1].is_number_integer())
-                bound_volumes.emplace_back(item[0].get<int>(), item[1].get<int>());
-        }
-    }
-    json_get_vec2d(j, "arrow_start_offset", arrow_start_offset);
-    json_get_vec2d(j, "arrow_end_offset", arrow_end_offset);
     json_get_vec2d(j, "label_size", label_size);
     color_from_json(j, "color", color);
+
+    rays.clear();
+    if (j.contains("rays") && j["rays"].is_array() && !j["rays"].empty()) {
+        for (const auto &rj : j["rays"]) {
+            ArrowSvgRay ray;
+            ray.from_json(rj);
+            rays.push_back(std::move(ray));
+        }
+    } else {
+        // Legacy single-arrow JSON: one combined ray from flat fields.
+        ArrowSvgRay ray;
+        bound_volumes_from_json(j, "bound_volumes", ray.bound_volumes);
+        json_get_vec2d(j, "arrow_start_offset", ray.arrow_start_offset);
+        json_get_vec2d(j, "arrow_end_offset", ray.arrow_end_offset);
+        rays.push_back(std::move(ray));
+    }
 }
 
 // ---- TextLabelNote ----
@@ -253,8 +306,11 @@ void PartNumberLabel::to_json(nlohmann::json &j) const
     j["object_idx"]         = object_idx;
     j["volume_idx"]         = volume_idx;
     j["part_name"]          = part_name;
+    j["uuid"]          = part_guid;
     j["arrow_start_offset"] = {arrow_start_offset.x(), arrow_start_offset.y()};
     j["arrow_end_offset"]   = {arrow_end_offset.x(), arrow_end_offset.y()};
+    j["visible"]            = visible;
+    j["in_explosion_state"] = in_explosion_state;
 }
 
 void PartNumberLabel::from_json(const nlohmann::json &j)
@@ -262,8 +318,15 @@ void PartNumberLabel::from_json(const nlohmann::json &j)
     json_get_int(j, "object_idx", object_idx);
     json_get_int(j, "volume_idx", volume_idx);
     json_get_string(j, "part_name", part_name);
+    json_get_string(j, "uuid", part_guid);
     json_get_vec2d(j, "arrow_start_offset", arrow_start_offset);
     json_get_vec2d(j, "arrow_end_offset", arrow_end_offset);
+    // Default true for legacy JSON that predates the per-label switch.
+    if (!json_get_bool(j, "visible", visible))
+        visible = true;
+    // Default false for legacy JSON that predates the explosion column.
+    if (!json_get_bool(j, "in_explosion_state", in_explosion_state))
+        in_explosion_state = false;
 }
 
 // ---- AssemblyNote ----
@@ -418,6 +481,9 @@ void KeyFrame::to_json(nlohmann::json &j) const
         auto it = volume_names.find(p.first);
         if (it != volume_names.end())
             item["volume_name"] = it->second;
+        auto git = volume_guids.find(p.first);
+        if (git != volume_guids.end() && !git->second.empty())
+            item["uuid"] = git->second;
         item["transformation"] = transform3d_to_json(p.second.get_matrix());
         vt_arr.push_back(item);
     }
@@ -464,6 +530,7 @@ void KeyFrame::from_json(const nlohmann::json &j)
 
     volume_transformations.clear();
     volume_names.clear();
+    volume_guids.clear();
     if (j.contains("volume_transformations") && j["volume_transformations"].is_array()) {
         for (const auto &item : j["volume_transformations"]) {
             int obj_id = -1;
@@ -479,6 +546,9 @@ void KeyFrame::from_json(const nlohmann::json &j)
             std::string volume_name;
             if (json_get_string(item, "volume_name", volume_name))
                 volume_names[key] = volume_name;
+            std::string volume_guid;
+            if (json_get_string(item, "uuid", volume_guid) && !volume_guid.empty())
+                volume_guids[key] = volume_guid;
         }
     }
 
@@ -564,6 +634,14 @@ void AssembleSub::to_json(nlohmann::json &j) const
         j["id"] = id;
     j["step"] = step;
     j["is_final_assembly"] = is_final_assembly;
+    if (inherited_from_step_id >= 0)
+        j["inherited_from_step_id"] = inherited_from_step_id;
+    if (!inherited_object_ids.empty()) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (size_t oid : inherited_object_ids)
+            arr.push_back(oid);
+        j["inherited_object_ids"] = std::move(arr);
+    }
     if (assembly_tree_checked) {
         nlohmann::json checked = nlohmann::json::object();
         for (const auto& item : *assembly_tree_checked)
@@ -585,7 +663,18 @@ void AssembleSub::from_json(const nlohmann::json &j)
     AssembleBaseInfo::from_json(j);
     json_get_int(j, "id", id);
     json_get_int(j, "step", step);
-    json_get_bool(j, "is_final_assembly", is_final_assembly);
+    json_get_assembly_step_kind(j, "is_final_assembly", is_final_assembly);
+    inherited_from_step_id = -1;
+    json_get_int(j, "inherited_from_step_id", inherited_from_step_id);
+    inherited_object_ids.clear();
+    if (j.contains("inherited_object_ids") && j["inherited_object_ids"].is_array()) {
+        for (const auto &v : j["inherited_object_ids"]) {
+            if (v.is_number_unsigned())
+                inherited_object_ids.push_back(v.get<size_t>());
+            else if (v.is_number_integer())
+                inherited_object_ids.push_back(static_cast<size_t>(v.get<long long>()));
+        }
+    }
     assembly_tree_checked.reset();
     if (j.contains("assembly_tree_checked") && j["assembly_tree_checked"].is_object()) {
         assembly_tree_checked.emplace();
@@ -693,7 +782,8 @@ std::string AssemblyStepJson::to_json_string() const
 {
     try {
         nlohmann::json root;
-        root["version"] = 1;//V1.0 2020610
+        // Current steps-file version. A loaded version above this is kept by the caller.
+        root["version"] = 1.2;//V1.0 20220610 //V1.1 20220715
         root["assembly_part_number_label_font_size"] = m_assembly_part_number_label_font_size;
         root["camera_ref_viewport_w"] = m_camera_ref_viewport_w;
         root["camera_ref_viewport_h"] = m_camera_ref_viewport_h;
@@ -736,6 +826,278 @@ bool AssemblyStepJson::save(const std::string &path) const
     }
 }
 
+bool assembly_steps_json_last_step_is_final_assembly(const std::string &json_str)
+{
+    if (json_str.empty())
+        return false;
+    try {
+        const nlohmann::json root = nlohmann::json::parse(json_str);
+        if (!root.contains("items") || !root["items"].is_array())
+            return false;
+
+        const nlohmann::json *last_step = nullptr;
+        for (const auto &item : root["items"]) {
+            if (!item.is_object())
+                continue;
+            std::string type;
+            if (!json_get_string(item, "type", type) || type != "sub")
+                continue;
+            int kind = AssemblyStepKind::Normal;
+            json_get_assembly_step_kind(item, "is_final_assembly", kind);
+            if (kind == AssemblyStepKind::OverallPreview)
+                continue;
+            last_step = &item;
+        }
+        if (last_step == nullptr)
+            return false;
+        int kind = AssemblyStepKind::Normal;
+        json_get_assembly_step_kind(*last_step, "is_final_assembly", kind);
+        return kind == AssemblyStepKind::FinalAssembly;
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "AssemblyStepJson: last-step check failed: " << e.what();
+        return false;
+    }
+}
+
+namespace {
+void collect_step_objects(const nlohmann::json &node, std::set<int> &idxs, std::set<size_t> &ids)
+{
+    if (!node.is_object())
+        return;
+    int idx = -1;
+    if (json_get_int(node, "object_idx", idx) && idx >= 0)
+        idxs.insert(idx);
+    size_t id = 0;
+    if (json_get_size_t(node, "object_id", id) && id != 0)
+        ids.insert(id);
+    if (node.contains("inherited_object_ids") && node["inherited_object_ids"].is_array()) {
+        for (const auto &v : node["inherited_object_ids"]) {
+            if (!v.is_number_integer())
+                continue;
+            const auto raw = v.get<long long>();
+            if (raw > 0)
+                ids.insert(static_cast<size_t>(raw));
+        }
+    }
+    if (!node.contains("children") || !node["children"].is_array())
+        return;
+    for (const auto &child : node["children"])
+        collect_step_objects(child, idxs, ids);
+}
+
+const nlohmann::json *find_step_by_id(const nlohmann::json &items, int step_id)
+{
+    for (const auto &item : items) {
+        if (!item.is_object())
+            continue;
+        std::string type;
+        if (!json_get_string(item, "type", type) || type != "sub")
+            continue;
+        int id = -1;
+        if (json_get_int(item, "id", id) && id == step_id)
+            return &item;
+    }
+    return nullptr;
+}
+} // namespace
+
+bool assembly_steps_json_last_step_covers_model(const std::string &json_str, const Model &model,
+                                                        const std::string &assembly_model_json)
+{
+    if (json_str.empty() || model.objects.empty())
+        return false;
+    try {
+        const nlohmann::json root = nlohmann::json::parse(json_str);
+        if (!root.contains("items") || !root["items"].is_array())
+            return false;
+
+        const nlohmann::json *last_step = nullptr;
+        for (const auto &item : root["items"]) {
+            if (!item.is_object())
+                continue;
+            std::string type;
+            if (!json_get_string(item, "type", type) || type != "sub")
+                continue;
+            int kind = AssemblyStepKind::Normal;
+            json_get_assembly_step_kind(item, "is_final_assembly", kind);
+            if (kind == AssemblyStepKind::OverallPreview)
+                continue;
+            last_step = &item;
+        }
+        if (last_step == nullptr)
+            return false;
+
+        // Restore gives each assembly object a new id. The id written in assembly_model.json
+        // is the one the steps file stored.
+        std::vector<size_t> persisted_ids;
+        if (!assembly_model_json.empty()) {
+            const nlohmann::json aroot = nlohmann::json::parse(assembly_model_json);
+            if (aroot.contains("nodes") && aroot["nodes"].is_array()) {
+                for (const auto &node : aroot["nodes"]) {
+                    size_t id = 0;
+                    if (node.is_object())
+                        json_get_size_t(node, "id", id);
+                    persisted_ids.push_back(id);
+                }
+            }
+        }
+
+        std::set<int>    idxs;
+        std::set<size_t> ids;
+        std::set<int>    seen_ids;
+        const nlohmann::json *step = last_step;
+        while (step != nullptr) {
+            collect_step_objects(*step, idxs, ids);
+            int self_id = -1;
+            json_get_int(*step, "id", self_id);
+            if (self_id >= 0 && !seen_ids.insert(self_id).second)
+                break;
+            int parent_id = -1;
+            if (!json_get_int(*step, "inherited_from_step_id", parent_id) || parent_id < 0)
+                break;
+            if (!seen_ids.insert(parent_id).second)
+                break;
+            step = find_step_by_id(root["items"], parent_id);
+        }
+
+        int expected = 0;
+        int covered  = 0;
+        for (int oi = 0; oi < (int) model.objects.size(); ++oi) {
+            const ModelObject *obj = model.objects[oi];
+            if (obj == nullptr)
+                continue;
+            bool has_part = false;
+            for (const ModelVolume *mv : obj->volumes) {
+                if (mv != nullptr && mv->is_model_part()) {
+                    has_part = true;
+                    break;
+                }
+            }
+            if (!has_part)
+                continue;
+            ++expected;
+            const size_t persisted_id = (static_cast<size_t>(oi) < persisted_ids.size()) ? persisted_ids[oi] : 0;
+            const bool by_idx = idxs.count(oi) != 0;
+            const bool by_id  = (obj->id().id != 0 && ids.count(obj->id().id) != 0)
+                             || (persisted_id != 0 && ids.count(persisted_id) != 0);
+            if (by_idx || by_id)
+                ++covered;
+        }
+        return expected > 0 && covered == expected;
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "AssemblyStepJson: last-step model coverage check failed: " << e.what();
+        return false;
+    }
+}
+
+std::string assembly_steps_json_mark_last_step_final_assembly(const std::string &json_str)
+{
+    if (json_str.empty())
+        return json_str;
+    try {
+        nlohmann::json root = nlohmann::json::parse(json_str);
+        if (!root.contains("items") || !root["items"].is_array())
+            return json_str;
+
+        nlohmann::json *last_step = nullptr;
+        for (auto &item : root["items"]) {
+            if (!item.is_object())
+                continue;
+            std::string type;
+            if (!json_get_string(item, "type", type) || type != "sub")
+                continue;
+            int kind = AssemblyStepKind::Normal;
+            json_get_assembly_step_kind(item, "is_final_assembly", kind);
+            if (kind == AssemblyStepKind::OverallPreview)
+                continue;
+            last_step = &item;
+        }
+        if (last_step == nullptr)
+            return json_str;
+
+        int kind = AssemblyStepKind::Normal;
+        json_get_assembly_step_kind(*last_step, "is_final_assembly", kind);
+        if (kind == AssemblyStepKind::FinalAssembly)
+            return json_str;
+        (*last_step)["is_final_assembly"] = AssemblyStepKind::FinalAssembly;
+        return root.dump(2);
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "AssemblyStepJson: mark last step final assembly failed: " << e.what();
+        return json_str;
+    }
+}
+
+std::string assembly_steps_json_with_qualified_assembly(const std::string &json_str, bool qualified)
+{
+    if (json_str.empty())
+        return json_str;
+    try {
+        nlohmann::json root = nlohmann::json::parse(json_str);
+        const bool has_flag = root.contains(kAssemblyStepsQualifiedKey);
+        if (qualified) {
+            if (has_flag && root[kAssemblyStepsQualifiedKey].is_boolean() && root[kAssemblyStepsQualifiedKey].get<bool>())
+                return json_str;
+            root[kAssemblyStepsQualifiedKey] = true;
+        } else {
+            if (!has_flag)
+                return json_str;
+            root.erase(kAssemblyStepsQualifiedKey);
+        }
+        return root.dump(2);
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "AssemblyStepJson: qualified_assembly update failed: " << e.what();
+        return json_str;
+    }
+}
+
+std::string qualified_assembly_result_json(bool qualified, bool need_rewrite_3mf)
+{
+    nlohmann::json root;
+    root[kQualifiedAssemblyResultKey] = qualified ? "true" : "false";
+    root[kNeedRewrite3mfResultKey] = need_rewrite_3mf ? "true" : "false";
+    return root.dump(2);
+}
+
+AssemblyStepsFileMeta assembly_steps_json_file_meta(const std::string &json_str)
+{
+    AssemblyStepsFileMeta meta;
+    if (json_str.empty())
+        return meta;
+    try {
+        const nlohmann::json root = nlohmann::json::parse(json_str);
+        if (root.contains("version") && root["version"].is_number())
+            meta.version = root["version"].get<double>();
+        if (root.contains(kAssemblyStepsQualifiedKey)) {
+            meta.has_qualified = true;
+            const auto &value = root[kAssemblyStepsQualifiedKey];
+            if (value.is_boolean())
+                meta.qualified = value.get<bool>();
+            else if (value.is_string())
+                meta.qualified = value.get<std::string>() == "true";
+        }
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "AssemblyStepJson: file meta parse failed: " << e.what();
+    }
+    return meta;
+}
+
+std::string assembly_steps_json_with_version(const std::string &json_str, double version)
+{
+    if (json_str.empty())
+        return json_str;
+    try {
+        nlohmann::json root = nlohmann::json::parse(json_str);
+        if (root.contains("version") && root["version"].is_number() &&
+            std::abs(root["version"].get<double>() - version) < 1e-6)
+            return json_str;
+        root["version"] = version;
+        return root.dump(2);
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "AssemblyStepJson: version update failed: " << e.what();
+        return json_str;
+    }
+}
+
 std::string AssemblyStepsTreeData::to_json_string() const
 {
     std::function<std::shared_ptr<AssembleBaseInfo>(int)> build_item;
@@ -750,6 +1112,8 @@ std::string AssemblyStepsTreeData::to_json_string() const
             sub->is_final_assembly = node.is_final_assembly;
             sub->id                = node.id;
             sub->step              = node.step;
+            sub->inherited_from_step_id = node.inherited_from_step_id;
+            sub->inherited_object_ids   = node.inherited_object_ids;
             sub->assembly_tree_checked = node.assembly_tree_checked;
             // Mirror legacy AssemblyStepsUtils::build_steps_json_string — all entries
             for (const auto& kf : node.kf_data.entries)
@@ -774,6 +1138,11 @@ std::string AssemblyStepsTreeData::to_json_string() const
     std::vector<std::shared_ptr<AssembleBaseInfo>> items;
     items.reserve(roots.size());
     for (int root_idx : roots) {
+        // OverallPreview is a runtime-only UI sentinel and must not be persisted.
+        if (root_idx >= 0 && root_idx < (int) nodes.size() &&
+            nodes[root_idx].type == AssemblyStepsTreeNode::Type::Folder &&
+            nodes[root_idx].is_final_assembly == AssemblyStepKind::OverallPreview)
+            continue;
         if (auto item = build_item(root_idx))
             items.push_back(std::move(item));
     }
@@ -952,6 +1321,8 @@ bool AssemblyStepsTreeData::from_json_string(
                 folder.step            = sub->step;
                 folder.name            = sub->name;
                 folder.is_final_assembly = sub->is_final_assembly;
+                folder.inherited_from_step_id = sub->inherited_from_step_id;
+                folder.inherited_object_ids   = sub->inherited_object_ids;
                 folder.assembly_tree_checked = sub->assembly_tree_checked;
                 folder.kf_data.node_idx   = folder_idx;
                 folder.kf_data.object_idx = folder.object_idx;
@@ -983,6 +1354,11 @@ bool AssemblyStepsTreeData::from_json_string(
         };
 
         for (const auto& item : json_doc.get_items()) {
+            // OverallPreview is runtime UI-only; drop it if an older file still contains it.
+            if (const auto *sub = dynamic_cast<const AssembleSub *>(item.get())) {
+                if (sub->is_final_assembly == AssemblyStepKind::OverallPreview)
+                    continue;
+            }
             const int idx = restore_item(item);
             if (idx >= 0)
                 parsed.roots.push_back(idx);
@@ -994,7 +1370,7 @@ bool AssemblyStepsTreeData::from_json_string(
             if (root_idx >= 0 && root_idx < (int) parsed.nodes.size())
                 total_children += parsed.nodes[root_idx].children.size();
         }
-        BOOST_LOG_TRIVIAL(info) << "AssemblyStepsTreeData::from_json_string loaded nodes="
+        BOOST_LOG_TRIVIAL(info) << "loaded nodes="
                                 << parsed.nodes.size() << " roots=" << parsed.roots.size()
                                 << " total_root_children=" << total_children;
 
@@ -1005,74 +1381,19 @@ bool AssemblyStepsTreeData::from_json_string(
         // Capture the load-time model snapshot as the baseline for the assembly view.
         // The 3mf was saved with model and steps data consistent, so this snapshot
         // represents "the model state the loaded steps data matches". Runtime-only.
-        parsed.loaded_recorded_objects.clear();
         parsed.loaded_recorded_volumes.clear();
         for (int oi = 0; oi < object_count; ++oi) {
             const ModelObject *obj = model.objects[oi];
             if (!obj)
                 continue;
-            const size_t object_id = obj->id().id;
-            if (!obj->instances.empty())
-                parsed.loaded_recorded_objects.insert(object_id);
             for (int vi = 0; vi < (int) obj->volumes.size(); ++vi) {
                 const ModelVolume *volume = obj->volumes[vi];
-                if (volume)
-                    parsed.loaded_recorded_volumes.insert({object_id, volume->id().id});
+                if (volume && volume->is_model_part())
+                    parsed.loaded_recorded_volumes.insert(volume->ensure_part_guid());
             }
         }
-        // Only trust the snapshot as a baseline when the final-assembly step's end
-        // frame actually covers the same objects/volumes as the loaded model. If
-        // they don't line up (stale steps data vs model), leave the flag false so
-        // the runtime re-syncs instead of skipping it on this loaded baseline.
-        bool baseline_matches_end_frame = false;
-        {
-            const KeyFrame *end_kf = nullptr;
-            for (const auto &node : parsed.nodes) {
-                if (node.type != AssemblyStepsTreeNode::Type::Folder || !node.is_final_assembly)
-                    continue;
-                for (const auto &e : node.kf_data.entries) {
-                    if (e.is_last()) {
-                        end_kf = &e.data;
-                        break;
-                    }
-                }
-                break;
-            }
-            if (end_kf != nullptr) {
-                // Convert the end frame's index-keyed pose maps into the same
-                // (object_id) / (object_id, volume_id) space as the snapshot above.
-                std::set<size_t>                    end_objects;
-                std::set<std::pair<size_t, size_t>> end_volumes;
-                bool keys_valid = true;
-                for (const auto &p : end_kf->object_transformations) {
-                    const int oi = p.first;
-                    if (oi < 0 || oi >= object_count || model.objects[oi] == nullptr) {
-                        keys_valid = false;
-                        break;
-                    }
-                    end_objects.insert(model.objects[oi]->id().id);
-                }
-                for (const auto &p : end_kf->volume_transformations) {
-                    if (!keys_valid)
-                        break;
-                    const int oi = p.first.first;
-                    const int vi = p.first.second;
-                    if (oi < 0 || oi >= object_count || model.objects[oi] == nullptr ||
-                        vi < 0 || vi >= (int) model.objects[oi]->volumes.size() ||
-                        model.objects[oi]->volumes[vi] == nullptr) {
-                        keys_valid = false;
-                        break;
-                    }
-                    end_volumes.insert({model.objects[oi]->id().id, model.objects[oi]->volumes[vi]->id().id});
-                }
-                if (keys_valid &&
-                    end_objects == parsed.loaded_recorded_objects &&
-                    end_volumes == parsed.loaded_recorded_volumes) {
-                    baseline_matches_end_frame = true;
-                }
-            }
-        }
-        parsed.has_loaded_recorded_baseline = baseline_matches_end_frame;
+        // As long as it's read from JSON, it's definitely a new project.
+        parsed.has_loaded_recorded_baseline = true;
 
         tree = std::move(parsed);
         return true;
@@ -1081,6 +1402,180 @@ bool AssemblyStepsTreeData::from_json_string(
             *error = e.what();
         return false;
     }
+}
+
+// ---- Independent assembly model (object graph) JSON ----
+namespace {
+static void matrix4_to_json(nlohmann::json &arr, const Transform3d &t)
+{
+    arr = nlohmann::json::array();
+    const auto &m = t.matrix();
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            arr.push_back(m(r, c));
+}
+static bool json_to_matrix4(const nlohmann::json &j, const char *key, Transform3d &out)
+{
+    if (!j.contains(key) || !j[key].is_array() || j[key].size() != 16)
+        return false;
+    Transform3d t = Transform3d::Identity();
+    int idx = 0;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            t.matrix()(r, c) = j[key][idx++].get<double>();
+    out = t;
+    return true;
+}
+} // namespace
+
+std::string assembly_model_to_json_string(const Model &assembly_model)
+{
+    nlohmann::json root;
+    root["version"] = 1;
+    nlohmann::json jobjects = nlohmann::json::array();
+    for (const ModelObject *mo : assembly_model.objects) {
+        if (mo == nullptr)
+            continue;
+        nlohmann::json jobj;
+        jobj["id"]   = (int) mo->id().id;
+        jobj["type"] = "group";
+        jobj["name"] = mo->name;
+        nlohmann::json jvols = nlohmann::json::array();
+            for (const ModelVolume *mv : mo->volumes) {
+                if (mv == nullptr)
+                    continue;
+                nlohmann::json jv;
+                jv["id"]     = (int) mv->id().id;
+                jv["type"]   = "leaf";
+                jv["volume"] = mv->assembly_src_guid();
+                jv["name"]   = mv->name;
+                // keep the assemble_transform which defines the part's pose in the assembly coordinate system.
+                matrix4_to_json(jv["assemble_transform"], mv->get_assemble_transformation().get_matrix());
+                // The local transform ("transform") and type/uuid are omitted because they are not required in the assembly view.
+                jvols.push_back(std::move(jv));
+            }
+        jobj["nodes"] = std::move(jvols);
+
+        if (mo->instances.size() == 1 && mo->instances.front() != nullptr) {
+            const ModelInstance *mi = mo->instances.front();
+            // Only the assemble_transform is needed for the assembly model.
+            matrix4_to_json(jobj["assemble_transform"], mi->get_assemble_transformation().get_matrix());
+            const Vec3d off = mi->get_offset_to_assembly();
+            jobj["offset_to_assembly"] = {off.x(), off.y(), off.z()};
+        } else {
+            nlohmann::json jinsts = nlohmann::json::array();
+            for (const ModelInstance *mi : mo->instances) {
+                if (mi == nullptr)
+                    continue;
+                nlohmann::json ji;
+                // Only the assemble_transform is needed for the assembly model.
+                matrix4_to_json(ji["assemble_transform"], mi->get_assemble_transformation().get_matrix());
+                const Vec3d off       = mi->get_offset_to_assembly();
+                ji["offset_to_assembly"] = {off.x(), off.y(), off.z()};
+                jinsts.push_back(std::move(ji));
+            }
+            jobj["instances"] = std::move(jinsts);
+        }
+        jobjects.push_back(std::move(jobj));
+    }
+    root["nodes"] = std::move(jobjects);
+    return root.dump(2);
+}
+
+bool assembly_model_from_json_string(const std::string &json_str, Model &out_assembly_model, const Model &mesh_source, std::string *error)
+{
+    out_assembly_model.clear_objects();
+    if (json_str.empty()) {
+        if (error != nullptr)
+            *error = "empty assembly model json";
+        return false;
+    }
+
+    nlohmann::json root;
+    try {
+        root = nlohmann::json::parse(json_str);
+    } catch (const std::exception &e) {
+        if (error != nullptr)
+            *error = e.what();
+        return false;
+    }
+    int version = 0;
+    json_get_int(root, "version", version);
+
+    if (!root.contains("nodes") || !root["nodes"].is_array()) {
+        if (error != nullptr)
+            *error = "missing objects array";
+        return false;
+    }
+
+    // Index prepare-side parts by part_guid so each assembly volume can rebind its mesh shared_ptr.
+    std::unordered_map<std::string, const ModelVolume *> src_by_guid;
+    for (const ModelObject *mo : mesh_source.objects)
+        for (const ModelVolume *mv : mo->volumes)
+            if (mv != nullptr && !mv->part_guid().empty())
+                src_by_guid.emplace(mv->part_guid(), mv);
+
+    for (const auto &jobj : root["nodes"]) {
+        ModelObject *ao = out_assembly_model.add_object();
+        if (jobj.contains("name") && jobj["name"].is_string())
+            ao->name = jobj["name"].get<std::string>();
+
+        if (jobj.contains("nodes") && jobj["nodes"].is_array()) {
+            for (const auto &jv : jobj["nodes"]) {
+                std::string src_guid;
+                // The source GUID is now stored under the alias "volume".
+                json_get_string(jv, "volume", src_guid);
+                auto it = src_guid.empty() ? src_by_guid.end() : src_by_guid.find(src_guid);
+                if (it == src_by_guid.end())
+                    continue; // prepare-side part gone -> drop this volume (delete already propagated)
+
+                // Clone shares the mesh shared_ptr and copies config/type; then override identity + poses.
+                ModelVolume *av = ao->add_volume(*it->second);
+                // Preserve extruder configuration as before.
+                const ConfigOption *vol_extruder_opt = av->config.option("extruder");
+                if (vol_extruder_opt == nullptr || vol_extruder_opt->getInt() == 0)
+                    av->config.set_key_value("extruder", new ConfigOptionInt(it->second->extruder_id()));
+                // The part GUID is no longer stored separately; it will be derived from the source volume when needed.
+                av->set_assembly_src_guid(src_guid);
+                // If the part GUID is missing (new format), fall back to the assembly source GUID.
+                if (av->part_guid().empty())
+                    av->set_part_guid(src_guid);
+                if (jv.contains("name") && jv["name"].is_string())
+                    av->name = jv["name"].get<std::string>();
+                // The type, local transform and explicit UUID are omitted in the new JSON format.
+                Transform3d t;
+                if (json_to_matrix4(jv, "assemble_transform", t))
+                    av->set_assemble_from_transform(t);
+            }
+        }
+
+        if (jobj.contains("instances") && jobj["instances"].is_array()) {
+            for (const auto &ji : jobj["instances"]) {
+                ModelInstance *ai = ao->add_instance();
+                Transform3d t;
+                // The local transform is not needed for the assembly model.
+                if (json_to_matrix4(ji, "assemble_transform", t))
+                    ai->set_assemble_from_transform(t);
+                if (ji.contains("offset_to_assembly") && ji["offset_to_assembly"].is_array() && ji["offset_to_assembly"].size() == 3)
+                    ai->set_offset_to_assembly(Vec3d(ji["offset_to_assembly"][0].get<double>(),
+                                                     ji["offset_to_assembly"][1].get<double>(),
+                                                     ji["offset_to_assembly"][2].get<double>()));
+            }
+        } else if (jobj.contains("assemble_transform") || jobj.contains("offset_to_assembly")) {
+            ModelInstance *ai = ao->add_instance();
+            Transform3d t;
+            if (json_to_matrix4(jobj, "assemble_transform", t))
+                ai->set_assemble_from_transform(t);
+            if (jobj.contains("offset_to_assembly") && jobj["offset_to_assembly"].is_array() && jobj["offset_to_assembly"].size() == 3)
+                ai->set_offset_to_assembly(Vec3d(jobj["offset_to_assembly"][0].get<double>(),
+                                                 jobj["offset_to_assembly"][1].get<double>(),
+                                                 jobj["offset_to_assembly"][2].get<double>()));
+        }
+        // Every renderable object needs at least one instance.
+        if (ao->instances.empty())
+            ao->add_instance();
+    }
+    return true;
 }
 
 } // namespace Slic3r

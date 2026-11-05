@@ -43,6 +43,8 @@
 #include "Gizmos/GLGizmoScale.hpp"
 #include "Gizmos/GLGizmoMeshBoolean.hpp"
 #include "libslic3r/TriangleMeshDeal.hpp"
+#include "libslic3r/PaintReproject.hpp"
+#include "libslic3r/Log.hpp"
 namespace Slic3r
 {
 namespace GUI
@@ -515,7 +517,7 @@ int ObjectList::get_repaired_errors_count(const int obj_idx, const int vol_idx /
 
 static std::string get_warning_icon_name(const TriangleMeshStats& stats)
 {
-    return (!stats.manifold() || stats.has_open_edges() || stats.repaired()) ? "obj_warning" : "";
+    return (stats.has_any_issue() || stats.repaired()) ? "obj_warning" : "";
 }
 
 MeshErrorsInfo ObjectList::get_mesh_errors_info(const int obj_idx, const int vol_idx /*= -1*/, wxString* sidebar_info /*= nullptr*/, MeshIssueCounts* issue_counts) const
@@ -531,6 +533,7 @@ MeshErrorsInfo ObjectList::get_mesh_errors_info(const int obj_idx, const int vol
     issues.non_manifold_edges    = stats.non_manifold_edges;
     issues.non_manifold_vertices = stats.non_manifold_vertices;
     issues.open_edges            = stats.open_edges;
+    issues.has_reversed_faces    = stats.has_reversed_faces;
     if (issue_counts)
         *issue_counts = issues;
 
@@ -538,7 +541,7 @@ MeshErrorsInfo ObjectList::get_mesh_errors_info(const int obj_idx, const int vol
         return { {}, {} }; // hide tooltip
     }
 
-    wxString tooltip, auto_repaired_info, error_info, open_info;
+    wxString tooltip, auto_repaired_info, error_info, open_info, reversed_info;
 
     // Create tooltip string, if there are errors
     if (stats.repaired()) {
@@ -547,7 +550,7 @@ MeshErrorsInfo ObjectList::get_mesh_errors_info(const int obj_idx, const int vol
         tooltip += auto_repaired_info + "\n";
     }
 
-    if (issues.has_error()) {
+    if (issues.non_manifold_edges > 0 || issues.non_manifold_vertices > 0) {
         if (issues.non_manifold_edges > 0 && issues.non_manifold_vertices > 0)
             error_info = format_wxstr(_L("Error: %1$d non-manifold edges, %2$d non-manifold vertices"),
                                       issues.non_manifold_edges, issues.non_manifold_vertices);
@@ -561,6 +564,11 @@ MeshErrorsInfo ObjectList::get_mesh_errors_info(const int obj_idx, const int vol
         tooltip += error_info + "\n";
     }
 
+    if (issues.has_reversed_faces) {
+        reversed_info = _L("Error: reversed faces detected, which may affect rendering");
+        tooltip += reversed_info + "\n";
+    }
+
     if (issues.has_info()) {
         open_info = format_wxstr(_L_PLURAL("Info: %1$d open edge", "Info: %1$d open edges", issues.open_edges), issues.open_edges);
         tooltip += open_info + "\n";
@@ -570,13 +578,22 @@ MeshErrorsInfo ObjectList::get_mesh_errors_info(const int obj_idx, const int vol
         wxString info;
         if (!open_info.empty())
             info += open_info;
-        if (!error_info.empty()) {
-            if (!info.empty())
-                info += "\n";
-            info += "<Error>" + error_info + "</Error>";
-        }
         if (stats.repaired())
             info += info.empty() ? auto_repaired_info : ("\n" + auto_repaired_info);
+
+        wxString errors;
+        if (!error_info.empty())
+            errors += error_info;
+        if (!reversed_info.empty()) {
+            if (!errors.empty())
+                errors += "\n";
+            errors += reversed_info;
+        }
+        if (!errors.empty()) {
+            if (!info.empty())
+                info += "\n";
+            info += "<Error>" + errors + "</Error>";
+        }
         *sidebar_info = info;
     }
 
@@ -632,12 +649,16 @@ void ObjectList::set_tooltip_for_item(const wxPoint& pt)
             tooltip = _(L("Click the icon to reset all settings of the object"));
 #endif //__WXMSW__
     }
-    else if (col->GetModelColumn() == (unsigned int)colPrint)
+    else if (col->GetModelColumn() == (unsigned int)colPrint) {
+        if (node->IsPrintable() == piUnprintable)
+            tooltip = _(L("Unprintable object"));
+        else
 #ifdef __WXOSX__
-        tooltip = _(L("Right button click the icon to drop the object printable property"));
+            tooltip = _(L("Right button click the icon to drop the object printable property"));
 #else
-        tooltip = _(L("Click the icon to toggle printable property of the object"));
+            tooltip = _(L("Click the icon to toggle printable property of the object"));
 #endif //__WXMSW__
+    }
     // BBS
     else if (col->GetModelColumn() == (unsigned int)colSupportPaint) {
         if (node->HasSupportPainting())
@@ -688,7 +709,8 @@ ModelConfig& ObjectList::get_item_config(const wxDataViewItem& item) const
         return s_empty_config;
 
     const int obj_idx = m_objects_model->GetObjectIdByItem(item);
-    const int vol_idx = type & itVolume ? m_objects_model->GetVolumeIdByItem(item) : -1;
+    // Translate it back to the real index
+    const int vol_idx = type & itVolume ? m_objects_model->get_real_volume_index_in_3d(obj_idx, m_objects_model->GetVolumeIdByItem(item)) : -1;
 
     assert(obj_idx >= 0 || ((type & itVolume) && vol_idx >=0));
     return type & itVolume ?(*m_objects)[obj_idx]->volumes[vol_idx]->config :
@@ -745,6 +767,49 @@ void ObjectList::update_filament_values_for_items(const size_t filaments_count)
     wxGetApp().plater()->update();
 }
 
+const std::vector<std::string>& filament_index_object_keys()
+{
+    static const std::vector<std::string> keys{"support_filament", "support_interface_filament",
+                                                "sparse_infill_filament", "solid_infill_filament", "wall_filament"};
+    return keys;
+}
+
+bool model_object_uses_mixed_filament(const ModelObject &object)
+{
+    const auto *is_mixed_opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionBools>("filament_is_mixed");
+    if (!is_mixed_opt)
+        return false;
+    const auto &is_mixed = is_mixed_opt->values;
+    auto mixed = [&is_mixed](int filament_id) {
+        return filament_id >= 1 && size_t(filament_id) <= is_mixed.size() && is_mixed[filament_id - 1];
+    };
+    auto config_uses_mixed = [&mixed](const ModelConfig &config) {
+        if (config.has("extruder") && mixed(config.extruder()))
+            return true;
+        for (const std::string &key : filament_index_object_keys())
+            if (config.has(key) && mixed(config.opt_int(key)))
+                return true;
+        return false;
+    };
+
+    if (config_uses_mixed(object.config))
+        return true;
+    const GlobalFeatureFilaments global_features = GlobalFeatureFilaments::from_config(
+        wxGetApp().preset_bundle->prints.get_edited_preset().config, wxGetApp().filaments_cnt());
+    for (const ModelVolume *volume : object.volumes) {
+        // get_extruders() covers the part's own / inherited filament, global feature filaments and its color painting.
+        for (int filament_id : volume->get_extruders(global_features))
+            if (mixed(filament_id))
+                return true;
+        if (volume->is_model_part() && config_uses_mixed(volume->config))
+            return true;
+    }
+    for (const auto &range : object.layer_config_ranges)
+        if (config_uses_mixed(range.second))
+            return true;
+    return false;
+}
+
 void ObjectList::update_filament_values_for_items_when_delete_filament(const size_t filament_id, const int replace_id)
 {
     int replace_filament_id = replace_id == -1 ? 1 : (replace_id + 1);
@@ -769,8 +834,7 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
         }
         m_objects_model->SetExtruder(extruder, item);
 
-        static const char *keys[] = {"support_filament", "support_interface_filament",
-            "sparse_infill_filament", "solid_infill_filament", "wall_filament"};
+        const std::vector<std::string>& keys = filament_index_object_keys();
         for (auto key : keys) {
             if (object->config.has(key)) {
                 if(object->config.opt_int(key) == filament_id + 1)
@@ -833,6 +897,16 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
                 auto l_iter = object->layer_config_ranges.find(layer_node->GetLayerRange());
                 if (l_iter != object->layer_config_ranges.end()) {
                     auto& layer_range_item = *(l_iter);
+                    // Keep height-range feature filaments in sync, like the object and volume configs above.
+                    for (const auto &key : keys) {
+                        if (!layer_range_item.second.has(key))
+                            continue;
+                        const int value = layer_range_item.second.opt_int(key);
+                        if (value == int(filament_id) + 1)
+                            layer_range_item.second.erase(key);
+                        else if (value > int(filament_id))
+                            layer_range_item.second.set_key_value(key, new ConfigOptionInt(value - 1));
+                    }
                     if (layer_range_item.second.has("extruder") && layer_range_item.second.option("extruder")->getInt() == filament_id + 1) {
                         int new_extruder = replace_id == -1 ? 0 : (replace_id + 1);
                         extruder         = wxString::Format("%d", new_extruder);
@@ -845,6 +919,93 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
                     }
                     m_objects_model->SetExtruder(extruder, layer_item);
                 }
+            }
+        }
+    }
+}
+
+void ObjectList::update_filament_values_for_items_when_replace_filament(const size_t from_id, const size_t to_id)
+{
+    if (!m_objects || from_id == to_id)
+        return;
+
+    const int from = int(from_id) + 1;
+    const int to   = int(to_id) + 1;
+    const wxString to_str = wxString::Format("%d", to);
+    // Support filaments have their own compatibility checks, so only model feature overrides follow the color.
+    static const std::vector<std::string> feature_keys = {"wall_filament", "sparse_infill_filament", "solid_infill_filament"};
+    auto replace_features = [&](ModelConfig &config) {
+        for (const std::string &key : feature_keys)
+            if (config.has(key) && config.opt_int(key) == from)
+                config.set_key_value(key, new ConfigOptionInt(to));
+    };
+
+    for (size_t i = 0; i < m_objects->size(); ++i) {
+        ModelObject *object = (*m_objects)[i];
+        const int obj_extruder = object->config.has("extruder") ? std::max(object->config.extruder(), 1) : 1;
+        if (obj_extruder == from) {
+            object->config.set_key_value("extruder", new ConfigOptionInt(to));
+            if (wxDataViewItem item = m_objects_model->GetItemById(i))
+                m_objects_model->SetExtruder(to_str, item);
+        }
+        replace_features(object->config);
+
+        for (size_t id = 0; id < object->volumes.size(); ++id) {
+            ModelVolume *volume = object->volumes[id];
+            replace_features(volume->config);
+            if (volume->config.has("extruder") && volume->config.extruder() == from) {
+                volume->config.set_key_value("extruder", new ConfigOptionInt(to));
+                if (wxDataViewItem item = m_objects_model->GetItemByVolumeId(i, id))
+                    m_objects_model->SetExtruder(to_str, item);
+            }
+        }
+
+        for (auto &range : object->layer_config_ranges) {
+            replace_features(range.second);
+            if (range.second.has("extruder") && range.second.option("extruder")->getInt() == from)
+                range.second.set("extruder", to);
+        }
+
+        wxDataViewItem obj_item = m_objects_model->GetItemById(i);
+        if (!obj_item)
+            continue;
+        ObjectDataViewModelNode *object_node = static_cast<ObjectDataViewModelNode *>(obj_item.GetID());
+        for (size_t c = 0; c < object_node->GetChildCount(); ++c) {
+            ObjectDataViewModelNode *layer_root_node = object_node->GetNthChild(c);
+            if (layer_root_node->GetType() != ItemType::itLayerRoot)
+                continue;
+            for (size_t j = 0; j < layer_root_node->GetChildCount(); ++j) {
+                ObjectDataViewModelNode *layer_node = layer_root_node->GetNthChild(j);
+                auto l_iter = object->layer_config_ranges.find(layer_node->GetLayerRange());
+                if (l_iter != object->layer_config_ranges.end() && l_iter->second.has("extruder") &&
+                    l_iter->second.option("extruder")->getInt() == to)
+                    m_objects_model->SetExtruder(to_str, wxDataViewItem((void *) layer_node));
+            }
+        }
+    }
+}
+
+void ObjectList::update_layer_range_filament_values()
+{
+    if (!m_objects)
+        return;
+
+    for (size_t i = 0; i < m_objects->size(); ++i) {
+        ModelObject   *object   = (*m_objects)[i];
+        wxDataViewItem obj_item = m_objects_model->GetItemById(i);
+        if (!obj_item || object->layer_config_ranges.empty())
+            continue;
+        ObjectDataViewModelNode *object_node = static_cast<ObjectDataViewModelNode *>(obj_item.GetID());
+        for (size_t c = 0; c < object_node->GetChildCount(); ++c) {
+            ObjectDataViewModelNode *layer_root_node = object_node->GetNthChild(c);
+            if (layer_root_node->GetType() != ItemType::itLayerRoot)
+                continue;
+            for (size_t j = 0; j < layer_root_node->GetChildCount(); ++j) {
+                ObjectDataViewModelNode *layer_node = layer_root_node->GetNthChild(j);
+                auto l_iter = object->layer_config_ranges.find(layer_node->GetLayerRange());
+                if (l_iter != object->layer_config_ranges.end() && l_iter->second.has("extruder"))
+                    m_objects_model->SetExtruder(wxString::Format("%d", l_iter->second.option("extruder")->getInt()),
+                                                 wxDataViewItem((void *) layer_node));
             }
         }
     }
@@ -1158,6 +1319,12 @@ void ObjectList::update_name_in_model(const wxDataViewItem& item) const
 
     if (volume_id < 0) return;
     obj->volumes[volume_id]->name = m_objects_model->GetName(item).ToUTF8().data();
+
+    // Sync the renamed volume's name to the assembly model so the assembly view
+    // shows the current name without waiting for sync_assemble_model_on_enter.
+    const std::string &guid = obj->volumes[volume_id]->part_guid();
+    if (!guid.empty())
+        wxGetApp().plater()->sync_assemble_volume_name(guid, obj->volumes[volume_id]->name);
 }
 
 void ObjectList::update_name_in_list(int obj_idx, int vol_idx) const
@@ -1206,6 +1373,45 @@ void ObjectList::sync_name_from_model(int obj_idx, int vol_idx)
         return;
 
     m_objects_model->SetName(new_name, item);
+}
+
+void ObjectList::sync_filament_from_model()
+{
+    if (m_objects_model == nullptr || m_objects == nullptr)
+        return;
+
+    auto extruder_str = [](const ModelConfig &cfg, int fallback) {
+        if (!cfg.has("extruder"))
+            return wxString::Format("%d", fallback);
+        const int e = cfg.extruder();
+        return wxString::Format("%d", e <= 0 ? fallback : e);
+    };
+
+    for (size_t i = 0; i < m_objects->size(); ++i) {
+        ModelObject *object = (*m_objects)[i];
+        if (object == nullptr)
+            continue;
+        wxDataViewItem obj_item = m_objects_model->GetItemById(static_cast<int>(i));
+        if (!obj_item)
+            continue;
+        const wxString obj_ext = extruder_str(object->config, 1);
+        m_objects_model->SetExtruder(obj_ext, obj_item);
+
+        if (object->volumes.size() <= 1)
+            continue;
+        const int obj_ext_n = wxAtoi(obj_ext);
+        for (size_t id = 0; id < object->volumes.size(); ++id) {
+            ModelVolume *mv = object->volumes[id];
+            if (mv == nullptr)
+                continue;
+            const int ui_vol = m_objects_model->get_real_volume_index_in_ui(static_cast<int>(i), static_cast<int>(id));
+            wxDataViewItem vol_item = m_objects_model->GetItemByVolumeId(static_cast<int>(i), ui_vol);
+            if (!vol_item)
+                continue;
+            m_objects_model->SetExtruder(extruder_str(mv->config, obj_ext_n), vol_item);
+        }
+    }
+    Refresh();
 }
 
 void ObjectList::selection_changed()
@@ -1440,6 +1646,12 @@ void ObjectList::paste_objects_into_list(const std::vector<size_t>& object_idxs)
 
     select_items(items);
     selection_changed();
+
+    // Objects arriving this way (a primitive added from the plate menu, a paste) can print with a
+    // slot the project cannot use, and nothing else on this path tells the sidebar. Without this the
+    // corner notification waits for an unrelated refresh -- selecting a plate, say -- so the problem
+    // stays hidden until the user happens to click something.
+    wxGetApp().plater()->sidebar().update_incompatible_nozzle_notifications();
 }
 
 #ifdef __WXOSX__
@@ -2368,6 +2580,9 @@ static TriangleMesh create_mesh(const std::string& type_name, const BoundingBoxf
         // Centered around 0, sitting on the print bed.
         // The cylinder has the same volume as the box above.
         mesh = TriangleMesh(its_make_cylinder(0.5 * side, side));
+    else if (type_name == "Hexagonal Prism")
+        // Centered around 0, sitting on the print bed.
+        mesh = TriangleMesh(its_make_cylinder(0.5 * side, side, PI / 3));
     else if (type_name == "Sphere")
         // Centered around 0, half the sphere below the print bed, half above.
         // The sphere has the same volume as the box above.
@@ -2385,6 +2600,8 @@ static TriangleMesh create_mesh(const std::string& type_name, const BoundingBoxf
         mesh.ReadSTLFile((Slic3r::resources_dir() + "/model/torus.stl").c_str(), true, nullptr);
     else if (type_name == "Rounded Rectangle")
         mesh.ReadSTLFile((Slic3r::resources_dir() + "/model/rounded_rectangle.stl").c_str(), true, nullptr);
+    else if (type_name == "TearDrop")
+        mesh.ReadSTLFile((Slic3r::resources_dir() + "/model/TearDrop.stl").c_str(), true, nullptr);
     else if (type_name == "Bambu Cube")
         mesh.ReadSTLFile((Slic3r::resources_dir() + "/model/Bambu_Cube.stl").c_str(), true, nullptr);
     else if (type_name == "Bambu Cube V2")
@@ -2520,7 +2737,7 @@ void GUI::ObjectList::add_new_model_object_from_old_object() {
     auto            mo = (*m_objects)[obj_idx];
     for (int i = vol_idxs.size() - 1; i >= 0; i--) {
         if (vol_idxs[i] > mo->volumes.size()) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "check error:array bound";
+            BOOST_LOG_TRIVIAL(info) << "check error:array bound";
             continue;
         }
         auto vol_idx = vol_idxs[i];
@@ -2563,6 +2780,7 @@ void GUI::ObjectList::add_new_model_object_from_old_object() {
     new_object->ensure_on_bed();
     // BBS init assmeble transformation
     new_object->get_model()->set_assembly_pos(new_object);
+    wxGetApp().plater()->ensure_model_object_volume_assemble_initialized(new_object);
     object_idxs.push_back(model.objects.size() - 1);
     paste_objects_into_list(object_idxs);
     wxGetApp().mainframe->update_title();
@@ -2650,6 +2868,9 @@ void ObjectList::load_mesh_object(const TriangleMesh &mesh, const wxString &name
 
     //BBS init assmeble transformation
     new_object->get_model()->set_assembly_pos(new_object);
+    // Seed per-volume assemble + stable GUID so the assembly-view thumbnail can
+    // resolve poses before the user ever enters the assembly view (derive/ensure_part_guid).
+    wxGetApp().plater()->ensure_model_object_volume_assemble_initialized(new_object);
 
     object_idxs.push_back(model.objects.size() - 1);
 #ifdef _DEBUG
@@ -2768,6 +2989,16 @@ bool ObjectList::del_object(const int obj_idx, bool refresh_immediately)
     return wxGetApp().plater()->delete_object_from_model(obj_idx, refresh_immediately);
 }
 
+// Returns true when the object still has at least one solid (model) part. A negative volume,
+// modifier or support volume on its own is not printable geometry.
+static bool object_has_solid_part(const ModelObject *object)
+{
+    for (const ModelVolume *v : object->volumes)
+        if (v->is_model_part()) return true;
+
+    return false;
+}
+
 // Delete subobject
 void ObjectList::del_subobject_item(wxDataViewItem& item)
 {
@@ -2796,6 +3027,11 @@ void ObjectList::del_subobject_item(wxDataViewItem& item)
     else if (idx == -1)
         return;
     else if (!del_subobject_from_object(obj_idx, idx, type))
+        return;
+
+    // BBS: if the deleted part was the object's last solid part, only negative / modifier
+    // volumes remain and the object has no printable geometry; remove it entirely.
+    if ((type & itVolume) && del_object_if_no_solid_part(obj_idx))
         return;
 
     // If last volume item with warning was deleted, unmark object item
@@ -2959,16 +3195,6 @@ bool ObjectList::del_subobject_from_object(const int obj_idx, const int idx, con
 
     if (type == itVolume) {
         const auto volume = object->volumes[idx];
-
-        // if user is deleting the last solid part, throw error
-        int solid_cnt = 0;
-        for (auto vol : object->volumes)
-            if (vol->is_model_part())
-                ++solid_cnt;
-        if (volume->is_model_part() && solid_cnt == 1) {
-            Slic3r::GUI::show_error(nullptr, _L("Deleting the last solid part is not allowed."));
-            return false;
-        }
         if (object->is_cut() && (volume->is_model_part() || volume->is_negative_volume())) {
             del_from_cut_object(volume->is_cut_connector(), volume->is_model_part(), volume->is_negative_volume());
             // in any case return false to break the deletion
@@ -2976,6 +3202,11 @@ bool ObjectList::del_subobject_from_object(const int obj_idx, const int idx, con
         }
 
         take_snapshot("Delete part");
+
+        // Propagate the prepare-side part delete to the independent assembly model before the volume is
+        // destroyed, so the assembly view (and the persisted assembly_model.json) drops the same part
+        // instead of keeping a dangling reference that would vanish only on the next 3mf reload.
+        wxGetApp().plater()->propagate_volume_delete_to_assemble(*volume);
 
         object->delete_volume(idx);
 
@@ -3022,7 +3253,21 @@ bool ObjectList::del_subobject_from_object(const int obj_idx, const int idx, con
     return true;
 }
 
-void ObjectList::split()
+// If the object at obj_idx has lost its last solid (model) part it has no printable geometry on
+// its own; remove the whole object together with any leftover negative / modifier volumes.
+// Returns true when the object was removed. Cut objects are left to their own delete handling.
+bool ObjectList::del_object_if_no_solid_part(const int obj_idx)
+{
+    if (obj_idx < 0 || obj_idx >= int(m_objects->size())) return false;
+
+    const ModelObject *obj = (*m_objects)[obj_idx];
+    if (obj->is_cut() || object_has_solid_part(obj)) return false;
+
+    if (del_object(obj_idx)) delete_object_from_list(obj_idx);
+    return true;
+}
+
+void ObjectList::split(bool ignore_warning)
 {
     const auto item = GetSelection();
     const int obj_idx = get_selected_obj_idx();
@@ -3036,7 +3281,9 @@ void ObjectList::split()
     const ConfigOptionStrings* filament_colors = config.option<ConfigOptionStrings>("filament_colour", false);
     const auto filament_cnt = (filament_colors == nullptr) ? size_t(1) : filament_colors->size();
     if (!volume->is_splittable()) {
-        wxMessageBox(_(L("The target object contains only one part and can not be split.")));
+        if (!ignore_warning) {
+            wxMessageBox(_(L("The target object contains only one part and can not be split.")));
+        }
         return;
     }
 
@@ -3183,10 +3430,17 @@ void ObjectList::merge(bool to_multipart_object)
 
         Slic3r::SaveObjectGaurd gaurd(*new_object);
 
+        // Preserve each part's world-space assemble pose across the merge. The assembly view composes a
+        // volume's world matrix as (instance assemble) x (volume assemble), so we snapshot the old world
+        // assemble pose here and re-solve each volume's assemble transform against the merged object's
+        // instance assemble transform once the latter is finalized below.
+        std::vector<std::pair<ModelVolume*, Transform3d>> vol_world_assemble;
+
         for (int obj_idx : obj_idxs) {
             ModelObject* object = (*m_objects)[obj_idx];
 
             const Geometry::Transformation& transformation = object->instances[0]->get_transformation();
+            const Transform3d old_instance_assemble_matrix = object->instances[0]->get_assemble_transformation().get_matrix();
             //const Vec3d scale     = transformation.get_scaling_factor();
             //const Vec3d mirror    = transformation.get_mirror();
             //const Vec3d rotation  = transformation.get_rotation();
@@ -3200,6 +3454,8 @@ void ObjectList::merge(bool to_multipart_object)
                 const ModelVolume* volume = object->volumes[volume_idx];
                 ModelVolume* new_volume = new_object->add_volume(*volume);
                 int new_volume_idx = new_object->volumes.size() - 1;
+                // World assemble pose of this part before the merge: instance-assemble x volume-assemble.
+                vol_world_assemble.emplace_back(new_volume, old_instance_assemble_matrix * volume->get_assemble_transformation().get_matrix());
                 // merge brim ears
                 for (auto p : object->brim_points) {
                     if (p.volume_idx == volume_idx) {
@@ -3320,6 +3576,14 @@ void ObjectList::merge(bool to_multipart_object)
                 new_object->instances[0]->set_assemble_offset(offset);
             }
         }
+        // Re-solve each part's assemble transform relative to the merged object's now-finalized instance
+        // assemble transform, keeping every part at its original world-space assemble pose:
+        //   volume_assemble_new = instance_assemble_new^-1 * (instance_assemble_old * volume_assemble_old)
+        {
+            const Transform3d new_instance_assemble_inverse = new_object->instances[0]->get_assemble_transformation().get_matrix().inverse();
+            for (const auto& vw : vol_world_assemble)
+                vw.first->set_assemble_transformation(Geometry::Transformation(new_instance_assemble_inverse * vw.second));
+        }
         // merge brim ears
         const Transform3d& new_object_inverse_matrix = new_object_trsf.get_matrix().inverse();
         for (auto& p : new_object->brim_points) {
@@ -3332,8 +3596,12 @@ void ObjectList::merge(bool to_multipart_object)
         //BBS: notify it before remove
         notify_instance_updated(m_objects->size() - 1);
 
-        // remove selected objects
+        // remove selected objects. Merge is a prepare-side restructure: the merged object keeps every
+        // source part's part_guid, so this internal remove must NOT propagate as a delete to the
+        // independent assembly model (otherwise the assembly view would lose those parts).
+        wxGetApp().plater()->set_suppress_assemble_delete_propagation(true);
         remove();
+        wxGetApp().plater()->set_suppress_assemble_delete_propagation(false);
 
         // Add new object(merged) to the object_list
         add_object_to_list(m_objects->size() - 1);
@@ -3359,6 +3627,27 @@ void ObjectList::merge(bool to_multipart_object)
 
         changed_object(obj_idx);
     }
+}
+
+void ObjectList::merge_objects(const std::vector<size_t>& obj_idxs)
+{
+    // Merge the given whole objects into one multipart object, reusing merge(true) so the assemble-pose
+    if (obj_idxs.size() <= 1)
+        return;
+
+    wxDataViewItemArray sels;
+    for (const size_t idx : obj_idxs) {
+        if (idx >= m_objects->size())
+            continue;
+        const wxDataViewItem item = m_objects_model->GetItemById((int) idx);
+        if (item.IsOk())
+            sels.Add(item);
+    }
+    if (sels.GetCount() < 2)
+        return;
+
+    select_items(sels);
+    merge(true);
 }
 
 void ObjectList::merge_volumes()
@@ -3397,16 +3686,9 @@ void ObjectList::merge_volumes()
 
 void ObjectList::layers_editing()
 {
-    const auto& print_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    if (print_config.opt_bool("enable_mixed_color_sublayer")) {
-        MessageDialog dlg(nullptr,
-            _L("Using variable layer height together with mixed color sublayer may result in poor color mixing quality."),
-            _L("Warning"), wxICON_WARNING | wxOK);
-        dlg.ShowModal();
-    }
-
     const Selection& selection = scene_selection();
     const int obj_idx = selection.get_object_idx();
+
     wxDataViewItem item = obj_idx >= 0 && GetSelectedItemsCount() > 1 && selection.is_single_full_object() ?
                           m_objects_model->GetItemById(obj_idx) :
                           GetSelection();
@@ -3444,44 +3726,22 @@ void ObjectList::layers_editing()
     Expand(layers_item);
 }
 
-// BBS: merge parts of a single object into one volume, similar to export_stl, but no need to export and then import
+// Union every model part of the selected object into one part, keeping all painting.
+// Runs as a background job of the Mesh Boolean gizmo (progress and cancel in the progress
+// notification); negative volumes and modifiers are kept as they are.
 void ObjectList::boolean()
 {
     std::vector<int> obj_idxs, vol_idxs;
     get_selection_indexes(obj_idxs, vol_idxs);
-    if (obj_idxs.empty() && vol_idxs.empty())
+    if (obj_idxs.empty() || obj_idxs.front() < 0 || obj_idxs.front() >= int(m_objects->size()))
         return;
 
-    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "boolean");
-
     ModelObject* object = (*m_objects)[obj_idxs.front()];
-    TriangleMesh mesh = Plater::combine_mesh_fff(*object, -1, [this](const std::string &msg) { return wxGetApp().notification_manager()->push_plater_warning_notification(msg); });
 
-    // add mesh to model as a new object, keep the original object's name and config
-    Model* model = object->get_model();
-    ModelObject* new_object = model->add_object();
-    new_object->name = object->name;
-    new_object->config.assign_config(object->config);
-    if (new_object->instances.empty())
-        new_object->add_instance();
-    ModelVolume* new_volume = new_object->add_volume(mesh);
-
-    // BBS: ensure on bed but no need to ensure locate in the center around origin
-    new_object->ensure_on_bed();
-    new_object->center_around_origin();
-    new_object->translate_instances(-new_object->origin_translation);
-    new_object->origin_translation = Vec3d::Zero();
-
-    // BBS: notify it before move
-    notify_instance_updated(m_objects->size() - 1);
-
-    // remove selected objects
-    remove();
-
-    // Add new object(UNION) to the object_list
-    add_object_to_list(m_objects->size() - 1);
-    select_item(m_objects_model->GetItemById(m_objects->size() - 1));
-    update_selections_on_canvas();
+    auto *gizmo = dynamic_cast<GLGizmoMeshBoolean *>(
+        wxGetApp().plater()->canvas3D()->get_gizmos_manager().get_gizmo(GLGizmosManager::MeshBoolean));
+    if (gizmo != nullptr)
+        gizmo->run_object_union_async(object);
 }
 
 wxDataViewItem ObjectList::add_layer_root_item(const wxDataViewItem obj_item)
@@ -3578,6 +3838,61 @@ bool ObjectList::is_splittable(bool to_objects)
         return false;
 
     return volume->is_splittable();
+}
+
+// Collect the currently selected whole-object indices (ignoring volume / instance sub-selections).
+std::vector<int> ObjectList::selected_object_idxs() const
+{
+    std::vector<int> obj_idxs;
+    wxDataViewItemArray sels;
+    const_cast<ObjectList*>(this)->GetSelections(sels);
+    for (const wxDataViewItem& item : sels) {
+        if (!(m_objects_model->GetItemType(item) & itObject))
+            continue;
+        const int oi = m_objects_model->GetIdByItem(item);
+        if (oi >= 0 && oi < (int) m_objects->size())
+            obj_idxs.emplace_back(oi);
+    }
+    return obj_idxs;
+}
+
+bool ObjectList::can_split_objects()
+{
+    const std::vector<int> obj_idxs = selected_object_idxs();
+    if (obj_idxs.size() < 2)
+        return false;
+    for (const int oi : obj_idxs) {
+        const ModelObject* mo = (*m_objects)[oi];
+        if (mo->volumes.size() > 1)
+            return true;
+        if (mo->volumes.size() == 1 && mo->volumes[0]->is_splittable())
+            return true;
+    }
+    return false;
+}
+
+void ObjectList::split_objects()
+{
+    // Snapshot the target identities up front: splitting an object removes it and appends its products,
+    // which shifts object indices, so we re-resolve each target's current index by ObjectID per pass.
+    std::vector<ObjectID> targets;
+    for (const int oi : selected_object_idxs())
+        targets.emplace_back((*m_objects)[oi]->id());
+    if (targets.empty())
+        return;
+    wxBusyCursor cursor;
+    for (const ObjectID id : targets) {
+        int obj_idx = -1;
+        for (int i = 0; i < (int) m_objects->size(); ++i)
+            if ((*m_objects)[i]->id() == id) { obj_idx = i; break; }
+        if (obj_idx < 0)
+            continue;
+        // split_object(mo) resolves the index by pointer, so it is not fooled by the multi-selection.
+        // We still select this single object first because a single-volume object's color-preserving
+        // split path (split_volume() -> ObjectList::split()) operates on the current list selection.
+        select_item(m_objects_model->GetItemById(obj_idx));
+        wxGetApp().plater()->split_object((*m_objects)[obj_idx],true);
+    }
 }
 
 bool ObjectList::selected_instances_of_same_object()
@@ -3876,7 +4191,7 @@ void ObjectList::part_selection_changed()
                     }
                     else if (parent_type & itVolume) {
                         og_name   = _L("Part Settings to modify");
-                        volume_id = m_objects_model->GetVolumeIdByItem(parent);
+                        volume_id = m_objects_model->get_real_volume_index_in_3d(obj_idx, m_objects_model->GetVolumeIdByItem(parent));
                         m_config = &(*m_objects)[obj_idx]->volumes[volume_id]->config;
                     }
                     else if (parent_type & itLayer) {
@@ -3887,7 +4202,7 @@ void ObjectList::part_selection_changed()
                 }
                 else if (type & itVolume) {
                     og_name = _L("Part manipulation");
-                    volume_id = m_objects_model->GetVolumeIdByItem(item);
+                    volume_id = m_objects_model->get_real_volume_index_in_3d(obj_idx, m_objects_model->GetVolumeIdByItem(item));
                     m_config = &(*m_objects)[obj_idx]->volumes[volume_id]->config;
                     update_and_show_manipulations = true;
                     m_config = &(*m_objects)[obj_idx]->volumes[volume_id]->config;
@@ -4442,6 +4757,10 @@ void ObjectList::delete_from_model_and_list(const ItemType type, const int obj_i
 
         type == itVolume ? delete_volume_from_list(obj_idx, sub_obj_idx) :
             delete_instance_from_list(obj_idx, sub_obj_idx);
+
+        // BBS: if that was the object's last solid part, drop the whole object (see del_subobject_item)
+        if (type == itVolume)
+            del_object_if_no_solid_part(obj_idx);
     }
 }
 
@@ -4455,6 +4774,7 @@ void ObjectList::delete_from_model_and_list(const std::vector<ItemForDelete>& it
     bool need_update = false;
 
     std::set<size_t> modified_objects_ids;
+    std::set<ModelObject*> orphan_objects;
     for (std::vector<ItemForDelete>::const_reverse_iterator item = items_for_delete.rbegin(); item != items_for_delete.rend(); ++item) {
         if (!(item->type&(itObject | itVolume | itInstance)))
             continue;
@@ -4476,10 +4796,12 @@ void ObjectList::delete_from_model_and_list(const std::vector<ItemForDelete>& it
             }
         }
         else {
+            // sub_obj_idx of a volume is the index in ModelObject::volumes, while the list skips cut connectors
+            const int ui_vol_idx = (item->type & itVolume) ? m_objects_model->get_real_volume_index_in_ui(item->obj_idx, item->sub_obj_idx) : -1;
             if (!del_subobject_from_object(item->obj_idx, item->sub_obj_idx, item->type))
                 return; //continue;
             if (item->type&itVolume) {
-                m_objects_model->Delete(m_objects_model->GetItemByVolumeId(item->obj_idx, item->sub_obj_idx));
+                m_objects_model->Delete(m_objects_model->GetItemByVolumeId(item->obj_idx, ui_vol_idx));
                 // BBS
 #if 0
                 ModelObject* obj = object(item->obj_idx);
@@ -4494,6 +4816,11 @@ void ObjectList::delete_from_model_and_list(const std::vector<ItemForDelete>& it
                 }
 #endif
                 wxGetApp().plater()->canvas3D()->ensure_on_bed(item->obj_idx, printer_technology() != ptSLA);
+
+                // BBS: an object that lost its last solid part has no printable geometry; note it
+                // and remove it after the loop so index shifts don't corrupt this iteration.
+                if (ModelObject *mo = object(item->obj_idx); mo && !mo->is_cut() && !object_has_solid_part(mo))
+                    orphan_objects.insert(mo);
             }
             else
                 m_objects_model->Delete(m_objects_model->GetItemByInstanceId(item->obj_idx, item->sub_obj_idx));
@@ -4508,11 +4835,37 @@ void ObjectList::delete_from_model_and_list(const std::vector<ItemForDelete>& it
     }
 
     for (size_t id : modified_objects_ids) {
+        update_ui_and_3d_volume_map(int(id));
         update_info_items(id);
+    }
+
+    // BBS: remove objects whose last solid part was just deleted (only negative / modifier
+    // volumes remain). Delete by pointer since removing an object shifts the list indices.
+    for (ModelObject *mo : orphan_objects) {
+        int idx = -1;
+        for (int i = 0; i < int(m_objects->size()); ++i)
+            if ((*m_objects)[i] == mo) { idx = i; break; }
+        del_object_if_no_solid_part(idx);
     }
 
     m_prevent_list_events = true;
     part_selection_changed();
+}
+
+void ObjectList::update_ui_and_3d_volume_map(const int obj_idx)
+{
+    auto &volume_maps = m_objects_model->get_ui_and_3d_volume_map();
+    volume_maps.erase(obj_idx);
+    if (obj_idx < 0 || obj_idx >= int(m_objects->size()))
+        return;
+
+    const ModelObject *object = (*m_objects)[obj_idx];
+    int ui_volume_idx = 0;
+    for (int volume_idx = 0; volume_idx < int(object->volumes.size()); ++volume_idx) {
+        if (object->is_cut() && object->volumes[volume_idx]->is_cut_connector())
+            continue;
+        volume_maps[obj_idx][ui_volume_idx++] = volume_idx;
+    }
 }
 
 void ObjectList::update_lock_icons_for_model()
@@ -4970,6 +5323,23 @@ int ObjectList::get_selected_layers_range_idx() const
     return m_objects_model->GetLayerIdByItem(type & itLayer ? item : m_objects_model->GetParent(item));
 }
 
+bool ObjectList::resolve_prepare_object_volume_idx(int& obj_idx, int& vol_idx, const GLVolume* assembly_gl_volume,
+                                                   const Model& assemble_model, Selection& prepare_selection) const
+{
+    if (assembly_gl_volume == nullptr)
+        return false;
+    const int real_idx = prepare_selection.query_real_volume_idx_from_other_model_volume(
+        assembly_gl_volume, assemble_model, /*use_assembly_src_guid*/ true);
+    if (real_idx < 0)
+        return false;
+    const GLVolume* prepare_vol = prepare_selection.get_volume((unsigned int) real_idx);
+    if (prepare_vol == nullptr)
+        return false;
+    obj_idx = prepare_vol->object_idx();
+    vol_idx = prepare_vol->volume_idx();
+    return true;
+}
+
 void ObjectList::update_selections()
 {
     const Selection& selection = scene_selection();
@@ -5090,6 +5460,12 @@ void ObjectList::update_selections()
             }
         }
         else {
+        // In the assembly view the scene selection belongs to the independent assembly model, but this
+        // ObjectList is bound to the prepare model. Map each assembly GLVolume back to its prepare-side
+        // part by stable guid (assembly_src_guid -> prepare part_guid) so the correct list row is picked.
+        const bool from_assemble = wxGetApp().plater()->get_current_canvas3D()->get_canvas_type() == GLCanvas3D::ECanvasType::CanvasAssembleView;
+        const Model* assemble_model = from_assemble ? selection.get_model() : nullptr;
+        Selection& prepare_selection = wxGetApp().plater()->get_view3D_canvas3D()->get_selection();
         for (auto idx : selection.get_volume_idxs()) {
             const auto gl_vol = selection.get_volume(idx);
             if (gl_vol->volume_idx() >= 0) {
@@ -5098,8 +5474,13 @@ void ObjectList::update_selections()
                 // (for example, SLA supports or SLA pad).
                 int obj_idx = gl_vol->object_idx();
                 int vol_idx = gl_vol->volume_idx();
+                if (from_assemble && assemble_model != nullptr) {
+                    if (!resolve_prepare_object_volume_idx(obj_idx, vol_idx, gl_vol, *assemble_model, prepare_selection))
+                        continue; // part split / combined on the prepare side: no prepare row to select.
+                }
                 assert(obj_idx >= 0 && vol_idx >= 0);
-                if (object(obj_idx)->volumes[vol_idx]->is_cut_connector())
+                auto mo = object(obj_idx);
+                if (mo && mo->volumes[vol_idx]->is_cut_connector())
                     sels.Add(m_objects_model->GetInfoItemByType(m_objects_model->GetItemById(obj_idx), InfoItemType::CutConnectors));
                 else {
                     vol_idx = m_objects_model->get_real_volume_index_in_ui(obj_idx,vol_idx);
@@ -6248,10 +6629,6 @@ void ObjectList::fix_through_netfabb()
     if (!wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().check_gizmos_closed_except(GLGizmosManager::Undefined))
         return;
 
-    // BBS: repair rebuilds the mesh; warn that painting is transferred approximately.
-    if (!wxGetApp().confirm_mesh_paint_warning())
-        return;
-
     //          model_name
     std::vector<std::string>                           succes_models;
     //                   model_name     failing reason
@@ -6287,6 +6664,32 @@ void ObjectList::fix_through_netfabb()
         }
     }
 
+    // BBS: repair rebuilds the mesh; painting is transferred approximately.
+    // Only warn about it when the models actually being repaired carry painted
+    // color/support/seam/fuzzy-skin data.
+    bool has_paint = false;
+    if (vol_idxs.empty()) {
+        for (int obj_idx : obj_idxs) {
+            const ModelObject *o = object(obj_idx);
+            if (o && (o->is_mm_painted() || o->is_fuzzy_skin_painted() ||
+                      o->is_fdm_support_painted() || o->is_seam_painted())) {
+                has_paint = true;
+                break;
+            }
+        }
+    } else if (const ModelObject *o = object(obj_idxs.front())) {
+        for (int vol_idx : vol_idxs) {
+            const ModelVolume *v = o->volumes[vol_idx];
+            if (v && (v->is_mm_painted() || v->is_fuzzy_skin_facets_painted() ||
+                      v->is_fdm_support_painted() || v->is_seam_painted())) {
+                has_paint = true;
+                break;
+            }
+        }
+    }
+    if (has_paint && !wxGetApp().confirm_mesh_paint_warning())
+        return;
+
     auto plater = wxGetApp().plater();
 
     auto fix_and_update_progress = [this, plater, model_names](const int obj_idx, const int vol_idx,
@@ -6299,15 +6702,9 @@ void ObjectList::fix_through_netfabb()
             return false;
 
         const std::string& model_name = model_names[model_idx];
-        wxString msg = _L("Repairing model object");
-        if (model_names.size() == 1)
-            msg += ": " + from_u8(model_name) + "\n";
-        else {
-            msg += ":\n";
-            for (int i = 0; i < int(model_names.size()); ++i)
-                msg += (i == model_idx ? " > " : "   ") + from_u8(model_names[i]) + "\n";
-            msg += "\n";
-        }
+        wxString msg = wxString::Format(_L("Repair object: %s"), from_u8(model_name));
+        if (model_names.size() > 1)
+            msg += wxString::Format(" (%d/%d)", model_idx + 1, int(model_names.size()));
 
         // BBS: do NOT wipe painting here; the repair below re-projects it
         // (best-effort) via set_mesh_keep_paint instead.
@@ -6337,7 +6734,7 @@ void ObjectList::fix_through_netfabb()
 
     // Open a progress dialog.
     ProgressDialog progress_dlg(_L("Repairing model object"), "", 100, find_toplevel_parent(plater),
-                                    wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
+                                    wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_SHOW_PERCENT);
     int model_idx{ 0 };
     if (vol_idxs.empty()) {
         int vol_idx{ -1 };
@@ -6409,6 +6806,8 @@ void GUI::ObjectList::smooth_mesh()
     plater->take_snapshot("smooth_mesh");
     std::vector<int> obj_idxs, vol_idxs;
     get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.empty())
+        return;
     auto object_idx = obj_idxs.front();
     ModelObject *obj{nullptr};
     auto show_warning_dlg = [this](int cur_face_count,std::string name,bool is_part) {
@@ -6433,6 +6832,8 @@ void GUI::ObjectList::smooth_mesh()
     bool has_show_smooth_mesh_error_dlg = false;
     if (vol_idxs.empty()) {
         obj        = object(object_idx);
+        if (!obj)
+            return;
         auto             future_face_count = static_cast<int>(obj->facets_count()) * 4;
         if (show_warning_dlg(future_face_count, obj->name,false)) {
             return;
@@ -6458,6 +6859,8 @@ void GUI::ObjectList::smooth_mesh()
         plater->changed_mesh(object_idx);
     } else {
         obj = object(obj_idxs.front());
+        if (!obj)
+            return;
         for (int vol_idx : vol_idxs) {
             auto mv = obj->volumes[vol_idx];
             auto future_face_count = static_cast<int>(mv->mesh().facets_count()) * 4;
@@ -6780,6 +7183,13 @@ void ObjectList::set_extruder_for_selected_items(const int extruder)
     wxGetApp().plater()->get_partplate_list().reset_thumbnail_assembly_view_data();
     wxGetApp().plater()->update();
 
+    // The flagged-slot notifications only name slots the current plate actually prints with, so the
+    // answer changes the moment an object is pointed at a different one. Nothing here went through
+    // object_list_changed(), which is where that refresh normally hangs, so the message stayed as it
+    // was until the next plate switch. Re-running it is cheap: with no flagged slot it does nothing,
+    // and it only pushes when the resulting text differs from what is already on screen.
+    wxGetApp().plater()->sidebar().update_incompatible_nozzle_notifications();
+
     // BBS: update extruder/filament column
     Refresh();
 }
@@ -6994,7 +7404,7 @@ void ObjectList::enable_layers_editing()
 
 ModelObject* ObjectList::object(const int obj_idx) const
 {
-    if (obj_idx < 0)
+    if (obj_idx < 0 || obj_idx >= (*m_objects).size())
         return nullptr;
 
     return (*m_objects)[obj_idx];

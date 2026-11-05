@@ -6,7 +6,7 @@
     "filament_id": "GFA18",
     "instantiation": "false",
     "filament_cost": [
-        "0"
+        "18.99"
     ],
     "filament_density": [
         "1.40"
@@ -23,11 +23,11 @@
     "filament_scarf_height": [
         "5%"
     ],
-    "filament_scarf_seam_type": [
-        "none"
-    ],
     "filament_vendor": [
         "Bambu Lab"
+    ],
+    "fins_extrude_safe_temp": [
+        "57"
     ],
     "impact_strength_z": [
         "6.6"

@@ -1,8 +1,6 @@
 #ifndef slic3r_GUI_ObjectDataViewModel_hpp_
 #define slic3r_GUI_ObjectDataViewModel_hpp_
 
-#include <boost/log/trivial.hpp>
-
 #include <wx/dataview.h>
 #include <vector>
 #include <map>
@@ -303,7 +301,9 @@ public:
     void        set_extruder_icon();
 	// Set printable icon for node
     void        set_printable_icon(PrintIndicator printable);
-    void        set_variable_height_icon(VaryHeightIndicator vari_height);
+    // Updates the variable-height icon. Returns true only when the state actually
+    // changed, so callers can skip the expensive ItemChanged/redraw when it did not.
+    bool        set_variable_height_icon(VaryHeightIndicator vari_height);
     void        set_action_icon(bool enable);
     // BBS
     void        set_color_icon(bool enable, bool force = false);

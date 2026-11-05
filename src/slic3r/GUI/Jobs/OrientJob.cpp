@@ -6,6 +6,7 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Log.hpp"
 
 
 namespace Slic3r { namespace GUI {
@@ -106,7 +107,7 @@ void OrientJob::prepare_partplate() {
     if (plate->empty())
     {
         //no instances on this plate
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": no instances in current plate!");
+        BOOST_LOG_TRIVIAL(info) << boost::format("no instances in current plate!");
 
         return;
     }
@@ -155,6 +156,7 @@ void OrientJob::on_exception(const std::exception_ptr &eptr)
         if (eptr)
             std::rethrow_exception(eptr);
     } catch (std::exception &) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
         PlaterJob::on_exception(eptr);
     }
 }
@@ -164,11 +166,11 @@ void OrientJob::process()
     auto start = std::chrono::steady_clock::now();
     static const auto arrangestr = _(L("Orienting..."));
 
-    const GLCanvas3D::OrientSettings& settings = m_plater->canvas3D()->get_orient_settings();
+    const bool min_area = m_plater->get_orient_min_area();
 
     orientation::OrientParams params;
     orientation::OrientParamsArea params_area;
-    if (settings.min_area) {
+    if (min_area) {
         memcpy(&params, &params_area, sizeof(params));
         params.min_volume = false;
     }

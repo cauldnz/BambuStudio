@@ -11,6 +11,7 @@
 #include <GL/glew.h>
 
 #include <wx/utils.h>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -37,7 +38,7 @@ GLGizmoMove3D::GLGizmoMove3D(GLCanvas3D& parent, unsigned int sprite_id, GizmoOb
         float value                             = std::stof(wxGetApp().app_config->get("grabber_size_factor"));
         GLGizmoBase::Grabber::GrabberSizeFactor = value;
     } catch (const std::invalid_argument &e) {
-        BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << e.what();
+        BOOST_LOG_TRIVIAL(trace) << e.what();
         GLGizmoBase::Grabber::GrabberSizeFactor = 1.0f;
     }
 }
@@ -146,7 +147,8 @@ std::string GLGizmoMove3D::on_get_name() const
 bool GLGizmoMove3D::on_is_activable() const
 {
     const Selection &selection = m_parent.get_selection();
-    return !selection.is_any_cut_volume() && !selection.is_any_connector() && !selection.is_empty();
+    return !selection.is_any_cut_volume() && !selection.is_any_connector() && !selection.is_empty()
+        && m_parent.is_allow_gizmo_active();
 }
 
 void GLGizmoMove3D::on_set_state() {
@@ -243,7 +245,7 @@ void GLGizmoMove3D::on_render()
                         else
                             cur_box = mo->bounding_box();
                     } else {
-                        BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << " error:get ModelObject box fail";
+                        BOOST_LOG_TRIVIAL(trace) << "error:get ModelObject box fail";
                     }
                 }
                 m_object_manipulation->get_alignment_helper()->set_parent_box(cur_box);

@@ -3,8 +3,8 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
 
-#include <boost/log/trivial.hpp>
 #include <thread>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -27,6 +27,7 @@ nlohmann::json parse_json_response(const std::string& resp_body)
     try {
         return nlohmann::json::parse(resp_body);
     } catch (const std::exception&) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
         return nlohmann::json{{"raw", resp_body}};
     }
 }
@@ -40,6 +41,7 @@ int parse_int(const std::map<std::string, std::string>& query, const std::string
     try {
         return std::stoi(it->second);
     } catch (const std::exception&) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
         return default_value;
     }
 }
@@ -143,6 +145,7 @@ void wgtFilaManagerCloudClient::update_spool(
     try {
         request_body["id"] = std::stoll(id);
     } catch (const std::exception&) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
         // spool_id 不可解析为 int64 时保持字符串形式交给 server，让服务端回
         // 具体的 400 校验错误（而不是本地吞掉），便于排查。
         request_body["id"] = id;
@@ -243,6 +246,66 @@ void wgtFilaManagerCloudClient::get_filament_config(SuccessFn on_ok, ErrorFn on_
                            },
                            std::move(on_ok),
                            std::move(on_err));
+}
+
+void wgtFilaManagerCloudClient::sync_ams(
+    BBL::AmsSyncParams params, SuccessFn on_ok, ErrorFn on_err)
+{
+    if (!check_login(on_err)) return;
+
+    dispatch_agent_request("sync_ams",
+                           {{"method", "POST"}, {"dev_id", params.devId},
+                            {"item_count", (int) params.items.size()}},
+                           [params = std::move(params)](NetworkAgent* agent,
+                                                        std::string& response_body) mutable {
+                               return agent->sync_ams_filaments(params, &response_body);
+                           },
+                           std::move(on_ok), std::move(on_err));
+}
+
+void wgtFilaManagerCloudClient::sync_slot_mappings(
+    BBL::SlotMappingsSyncParams params, SuccessFn on_ok, ErrorFn on_err)
+{
+    if (!check_login(on_err)) return;
+
+    dispatch_agent_request("sync_slot_mappings",
+                           {{"method", "POST"}, {"dev_id", params.devId},
+                            {"mapping_count", (int) params.mappings.size()}},
+                           [params = std::move(params)](NetworkAgent* agent,
+                                                        std::string& response_body) mutable {
+                               return agent->sync_slot_mappings(params, &response_body);
+                           },
+                           std::move(on_ok), std::move(on_err));
+}
+
+void wgtFilaManagerCloudClient::get_soft_match_pending(
+    BBL::SoftMatchPendingParams params, SuccessFn on_ok, ErrorFn on_err)
+{
+    if (!check_login(on_err)) return;
+
+    dispatch_agent_request("get_soft_match_pending",
+                           {{"method", "GET"}, {"devId", params.devId}, {"amsSn", params.amsSn}},
+                           [params = std::move(params)](NetworkAgent* agent,
+                                                        std::string& response_body) mutable {
+                               return agent->get_soft_match_pending(params, &response_body);
+                           },
+                           std::move(on_ok), std::move(on_err));
+}
+
+void wgtFilaManagerCloudClient::post_soft_match_pending(
+    BBL::SoftMatchPendingActionParams params, SuccessFn on_ok, ErrorFn on_err)
+{
+    if (!check_login(on_err)) return;
+
+    dispatch_agent_request("post_soft_match_pending",
+                           {{"method", "POST"}, {"action", params.action},
+                            {"spoolId", params.spoolId},
+                            {"targetSpoolId", params.targetSpoolId}},
+                           [params = std::move(params)](NetworkAgent* agent,
+                                                        std::string& response_body) mutable {
+                               return agent->post_soft_match_pending(params, &response_body);
+                           },
+                           std::move(on_ok), std::move(on_err));
 }
 
 }} // namespace Slic3r::GUI

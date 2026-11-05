@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <vector>
+#include <cstdint>
 
 extern std::string g_log_folder;
 extern std::string g_log_start_time;
@@ -43,6 +44,38 @@ namespace BBL {
 #define BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED        -29
 #define BAMBU_NETWORK_ERR_DELETE_FILAMENT_FAILED        -30
 #define BAMBU_NETWORK_ERR_GET_FILAMENT_CONFIG_FAILED    -31
+#define BAMBU_NETWORK_ERR_AMS_SYNC_FAILED               -32
+#define BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED     -33
+#define BAMBU_NETWORK_ERR_GET_SOFT_MATCH_PENDING_FAILED -34
+#define BAMBU_NETWORK_ERR_POST_SOFT_MATCH_PENDING_FAILED -35
+#define BAMBU_NETWORK_ERR_CREATE_PRINT_QUEUE_PROJECT_FAILED       -36
+#define BAMBU_NETWORK_ERR_GET_PRINT_QUEUE_PROJECTS_FAILED         -37
+#define BAMBU_NETWORK_ERR_UPDATE_PRINT_QUEUE_PROJECT_FAILED       -38
+#define BAMBU_NETWORK_ERR_SORT_PRINT_QUEUE_PROJECT_FAILED         -39
+#define BAMBU_NETWORK_ERR_DELETE_PRINT_QUEUE_PROJECT_FAILED       -40
+#define BAMBU_NETWORK_ERR_UPDATE_PRINT_QUEUE_PLATE_FAILED         -41
+#define BAMBU_NETWORK_ERR_SORT_PRINT_QUEUE_PLATE_FAILED           -42
+#define BAMBU_NETWORK_ERR_DELETE_PRINT_QUEUE_PLATE_FAILED         -43
+#define BAMBU_NETWORK_ERR_EXTRACT_PRINT_QUEUE_PLATE_FAILED        -44
+#define BAMBU_NETWORK_ERR_DELETE_UNAVAILABLE_PRINT_QUEUE_PLATES_FAILED -45
+#define BAMBU_NETWORK_ERR_GET_PRINT_QUEUE_MODEL_PROFILE_FAILED    -46
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_REQUEST_PROJECT_PROFILE_FAILED -47
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_CHECK_MD5_FAILED            -48
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_UPLOAD_CONFIG_FAILED        -49
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_PUT_NOTIFICATION_FAILED     -50
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_GET_NOTIFICATION_TIMEOUT    -51
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_GET_NOTIFICATION_FAILED     -52
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_FILE_NOT_EXIST              -53
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_GET_UPLOAD_URL_FAILED       -54
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_FILE_OVER_SIZE              -55
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_UPLOAD_ARCHIVE_FAILED       -56
+#define BAMBU_NETWORK_ERR_PRINT_QUEUE_PATCH_PROJECT_FAILED        -57
+#define BAMBU_NETWORK_ERR_DOWNLOAD_PRINT_QUEUE_CONFIG_FAILED      -58
+#define BAMBU_NETWORK_ERR_START_PRINT_QUEUE_TASK_FAILED           -59
+#define BAMBU_NETWORK_ERR_POST_DEVICE_REGION_FAILED               -60
+#define BAMBU_NETWORK_ERR_GET_MINORS_DECISIONS_FAILED             -61
+#define BAMBU_NETWORK_ERR_GET_CHILD_REGISTRATION_KEY_FAILED       -62
+
 
 //bind error
 #define BAMBU_NETWORK_ERR_BIND_CREATE_SOCKET_FAILED          -1010 //failed to create socket
@@ -103,7 +136,7 @@ namespace BBL {
 #define BAMBU_NETWORK_LIBRARY               "bambu_networking"
 #define BAMBU_NETWORK_AGENT_NAME            "bambu_network_agent"
 
-#define BAMBU_NETWORK_AGENT_VERSION         "02.08.00.53"
+#define BAMBU_NETWORK_AGENT_VERSION         "02.09.01.54"
 
 //iot preset type strings
 #define IOT_PRINTER_TYPE_STRING     "printer"
@@ -245,6 +278,8 @@ struct PrintParams {
     bool            task_ext_change_assist;
     bool            try_emmc_print;
     std::string     svc_context;
+    std::string     slicer_uid;
+    std::string     queue_plate_id;
 };
 
 struct TaskQueryParams
@@ -253,6 +288,102 @@ struct TaskQueryParams
     int status = 0;
     int offset = 0;
     int limit = 20;
+};
+
+// Queue record IDs are int64 so request payloads retain the service's numeric
+// project, plate, and profile ID types across the dynamic-library ABI.
+struct PrintQueuePlateCreateParams
+{
+    std::string title;
+    int64_t     design_id = 0;
+    int64_t     instance_id = 0;
+    std::string model_id;
+    int64_t     profile_id = 0;
+    int         plate_index = 0;
+    bool        include_source_ids = false;
+};
+
+struct PrintQueueProjectCreateParams
+{
+    std::string device_id;
+    std::string title;
+    std::string cover;
+    std::string mode = "cloud_file";
+    std::vector<PrintQueuePlateCreateParams> plates;
+};
+
+struct PrintQueueProjectsQueryParams
+{
+    std::string device_id;
+    std::string status;
+    int         offset = 0;
+    int         limit = 20;
+};
+
+struct PrintQueueProjectUpdateParams
+{
+    int64_t     project_id = 0;
+    std::string title;
+};
+
+struct PrintQueueProjectSortParams
+{
+    int64_t     project_id = 0;
+    int64_t     prev_project_id = 0;
+};
+
+struct PrintQueueProjectDeleteParams
+{
+    int64_t     project_id = 0;
+};
+
+struct PrintQueuePlateUpdateParams
+{
+    int64_t     plate_id = 0;
+    std::string title;
+};
+
+struct PrintQueuePlateSortParams
+{
+    int64_t     plate_id = 0;
+    int64_t     project_id = 0;
+    int64_t     prev_plate_id = 0;
+};
+
+struct PrintQueuePlateDeleteParams
+{
+    int64_t     plate_id = 0;
+};
+
+struct PrintQueuePlateExtractParams
+{
+    int64_t     plate_id = 0;
+    std::string title;
+    std::string cover;
+    int64_t     prev_project_id = 0;
+};
+
+struct PrintQueueUnavailablePlatesDeleteParams
+{
+    std::string device_id;
+};
+
+struct PrintQueueModelProfileQueryParams
+{
+    int64_t     profile_id = 0;
+    std::string model_id;
+};
+
+struct PrintQueueConfigDownloadParams
+{
+    std::string url;
+};
+
+struct PrintQueueTaskParams
+{
+    std::string model_id;
+    std::string profile_id;
+    PrintParams params;
 };
 
 struct FilamentQueryParams
@@ -269,6 +400,94 @@ struct FilamentDeleteParams
 {
     std::vector<std::string> ids;
     std::vector<std::string> rfids;
+};
+
+struct AmsSyncItem {
+    std::string RFID;
+    std::string filamentVendor;
+    std::string filamentType;
+    std::string filamentName;
+    std::string filamentId;
+    bool        isSupport      = false;
+    std::string color;
+    int         colorType      = 0;
+    std::vector<std::string> colors;
+    int         netWeight      = 0;
+    int         totalNetWeight = 0;
+    std::string trayIdName;
+    std::string note;
+    std::string amsSn;
+    std::string slotId;
+    int         amsId          = 0;
+    int         amsType        = 0;
+    bool        createNew      = false;
+};
+
+struct AmsSyncParams {
+    std::string              devId;
+    std::vector<AmsSyncItem> items;
+};
+
+struct SlotMappingItem {
+    std::string amsSn;
+    std::string slotId;
+    int         spoolId  = 0;
+    std::string rfid;
+    int         amsId    = 0;
+    int         amsType  = 0;
+};
+
+struct SlotMappingsSyncParams {
+    std::string                  devId;
+    std::vector<SlotMappingItem> mappings;
+};
+
+struct SoftMatchPendingParams {
+    std::string devId;
+    std::string amsSn;
+};
+
+struct SoftMatchPendingActionParams {
+    std::string action;
+    int         spoolId       = 0;
+    int         targetSpoolId = 0;
+};
+
+struct DeviceRegionParams {
+    std::string DeviceId;
+    std::string ClientType;
+    std::string country;
+    std::string XClientCountry;
+};
+
+enum class MinorDecision : int
+{
+    Allow   = 0,
+    Deny    = 1,
+    NeedIdv = 2,
+};
+
+// Scene codes accepted by bambu_network_get_minors_decisions.
+inline constexpr const char* MINORS_SCENE_STUDIO_LOGIN_VIA_EMAIL = "STUDIO_LOGIN_VIA_EMAIL"; // Studio email login
+inline constexpr const char* MINORS_SCENE_STUDIO_LOGIN_VIA_3P = "STUDIO_LOGIN_VIA_3P"; // Studio third-party login
+inline constexpr const char* MINORS_SCENE_JOIN_USER_EXPERIENCE_PROGRAM = "JOIN_USER_EXPERIENCE_PROGRAM"; // Join user experience program
+inline constexpr const char* MINORS_SCENE_REMOTE_CONTROL_PRINTER = "REMOTE_CONTROL_PRINTER"; // Remote printer control
+inline constexpr const char* MINORS_SCENE_ACCESS_MAKER_WORLD = "ACCESS_MAKER_WORLD"; // Access MakerWorld
+inline constexpr const char* MINORS_SCENE_ACCESS_MAKER_LAB = "ACCESS_MAKER_LAB"; // Access MakerLab
+inline constexpr const char* MINORS_SCENE_ACCESS_MAKER_SUPPLY = "ACCESS_MAKER_SUPPLY"; // Access MakerSupply
+inline constexpr const char* MINORS_SCENE_FORUM_LOGIN_VIA_EMAIL = "FORUM_LOGIN_VIA_EMAIL"; // Forum email login
+inline constexpr const char* MINORS_SCENE_FORUM_LOGIN_VIA_3P = "FORUM_LOGIN_VIA_3P"; // Forum third-party login
+
+// Possible values of MinorsDecisionResult::family_link_decision.
+inline constexpr const char* FAMILY_LINK_DECISION_NO_CONFIG = "no_config";
+inline constexpr const char* FAMILY_LINK_DECISION_ALLOW = "allow";
+inline constexpr const char* FAMILY_LINK_DECISION_DENY = "deny";
+
+struct MinorsDecisionResult {
+    std::string   scene_code;
+    bool          family_link_enable = false;
+    std::string   family_link_decision;
+    MinorDecision decision = MinorDecision::NeedIdv;
 };
 
 struct PublishParams {

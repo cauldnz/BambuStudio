@@ -245,13 +245,6 @@
         "200",
         "200"
     ],
-    "top_solid_infill_flow_ratio": [
-        "1",
-        "1",
-        "1",
-        "1",
-        "1"
-    ],
     "travel_acceleration": [
         "10000",
         "10000",
@@ -279,6 +272,13 @@
         "2000",
         "2000",
         "2000"
+    ],
+    "top_solid_infill_flow_ratio": [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1"
     ],
     "travel_speed_z": [
         "0",

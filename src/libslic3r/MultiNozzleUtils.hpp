@@ -9,6 +9,8 @@
 
 namespace Slic3r {
 struct FilamentInfo;
+struct GCodeProcessorResult;
+class DynamicPrintConfig;
 namespace MultiNozzleUtils {
 
 // 存储单个喷嘴的信息
@@ -18,6 +20,7 @@ struct NozzleInfo
     NozzleVolumeType volume_type;
     int              extruder_id{-1}; // 逻辑挤出机id
     int              group_id{-1};   // 对应逻辑喷嘴id
+    bool             installed{true}; // false: physical slot has no nozzle (placeholder, never assigned)
 
     std::string serialize() const;
 
@@ -112,6 +115,7 @@ private:
     std::vector<int>                                   _default_filament_nozzle_map; // 默认映射，全局材料
     std::vector<unsigned int>                          _used_filaments; // 所有使用的材料idx
     std::vector<NozzleInfo>                            _nozzle_list; // 全局的喷嘴列表
+    bool handle_nozzle_as_extruder{ false };
 
 public:
     LayeredNozzleGroupResult(bool support_dynamic_map = false) : NozzleGroupResultBase(support_dynamic_map) {}
@@ -120,14 +124,16 @@ public:
     static std::optional<LayeredNozzleGroupResult> create(
         const std::vector<int>&          filament_nozzle_map,
         const std::vector<NozzleInfo>&   nozzle_list,
-        const std::vector<unsigned int>& used_filaments);
+        const std::vector<unsigned int>& used_filaments,
+        bool                             handle_nozzle_as_extruder = false);
 
     // 有选料器：从逐层映射构建（每层可能不同）
     static std::optional<LayeredNozzleGroupResult> create(
         const std::vector<std::vector<int>>&          layer_filament_nozzle_maps,
         const std::vector<NozzleInfo>&                nozzle_list,
         const std::vector<unsigned int>&              used_filaments,
-        const std::vector<std::vector<unsigned int>>& layer_filament_sequences);
+        const std::vector<std::vector<unsigned int>>& layer_filament_sequences,
+        bool                                          handle_nozzle_as_extruder = false);
 
     // O1C + 无选料器 + 命令行切片
     static std::optional<LayeredNozzleGroupResult> create(
@@ -136,7 +142,8 @@ public:
         const std::vector<int>&                             filament_volume_map,
         const std::vector<int>&                             filament_nozzle_map,
         const std::vector<std::map<NozzleVolumeType, int>>& nozzle_count,
-        float                                               diameter);
+        float                                               diameter,
+        bool                                                handle_nozzle_as_extruder = false);
 
     bool are_filaments_same_extruder(int filament_id1, int filament_id2, int layer_id = -1) const; // 判断两个材料是否处于同一个挤出机
     bool are_filaments_same_nozzle(int filament_id1, int filament_id2, int layer_id = -1) const; // 判断两个材料是否处于同一个喷嘴
@@ -166,6 +173,7 @@ public:
     const std::vector<int>& get_layer_filament_nozzle_map(int layer_id) const;
     const std::vector<std::vector<int>> &get_layer_filament_nozzle_maps() const { return _layer_filament_nozzle_maps; }
     const std::vector<std::vector<unsigned int>>& get_layer_filament_sequences() const { return _layer_filament_sequences; }
+    bool is_handle_nozzle_as_extruder() const { return handle_nozzle_as_extruder; }
 
     /**
      * @brief 预估给定序列的冲刷重量
@@ -273,6 +281,20 @@ std::vector<int> find_optimal_physical_assignment(
 std::vector<NozzleInfo> build_nozzle_list(std::vector<NozzleGroupInfo> info);
 std::vector<NozzleInfo> build_nozzle_list(double diameter, const std::vector<int>& filament_nozzle_map,
                                           const std::vector<int>& filament_volume_map, const std::vector<int>& filament_map);
+// Build the nozzle list from the per-slot params (extruder_nozzle_count / _volume_type / _diameter /
+// _slot): group_id == physical slot, empty slots become placeholders. Returns empty when the params
+// are absent or inconsistent (caller falls back).
+std::vector<NozzleInfo> build_nozzle_list_from_extruder_nozzles(const PrintConfig& print_config);
+// fmmNozzleManual 兼容：把旧“分组 key”形式的 filament_nozzle_map 转成后端使用的 nozzle_list 下标。
+// 同 key 的耗材共用一个喷嘴；新 key 取第一个 已安装、未占用、(挤出机+流量)兼容 的喷嘴。喷嘴表由
+// build_nozzle_list_from_extruder_nozzles 构建，下标与切片后端一致。若输入已是合法下标则原样返回
+// （幂等），因此仍须在整盘全集上调用（见 Print::resolve_manual_nozzle_map）。无法解析时返回空。
+std::vector<int> resolve_manual_nozzle_map_to_index(
+    const PrintConfig&               config,
+    const std::vector<unsigned int>& used_filaments,
+    const std::vector<int>&          filament_map_1based,
+    const std::vector<int>&          filament_volume_map,
+    const std::vector<int>&          filament_nozzle_key_map);
 // 从gcode.3mf中加载nozzle info需要处理前后兼容性
 std::vector<NozzleInfo> load_nozzle_infos_with_compatibility(
     const std::vector<NozzleInfo>& nozzle_infos,
@@ -281,6 +303,50 @@ std::vector<NozzleInfo> load_nozzle_infos_with_compatibility(
     const std::vector<NozzleVolumeType>& extruder_volume_types,
     const std::vector<double>& nozzle_diameter
 );
+
+// ==================== AMS 换料时间查表 ====================
+// Resolve load/unload for one AMS type. Returns true when both values come from the
+// AMS tables; false when legacy_load/legacy_unload are used (ams_type < 0 or OOR).
+// Shared by G-code time estimation and the mapped print-time recalc below.
+bool resolve_ams_load_unload(const std::vector<double>& loads,
+                             const std::vector<double>& unloads,
+                             int                        ams_type,
+                             float                      legacy_load,
+                             float                      legacy_unload,
+                             float&                     out_load,
+                             float&                     out_unload);
+
+// ==================== 按实际映射重算打印预估时间 ====================
+// Recalculate the estimated print time after the actual filament mapping is known.
+// The slicer accounts change time with a single AMS type; on the device pages the user
+// may map filaments to other AMS hardware types (including mixed AMS), so the screen
+// estimate can diverge from the Studio estimate. This differential recalc keeps the
+// print body time and only replaces the change-time portion.
+enum class FailReason {
+    Ok = 0,
+    UnsupportedTopology,
+    MissingSequence,
+    MissingTimeParams,
+    InvalidMapping,
+    InconsistentInput,
+};
+
+struct PrintTimeRecalcResult {
+    float      total_seconds{0.f};
+    float      gap_seconds{0.f};
+    FailReason reason{FailReason::Ok};
+};
+
+// Recalculate the total estimated print time from the slice result + printer config
+// (same preset used when slicing) and the actual per-filament AMS types.
+// actual_ams_type_per_filament: index == logical filament id, value == AmsTimeType
+// timing-vector index (external spool: 0, unused/unsupported: -1).
+// PartPlate is GUI-only — pass plate->get_slice_result() here; with a Preset pass &preset.config.
+// On reason != Ok the caller should fall back to the sliced total time.
+PrintTimeRecalcResult estimate_mapped_print_time(const GCodeProcessorResult* slice_result,
+                                                 const DynamicPrintConfig*   printer_config,
+                                                 const std::vector<int>&     actual_ams_type_per_filament);
+
 } // namespace MultiNozzleUtils
 } // namespace Slic3r
 

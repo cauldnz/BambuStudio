@@ -10,6 +10,7 @@
 #include "GUI_Preview.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
+#include "libslic3r/Log.hpp"
 
 // Forward declaration - function is defined in Plater.cpp
 namespace Slic3r {
@@ -216,7 +217,7 @@ void HelioStatementDialog::report_consent_install()
     std::string post_body_str = consent.dump();
 
     NetworkAgent* agent = GUI::wxGetApp().getAgent();
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "  client_id:" << wxGetApp().app_config->get("slicer_uuid") << "\nreport_consent:" << post_body_str;
+    BOOST_LOG_TRIVIAL(info) << "client_id:" << wxGetApp().app_config->get("slicer_uuid") << "\nreport_consent:" << post_body_str;
 
     if (agent && agent->is_user_login()) {
         agent->report_consent(post_body_str);
@@ -1698,12 +1699,15 @@ void HelioInputDialog::update_mode_card_styling(int selected_action)
     bool has_heated_chamber = false;
     if (!printer_name.empty()) {
         std::string target_lower = boost::to_lower_copy(printer_name);
-        for (const auto& p : HelioQuery::global_supported_printers) {
-            if (p.native_name.empty()) continue;
-            std::string native_lower = boost::to_lower_copy(p.native_name);
-            if (target_lower == native_lower || target_lower.find(native_lower) != std::string::npos) {
-                has_heated_chamber = p.heated_chamber;
-                break;
+        const auto supported_printers = HelioQuery::supported_data_view().printers;
+        if (supported_printers) {
+            for (const auto& p : *supported_printers) {
+                if (p.native_name.empty()) continue;
+                std::string native_lower = boost::to_lower_copy(p.native_name);
+                if (target_lower == native_lower || target_lower.find(native_lower) != std::string::npos) {
+                    has_heated_chamber = p.heated_chamber;
+                    break;
+                }
             }
         }
     }
@@ -2247,7 +2251,7 @@ void HelioInputDialog::update_action(int action)
         m_button_confirm->Enable();
         helio_wiki_link->setLinkUrl(wxGetApp().app_config->get("language") == "zh_CN" ? "https://wiki.helioadditive.com/zh/home" : "https://wiki.helioadditive.com/en/home");
 
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "  last simulation trace id:" << Slic3r::HelioQuery::last_simulation_trace_id;
+        BOOST_LOG_TRIVIAL(info) << "last simulation trace id:" << Slic3r::HelioQuery::last_simulation_trace_id;
 
         if (Slic3r::HelioQuery::last_simulation_trace_id.empty()) {
             last_tid_panel->Hide();
@@ -2429,9 +2433,11 @@ void HelioInputDialog::update_action(int action)
                 Fit();
             }
         }
-        catch (...){}
+        catch (...){
+            BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        }
 
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "  last optimization trace id:" << Slic3r::HelioQuery::last_optimization_trace_id;
+        BOOST_LOG_TRIVIAL(info) << "last optimization trace id:" << Slic3r::HelioQuery::last_optimization_trace_id;
 
         if (Slic3r::HelioQuery::last_optimization_trace_id.empty()) {
             last_tid_panel->Hide();
@@ -2787,7 +2793,7 @@ void HelioInputDialog::populate_print_priority_dropdown(ComboBox* combobox)
     // Clear global tooltip to allow per-item tooltips to display
     combobox->UnsetToolTip();
     } catch (const std::exception& e) {
-        BOOST_LOG_TRIVIAL(error) << "populate_print_priority_dropdown error: " << e.what();
+        BOOST_LOG_TRIVIAL(error) << "error: " << e.what();
         return;
     }
 }
@@ -2795,7 +2801,7 @@ void HelioInputDialog::populate_print_priority_dropdown(ComboBox* combobox)
 void HelioInputDialog::fetch_print_priority_options()
 {
     if (m_material_id.empty()) {
-        BOOST_LOG_TRIVIAL(warning) << "fetch_print_priority_options: material_id is empty, using fallback options";
+        BOOST_LOG_TRIVIAL(warning) << "material_id is empty, using fallback options";
         return;
     }
 
@@ -2815,7 +2821,7 @@ void HelioInputDialog::fetch_print_priority_options()
     std::string helio_api_key = HelioQuery::get_helio_pat();
 
     if (helio_api_key.empty()) {
-        BOOST_LOG_TRIVIAL(warning) << "fetch_print_priority_options: No API key, using fallback options";
+        BOOST_LOG_TRIVIAL(warning) << "No API key, using fallback options";
         m_print_priority_loading = false;
         update_print_priority_dropdown();
         return;
@@ -3794,9 +3800,20 @@ HelioSimulationResultsDialog::HelioSimulationResultsDialog(wxWindow *parent,
     m_button_enhance->Bind(wxEVT_LEFT_DOWN, &HelioSimulationResultsDialog::on_enhance_speed_quality, this);
     m_button_enhance->Bind(wxEVT_ENTER_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_HAND); });
     m_button_enhance->Bind(wxEVT_LEAVE_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_ARROW); });
+    wxStaticBitmap* save_icon = new wxStaticBitmap(this, wxID_ANY, create_scaled_bitmap("save", this, 24), wxDefaultPosition,
+        wxSize(FromDIP(24), FromDIP(24)));
+    save_icon->SetToolTip(_L("Save the simulated sliced 3MF locally"));
+    save_icon->Bind(wxEVT_ENTER_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_HAND); });
+    save_icon->Bind(wxEVT_LEAVE_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_ARROW); });
+    save_icon->Bind(wxEVT_LEFT_DOWN, [](wxMouseEvent& e) {
+        wxPostEvent(wxGetApp().plater(), SimpleEvent(EVT_GLTOOLBAR_EXPORT_SLICED_FILE));
+    });
+
 
     // Right-align the enhance button
     sizer_actions->Add(0, 0, 1, wxEXPAND, 0);
+    sizer_actions->Add(save_icon, 0, wxALIGN_CENTER, 0);
+    sizer_actions->Add(0, 0, 0, wxRIGHT, FromDIP(14));
     sizer_actions->Add(m_button_enhance, 0, wxALIGN_CENTER, 0);
 
     // Layout

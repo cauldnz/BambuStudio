@@ -25,6 +25,7 @@
 #include "FillConcentricInternal.hpp"
 #include "FillCrossHatch.hpp"
 #include "FillFloatingConcentric.hpp"
+#include "libslic3r/Log.hpp"
 
 // #define INFILL_DEBUG_OUTPUT
 
@@ -57,11 +58,15 @@ Fill* Fill::new_from_type(const InfillPattern type)
     case ipConcentricInternal:  return new FillConcentricInternal();
     // BBS: for bottom and top surface only
     case ipMonotonicLine:       return new FillMonotonicLineWGapFill();
+    case ipGlobalMonotonicLine: return new FillGlobalMonotonicLine();
     case ipZigZag:              return new FillZigZag();
     case ipCrossZag:            return new FillCrossZag();
     case ipFloatingConcentric:  return new FillFloatingConcentric();
     case ipLockedZag:           return new FillLockedZag();
     case ip2DLattice:           return new Fill2DLattice();
+    // Same filler as ipArchimedeanChords; the ironing specific lead-in and center-out ordering are
+    // selected by FillParams::extrusion_role inside FillPlanePath::_fill_surface_single().
+    case ipIroningArchimedeanSpiral: return new FillArchimedeanChords();
     default: throw Slic3r::InvalidArgument("unknown type");
     }
 }
@@ -203,7 +208,7 @@ std::pair<float, Point> Fill::_infill_direction(const Surface *surface) const
 
 	if (out_angle == FLT_MAX) {
 		//FIXME Vojtech: Add a warning?
-        printf("Using undefined infill angle\n");
+        BOOST_LOG_TRIVIAL(warning) << "Using undefined infill angle";
         out_angle = 0.f;
     }
 

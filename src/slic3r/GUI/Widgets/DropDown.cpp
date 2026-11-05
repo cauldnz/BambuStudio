@@ -1,6 +1,7 @@
 #include "DropDown.hpp"
 #include "Label.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <wx/display.h>
 #include <wx/dcbuffer.h>
@@ -56,12 +57,13 @@ void DropDown::Create(wxWindow *parent, long style)
 {
     PopupWindow::Create(parent, wxPU_CONTAINS_CONTROLS);
     SetBackgroundStyle(wxBG_STYLE_PAINT);
-    SetBackgroundColour(*wxWHITE);
+    SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
     state_handler.attach({&border_color, &text_color, &selector_border_color, &selector_background_color});
     state_handler.update_binds();
     if ((style & DD_NO_CHECK_ICON) == 0)
         check_bitmap = ScalableBitmap(this, "checked", 16);
     arrow_bitmap = ScalableBitmap(this, "hms_arrow", 16);
+    synced_bitmap = ScalableBitmap(this, "badge", 14);
     text_off = style & DD_NO_TEXT;
 
     // BBS set default font
@@ -155,6 +157,15 @@ void DropDown::SetUseContentWidth(bool use, bool limit_max_content_width)
 
 void DropDown::SetAlignIcon(bool align) { align_icon = align; }
 
+void DropDown::SetTrailingPadding(int padding)
+{
+    if (trailing_padding == padding)
+        return;
+    trailing_padding = padding;
+    need_sync = true;
+    messureSize();
+}
+
 void DropDown::Rescale()
 {
     need_sync = true;
@@ -206,8 +217,8 @@ static void _DrawSplitItem(const wxWindow* w, wxDC& dc, wxString split_text, wxP
     // save dc
     auto pre_clr = dc.GetTextForeground();
     auto pre_pen = dc.GetPen();
-    dc.SetTextForeground(wxColour(172, 172, 172));//GRAY 500
-    dc.SetPen(wxColour(166, 169, 170));//GRAY 400
+    dc.SetTextForeground(StateColor::darkModeColorFor(wxColour(172, 172, 172)));
+    dc.SetPen(StateColor::darkModeColorFor(wxColour(166, 169, 170)));
     // miner font
     auto font = w->GetFont();
     font.SetPointSize(font.GetPointSize() - 3);
@@ -273,7 +284,7 @@ void DropDown::render(wxDC &dc)
 
     // draw hover rectangle
     wxRect rcContent = {{0, offset.y}, rowSize};
-    if (hover_item >= 0 && (states & StateColor::Hovered) && (hover_index < 0 || !(items[hover_index].style & DD_ITEM_STYLE_SPLIT_ITEM))) {
+    if (hover_item >= 0 && (states & StateColor::Hovered) && (hover_index < 0 || !(items[hover_index].style & (DD_ITEM_STYLE_SPLIT_ITEM | DD_ITEM_STYLE_DISABLED)))) {
         rcContent.y += rowSize.y * hover_item;
         if (rcContent.GetBottom() > 0 && rcContent.y < size.y) {
             if (selected_item == hover_item)
@@ -330,6 +341,22 @@ void DropDown::render(wxDC &dc)
         rcContent.width -= szBmp.x + 5;
     }
 
+    const int suffix_pad = FromDIP(8);
+    int suffix_col = 0;
+    if (!text_off) {
+        dc.SetFont(::Label::Body_13);
+        for (const auto &item : items) {
+            if (item.suffix.IsEmpty() || (item.style & DD_ITEM_STYLE_SPLIT_ITEM))
+                continue;
+            suffix_col = std::max(suffix_col, dc.GetTextExtent(item.suffix).GetWidth());
+        }
+    }
+    dc.SetFont(GetFont());
+    const int suffix_gap = suffix_col > 0 ? FromDIP(12) : 0;
+    // The synced badge shares the row's right edge with the suffix, so the suffix column moves left
+    // of the badge on every row; this keeps suffixes aligned whether or not a row is synced.
+    const int suffix_badge_col = suffix_col > 0 ? synced_badge_width() : 0;
+
     std::set<wxString> groups;
     // draw texts & icons
     int index = 0;
@@ -346,15 +373,7 @@ void DropDown::render(wxDC &dc)
                     continue;
                 groups.insert(item.group);
                 if (!item.group.IsEmpty()) {
-                    bool disabled = true;
-                    for (int j = i + 1; j < items.size(); ++j) {
-                        if (items[i].group != item.group && (items[j].style & DD_ITEM_STYLE_DISABLED) == 0) {
-                            disabled = false;
-                            break;
-                        }
-                    }
-                    if (!disabled)
-                        states2 |= StateColor::Enabled;
+                    states2 |= StateColor::Enabled;
                 }
             }
         } else {
@@ -392,21 +411,50 @@ void DropDown::render(wxDC &dc)
             pt.x += size2.x + 5;
             pt.y = rcContent.y;
         }
+        // When the icon is a full-row pre-rendered bitmap (height >> text height),
+        // it already contains all text; skip drawing text on top to avoid duplicates.
+        const bool icon_fills_row = !is_top_level_group && icon.IsOk()
+                                    && size2.y > textSize.y * 2;
+        auto strip_brand_prefix = [](const wxString &text, const wxString &grp) -> wxString {
+            if (grp.EndsWith(' ')) return text;
+            wxString prefix = grp.BeforeFirst(' ');
+            if (prefix.IsEmpty()) prefix = grp;
+            if (text.StartsWith(prefix))
+                return text.substr(prefix.size()).Trim(false);
+            return text;
+        };
         auto text = group.IsEmpty()
                         ? (item.group.IsEmpty() ? item.text : item.group)
-                        : (item.text.StartsWith(group) && !group.EndsWith(' ') ? item.text.substr(group.size()).Trim(false) : item.text);
-        if (!text_off && !text.IsEmpty()) {
+                        : strip_brand_prefix(item.text, group);
+        if (!text_off && !text.IsEmpty() && !icon_fills_row) {
+            int text_right = rcContent.GetRight();
+            if (suffix_col > 0 && !item.suffix.IsEmpty())
+                text_right -= suffix_badge_col + suffix_col + suffix_gap + suffix_pad;
+            else if ((item.style & DD_ITEM_STYLE_SYNCED) != 0 && synced_bitmap.bmp().IsOk())
+                text_right -= synced_bitmap.GetBmpSize().x + 5;
             wxSize tSize = dc.GetMultiLineTextExtent(text);
-            if (pt.x + tSize.x > rcContent.GetRight()) {
+            if (pt.x + tSize.x > text_right) {
                 if (is_hover && item.tip.IsEmpty())
                     SetToolTip(text);
-                text = wxControl::Ellipsize(text, dc, wxELLIPSIZE_END,
-                                            rcContent.GetRight() - pt.x);
+                int avail = text_right - pt.x;
+                if (avail < FromDIP(20))
+                    avail = FromDIP(20);
+                text = wxControl::Ellipsize(text, dc, wxELLIPSIZE_END, avail);
             }
             pt.y += (rcContent.height - textSize.y) / 2;
             dc.SetFont(GetFont());
             dc.SetTextForeground(is_dimmed ? wxColour(0xCE, 0xCE, 0xCE) : text_color.colorForStates(states2));
             dc.DrawText(text, pt);
+            if (!item.suffix.IsEmpty()) {
+                dc.SetFont(::Label::Body_13);
+                const wxSize sSize = dc.GetTextExtent(item.suffix);
+                // Left edge of the shared column, so every suffix starts at the same x.
+                const int    sx    = rcContent.GetRight() - suffix_badge_col - suffix_pad - suffix_col;
+                const int    sy    = rcContent.y + (rcContent.height - sSize.GetHeight()) / 2;
+                dc.SetTextForeground(StateColor::darkModeColorFor(wxColour("#ACACAC")));
+                dc.DrawText(item.suffix, wxPoint(sx, sy));
+                dc.SetFont(GetFont());
+            }
             if (group.IsEmpty() && !item.group.IsEmpty()) {
                 auto szBmp = arrow_bitmap.GetBmpSize();
                 pt.x = rcContent.GetRight() - szBmp.x - 5;
@@ -414,16 +462,43 @@ void DropDown::render(wxDC &dc)
                 dc.DrawBitmap(arrow_bitmap.bmp(), pt);
             }
         }
+        if ((item.style & DD_ITEM_STYLE_SYNCED) != 0 && synced_bitmap.bmp().IsOk()) {
+            auto szBmp = synced_bitmap.GetBmpSize();
+            wxPoint ptBadge(rcContent.GetRight() - szBmp.x, rcContent.y + (rcContent.height - szBmp.y) / 2);
+            dc.DrawBitmap(synced_bitmap.bmp(), ptBadge);
+        }
         rcContent.y += rowSize.y;
     }
+}
+
+int DropDown::synced_badge_width() const
+{
+    if (!synced_bitmap.bmp().IsOk())
+        return 0;
+    for (const auto &item : items)
+        if ((item.style & DD_ITEM_STYLE_SYNCED) != 0)
+            return synced_bitmap.GetBmpSize().x + FromDIP(4);
+    return 0;
 }
 
 int DropDown::hoverIndex()
 {
     if (hover_item < 0)
         return -1;
-    if (count == items.size())
-        return hover_item;
+    if (count == items.size()) {
+        // Fast path assumes "count == items.size() implies no grouping folded any rows".
+        // That's true when items are truly flat, but a group with exactly one member
+        // makes count and items.size() coincide by accident — in that case we'd need to
+        // encode the group-header row as -i-2, not return it as a positive index. Only
+        // keep the shortcut when the top-level view actually has no group headers.
+        bool any_grouped_at_top_level = false;
+        if (group.IsEmpty()) {
+            for (const auto &item : items)
+                if (!item.group.IsEmpty()) { any_grouped_at_top_level = true; break; }
+        }
+        if (!any_grouped_at_top_level)
+            return hover_item;
+    }
     int index = -1;
     std::set<wxString> groups;
     for (int i = 0; i < items.size(); ++i) {
@@ -486,6 +561,7 @@ void DropDown::messureSize()
     count = 0;
     wxClientDC dc(GetParent() ? GetParent() : this);
     dc.SetFont(GetFont());
+    int suffix_col = 0;
     std::set<wxString> groups;
     for (size_t i = 0; i < items.size(); ++i) {
         auto &item = items[i];
@@ -504,9 +580,17 @@ void DropDown::messureSize()
         ++count;
         wxSize size1;
         if (!text_off) {
+            auto strip_brand_prefix = [](const wxString &text, const wxString &grp) -> wxString {
+                if (grp.EndsWith(' ')) return text;
+                wxString prefix = grp.BeforeFirst(' ');
+                if (prefix.IsEmpty()) prefix = grp;
+                if (text.StartsWith(prefix))
+                    return text.substr(prefix.size()).Trim(false);
+                return text;
+            };
             auto text = group.IsEmpty()
                         ? (item.group.IsEmpty() ? item.text : item.group)
-                        : (item.text.StartsWith(group) && !group.EndsWith(' ') ? item.text.substr(group.size()).Trim(false) : item.text);
+                        : strip_brand_prefix(item.text, group);
             size1 = dc.GetMultiLineTextExtent(text);
             if (group.IsEmpty() && !item.group.IsEmpty())
                 size1.x += 5 + arrow_bitmap.GetBmpWidth();
@@ -517,16 +601,27 @@ void DropDown::messureSize()
             if (size2.x > iconSize.x)
                 iconSize = size2;
             if (!align_icon) {
-                size1.x += size2.x + (text_off ? 0 : 5);
+                // Full-row bitmap (icon height >> text height): width = bitmap width only.
+                if (size2.y > size1.y * 2)
+                    size1.x = size2.x;
+                else
+                    size1.x += size2.x + (text_off ? 0 : 5);
             }
+        }
+        if (!is_top_level_group && !item.suffix.IsEmpty()) {
+            dc.SetFont(::Label::Body_13);
+            suffix_col = std::max(suffix_col, dc.GetTextExtent(item.suffix).GetWidth());
+            dc.SetFont(GetFont());
         }
         if (size1.x > textSize.x) textSize = size1;
     }
+    if (suffix_col > 0)
+        textSize.x += FromDIP(12) + suffix_col + FromDIP(8) + synced_badge_width();
     if (!align_icon) iconSize.x = 0;
     wxSize szContent = textSize;
     if (szContent.x < FromDIP(120))
         szContent.x = FromDIP(120);
-    szContent.x += 10;
+    szContent.x += 10 + FromDIP(trailing_padding);
     if (check_bitmap.bmp().IsOk()) {
         auto szBmp = check_bitmap.GetBmpSize();
         szContent.x += szBmp.x + 5;
@@ -534,7 +629,7 @@ void DropDown::messureSize()
     if (iconSize.x > 0) szContent.x += iconSize.x + (text_off ? 0 : 5);
     if (iconSize.y > szContent.y) szContent.y = iconSize.y;
     szContent.y += 10;
-    if (count > 15) szContent.x += 6;
+    if (count > (size_t)max_visible_rows) szContent.x += 6;
     if (GetParent() && group.IsEmpty()) {
         auto x = GetParent()->GetSize().x;
         if (x > 0 && (!use_content_width || x > szContent.x))
@@ -542,14 +637,17 @@ void DropDown::messureSize()
     }
     rowSize = szContent;
     if (limit_max_content_width) {
-        wxSize parent_size = GetParent()->GetSize();
-        if (rowSize.x > parent_size.x * 2) {
-            rowSize.x = 2 * parent_size.x;
-            szContent = rowSize;
+        // Fixed cap: a cap relative to the control cuts normal names in narrow controls,
+        // while very long user preset names still need a limit.
+        const int max_w = GetParent()->FromDIP(400);
+        if (rowSize.x > max_w) {
+            rowSize.x = max_w;
+            szContent  = rowSize;
         }
     }
-    szContent.y *= std::min((size_t) 15, std::max(count, (size_t) 1));
-    szContent.y += items.size() > 15 ? rowSize.y / 2 : 0;
+    fit_width = rowSize.x;
+    szContent.y *= std::min((size_t)max_visible_rows, std::max(count, (size_t) 1));
+    szContent.y += items.size() > (size_t)max_visible_rows ? rowSize.y / 2 : 0;
     wxWindow::SetSize(szContent);
 #ifdef __WXGTK__
     // Gtk has a wrapper window for popup widget
@@ -560,7 +658,9 @@ void DropDown::messureSize()
         subDropDown->mainDropDown = this;
         subDropDown->check_bitmap      = check_bitmap;
         subDropDown->text_off          = text_off;
-        subDropDown->use_content_width = true;
+        subDropDown->use_content_width       = true;
+        subDropDown->limit_max_content_width = true;
+        subDropDown->max_visible_rows        = 8;
         subDropDown->Create(GetParent());
         subDropDown->Bind(wxEVT_COMBOBOX, [this](wxCommandEvent &e) {
             e.SetEventObject(this);
@@ -596,9 +696,9 @@ void DropDown::autoPosition()
         pos = mainDropDown->ClientToScreen(wxPoint(0, 0));
         off = mainDropDown->GetSize();
         pos.x += 6;
-        pos.y += mainDropDown->hover_item * rowSize.y + rowSize.y + mainDropDown->offset.y;
+        pos.y += mainDropDown->hover_item * mainDropDown->rowSize.y + mainDropDown->offset.y;
         off.x -= 12;
-        off.y = -rowSize.y;
+        off.y = 0;
     } else {
         pos = GetParent()->ClientToScreen(wxPoint(0, 0));
         off = GetParent()->GetSize();
@@ -611,19 +711,20 @@ void DropDown::autoPosition()
     Position(pos, off);
     if (old != GetPosition()) {
         size = rowSize;
-        size.y *= std::min((size_t) 15, count);
-        size.y += count > 15 ? rowSize.y / 2 : 0;
+        size.y *= std::min((size_t)max_visible_rows, count);
+        size.y += count > (size_t)max_visible_rows ? rowSize.y / 2 : 0;
         if (size != GetSize()) {
             wxWindow::SetSize(size);
             offset = wxPoint();
             Position(pos, off);
         }
     }
+    fitWidthToDisplay(size);
     if (GetPosition().y > pos.y) {
         // may exceed
         auto drect = wxDisplay(GetParent()).GetGeometry();
         if (GetPosition().y + size.y + 10 > drect.GetBottom()) {
-            if (use_content_width && count <= 15) size.x += 6;
+            if (use_content_width && count <= (size_t)max_visible_rows) size.x += 6;
             size.y = drect.GetBottom() - GetPosition().y - 10;
             wxWindow::SetSize(size);
             if (selection >= 0) {
@@ -634,6 +735,22 @@ void DropDown::autoPosition()
             }
         }
     }
+}
+
+void DropDown::fitWidthToDisplay(wxSize &size)
+{
+    // The list and its group list sit side by side, and the group list moves to the left only
+    // when the left side has room, so the pair can pass the display right edge.
+    if (!use_content_width)
+        return;
+    const wxRect drect = wxDisplay(GetParent()).GetGeometry();
+    const int    avail = std::max(drect.GetRight() - GetPosition().x - 10, FromDIP(120));
+    const int    width = std::min(fit_width, avail);
+    if (width == rowSize.x)
+        return;
+    rowSize.x = width;
+    size.x    = width;
+    wxWindow::SetSize(size);
 }
 
 void DropDown::mouseDown(wxMouseEvent& event)
@@ -657,6 +774,27 @@ void DropDown::mouseReleased(wxMouseEvent& event)
             ReleaseMouse();
         if (hover_item < 0)
             return;
+
+        // If the clicked row is a top-level group header, open (or focus) the drill-down
+        // submenu instead of dismissing the dropdown. Previously this path only fired via
+        // hover in mouseMove — which is flaky for narrow (1-row) groups and unreachable
+        // via keyboard/tap. Clicking on the header is the natural UX for a two-level menu.
+        int idx = hoverIndex();
+        if (idx < -1 && subDropDown) {
+            const wxString &target_group = items[-idx - 2].group;
+            auto &drop = *subDropDown;
+            if (drop.group != target_group) {
+                drop.group     = target_group;
+                drop.need_sync = true;
+                drop.messureSize();
+                drop.autoPosition();
+                drop.paintNow();
+            }
+            if (!drop.IsShown())
+                drop.Popup(&drop);
+            return;
+        }
+
         if (hover_item >= 0 && (subDropDown == nullptr || subDropDown->group.empty())) { // not moved
             sendDropDownEvent();
             if (mainDropDown)
@@ -703,7 +841,7 @@ void DropDown::mouseMove(wxMouseEvent &event)
             return;
         }
     }
-    if (!pressedDown || hover_item >= 0) {
+    if (rowSize.y > 0 && (!pressedDown || hover_item >= 0)) {
         int hover = (pt.y - offset.y) / rowSize.y;
         if (hover >= (int) count) hover = -1;
         if (hover == hover_item) return;

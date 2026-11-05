@@ -39,7 +39,7 @@ bool StaticBox::Create(wxWindow* parent, wxWindowID id, const wxPoint& pos, cons
 {
     if (style & wxBORDER_NONE)
         border_width = 0;
-    wxWindow::Create(parent, id, pos, size, style);
+    wxWindow::Create(parent, id, pos, size, style | wxFULL_REPAINT_ON_RESIZE);
     state_handler.attach({&border_color, &background_color, &background_color2});
     state_handler.update_binds();
     SetBackgroundColour(GetParentBackgroundColor(parent));
@@ -120,8 +120,8 @@ wxColor StaticBox::GetParentBackgroundColor(wxWindow* parent)
 
 void StaticBox::ShowBadge(bool show)
 {
-    if (show && badge.name() != "badge") {
-        badge = ScalableBitmap(this, "badge", 18);
+    if (show && badge.name() != badge_icon_name) {
+        badge = ScalableBitmap(this, badge_icon_name, 18);
         Refresh();
     } else if (!show && !badge.name().empty()) {
         badge = ScalableBitmap {};

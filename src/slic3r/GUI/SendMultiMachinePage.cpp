@@ -9,6 +9,7 @@
 
 #include "DeviceCore/DevManager.h"
 #include "DeviceCore/DevStorage.h"
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -16,6 +17,7 @@ namespace GUI {
 #define MATERIAL_ITEM_SIZE wxSize(FromDIP(64), FromDIP(34))
 #define MATERIAL_ITEM_REAL_SIZE wxSize(FromDIP(62), FromDIP(32))
 #define MAPPING_ITEM_REAL_SIZE wxSize(FromDIP(48), FromDIP(45))
+static constexpr int INPUT_WIDTH = 50; // raw (pre-DPI) text-input width; wrap in FromDIP()
 WX_DEFINE_LIST(AmsRadioSelectorList);
 
 class ScrolledWindow : public wxScrolledWindow {
@@ -646,13 +648,15 @@ bool SendMultiMachinePage::get_ams_mapping_result(std::string &mapping_array_str
             if (curr_plate) {
                 filament_maps = curr_plate->get_filament_maps();
             } else {
-                BOOST_LOG_TRIVIAL(error) << "get_ams_mapping_result, curr_plate is nullptr";
+                BOOST_LOG_TRIVIAL(error) << "curr_plate is nullptr";
             }
         } else {
-            BOOST_LOG_TRIVIAL(error) << "get_ams_mapping_result, plater is nullptr";
+            BOOST_LOG_TRIVIAL(error) << "plater is nullptr";
         }
 
-        for (int i = 0; i < wxGetApp().preset_bundle->filament_presets.size(); i++) {
+        // Same physical-length cap as SelectMachineDialog::get_ams_mapping_result: mixed slots never carry a mapping.
+        const int mapping_count = std::min((int) wxGetApp().preset_bundle->filament_presets.size(), (int) MAX_PHYSICAL_FILAMENT_COUNT);
+        for (int i = 0; i < mapping_count; i++) {
             int  tray_id = -1;
             json mapping_item_v1;
             mapping_item_v1["ams_id"]  = 0xff;
@@ -794,7 +798,9 @@ void SendMultiMachinePage::on_send(wxCommandEvent& event)
            wxGetApp().getTaskManager()->start_print(print_params, &settings);
        }
        catch (...)
-       {}
+       {
+           BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+       }
     }
     //jump to info
     EndModal(wxCLOSE);
@@ -827,13 +833,13 @@ wxBoxSizer* SendMultiMachinePage::create_item_title(wxString title, wxWindow* pa
     wxBoxSizer* m_sizer_title = new wxBoxSizer(wxHORIZONTAL);
 
     auto m_title = new wxStaticText(parent, wxID_ANY, title, wxDefaultPosition, wxDefaultSize, 0);
-    m_title->SetForegroundColour(DESIGN_GRAY800_COLOR);
+    m_title->SetForegroundColour(ThemeColor::TextSecondary);
     m_title->SetFont(::Label::Head_13);
     m_title->Wrap(-1);
     m_title->SetToolTip(tooltip);
 
     auto m_line = new wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(-1, 1), wxTAB_TRAVERSAL);
-    m_line->SetBackgroundColour(DESIGN_GRAY400_COLOR);
+    m_line->SetBackgroundColour(ThemeColor::Grey450);
 
     m_sizer_title->Add(m_title, 0, wxALIGN_CENTER | wxALL, 3);
     m_sizer_title->Add(0, 0, 0, wxLEFT, 9);
@@ -856,7 +862,7 @@ wxBoxSizer* SendMultiMachinePage::create_item_checkbox(wxString title, wxWindow*
     m_sizer_checkbox->Add(0, 0, 0, wxEXPAND | wxLEFT, 8);
 
     auto checkbox_title = new wxStaticText(parent, wxID_ANY, title, wxDefaultPosition, wxDefaultSize, 0);
-    checkbox_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    checkbox_title->SetForegroundColour(ThemeColor::TextPrimary);
     checkbox_title->SetFont(::Label::Body_13);
 
     auto size = checkbox_title->GetTextExtent(title);
@@ -880,12 +886,12 @@ wxBoxSizer* SendMultiMachinePage::create_item_input(wxString str_before, wxStrin
 {
     wxBoxSizer* sizer_input = new wxBoxSizer(wxHORIZONTAL);
     auto input_title = new wxStaticText(parent, wxID_ANY, str_before);
-    input_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    input_title->SetForegroundColour(ThemeColor::TextPrimary);
     input_title->SetFont(::Label::Body_13);
     input_title->SetToolTip(tooltip);
     input_title->Wrap(-1);
 
-    auto input = new ::TextInput(parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
+    auto input = new ::TextInput(parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(INPUT_WIDTH), -1), wxTE_PROCESS_ENTER);
     StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
     input->SetBackgroundColor(input_bg);
     input->GetTextCtrl()->SetValue(app_config->get(param));
@@ -893,7 +899,7 @@ wxBoxSizer* SendMultiMachinePage::create_item_input(wxString str_before, wxStrin
     input->GetTextCtrl()->SetValidator(validator);
 
     auto second_title = new wxStaticText(parent, wxID_ANY, str_after, wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
-    second_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    second_title->SetForegroundColour(ThemeColor::TextPrimary);
     second_title->SetFont(::Label::Body_13);
     second_title->SetToolTip(tooltip);
     second_title->Wrap(-1);
@@ -1350,7 +1356,7 @@ wxPanel* SendMultiMachinePage::create_page()
     m_tip_text->SetMinSize(wxSize(FromDIP(DEVICE_ITEM_MAX_WIDTH), -1));
     m_tip_text->SetMaxSize(wxSize(FromDIP(DEVICE_ITEM_MAX_WIDTH), -1));
     m_tip_text->SetLabel(_L("Please select the devices you would like to manage here (up to 6 devices)"));
-    m_tip_text->SetForegroundColour(DESIGN_GRAY800_COLOR);
+    m_tip_text->SetForegroundColour(ThemeColor::TextSecondary);
     m_tip_text->SetFont(::Label::Head_20);
     m_tip_text->Wrap(-1);
 

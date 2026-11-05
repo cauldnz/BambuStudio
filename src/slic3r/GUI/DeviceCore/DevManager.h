@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <mutex>
 #include "libslic3r/CommonDefs.hpp"
 
@@ -48,6 +49,7 @@ public:
     MachineObject* get_local_selected_machine() const { return get_local_machine(local_selected_machine); }
 
     // local machine list
+    void remove_local_machine_for_cloud_mode(const std::string& dev_id, const char* source);
     void erase_local_machine(std::string dev_id) { localMachineList.erase(dev_id); }
     std::map<std::string, MachineObject*> get_local_machinelist() const { return localMachineList; }
     MachineObject* get_local_machine(std::string dev_id) const
@@ -66,8 +68,8 @@ public:
     void record_user_last_machine(const std::string& dev_id);
     std::string get_user_last_machine() const;
 
-    void update_user_machine_list_info();
-    void parse_user_print_info(std::string body);
+    void update_user_machine_list_info(std::function<void(bool)> on_completed = {});
+    bool parse_user_print_info(std::string body);
     void reload_printer_settings();
 
     MachineObject* get_user_machine(std::string dev_id);

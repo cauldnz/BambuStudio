@@ -26,7 +26,6 @@
 #include <utility>
 
 #include <boost/filesystem.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/nowide/convert.hpp>
 #include <boost/nowide/cstdio.hpp>
 #include <boost/thread.hpp>
@@ -42,6 +41,7 @@
 
 #include <wx/msgdlg.h>
 #include <wx/progdlg.h>
+#include "libslic3r/Log.hpp"
 
 extern "C"{
 	// from rapi.h
@@ -444,13 +444,19 @@ bool fix_model_by_win10_sdk_gui(ModelObject &model_object, int volume_idx, GUI::
 	std::condition_variable			condition;
 	std::unique_lock<std::mutex>	lock(mutex);
 	struct Progress {
-		std::string 				message;
+		// Start with the first stage so the message line is never blank before the worker reports.
+		std::string 				message = L("Exporting objects");
 		int 						percent  = 0;
 		bool						updated = false;
 	} progress;
 	std::atomic<bool>				canceled = false;
 	std::atomic<bool>				finished = false;
 	progress_dialog.EnableYield(true);
+	const bool						percent_layout = progress_dialog.ShowsPercent();
+	if (percent_layout) {
+		progress_dialog.SetSubject(msg_header);
+		progress_dialog.SetGaugeTitle(_L("Repairing"));
+	}
 
 	std::vector<ModelVolume*> volumes;
 	if (volume_idx == -1)
@@ -462,22 +468,46 @@ bool fix_model_by_win10_sdk_gui(ModelObject &model_object, int volume_idx, GUI::
 	// (It seems like wxWidgets initialize the COM contex as single threaded and we need a multi-threaded context).
 	bool   success = false;
 	size_t ivolume = 0;
-	auto on_progress = [&mutex, &condition, &ivolume, &volumes, &progress](const char *msg, unsigned prcnt) {
+	// Two-phase overall budget: all per-volume Win10 SDK repairs share 0-70%,
+	// then all paint reprojections share 70-100%. Mapping by global phase (not
+	// per-volume SDK+paint) avoids the progress bar rewinding when ivolume resets
+	// at the start of the reproject loop.
+	enum class RepairProgressPhase { Sdk, Reproject };
+	RepairProgressPhase phase = RepairProgressPhase::Sdk;
+	auto on_progress = [&mutex, &condition, &ivolume, &volumes, &progress, &phase](const char *msg, unsigned local_prcnt) {
         std::lock_guard<std::mutex> lk(mutex);
 		progress.message = msg;
-		progress.percent = (int)floor((float(prcnt) + float(ivolume) * 100.f) / float(volumes.size()));
+		const float n = float(volumes.empty() ? size_t(1) : volumes.size());
+		const float within_phase = (float(ivolume) * 100.f + float(local_prcnt)) / n;
+		int overall = (phase == RepairProgressPhase::Sdk)
+			? int(floor(within_phase * 0.7f))
+			: int(floor(70.f + within_phase * 0.3f));
+		if (overall > 100)
+			overall = 100;
+		if (overall > progress.percent)
+			progress.percent = overall;
 		progress.updated = true;
 	    condition.notify_all();
 	};
-	auto worker_thread = boost::thread([&model_object, &volumes, &ivolume, on_progress, &success, &canceled, &finished]() {
+	auto worker_thread = boost::thread([&model_object, &volumes, &ivolume, &phase, on_progress, &success, &canceled, &finished]() {
 		try {
+			// local_prcnt is always 0-100 within the current phase for the current volume.
+			auto sdk_on_progress = [&on_progress](const char *msg, unsigned prcnt) {
+				on_progress(msg, prcnt);
+			};
+			auto reproject_on_progress = [&on_progress](int percent, const char *msg) {
+				on_progress(msg, (unsigned)percent);
+			};
+			auto is_canceled = [&canceled]() { return canceled.load(); };
+
 			std::vector<TriangleMesh> meshes_repaired;
 			meshes_repaired.reserve(volumes.size());
-			for (; ivolume < volumes.size(); ++ ivolume) {
+			phase = RepairProgressPhase::Sdk;
+			for (ivolume = 0; ivolume < volumes.size(); ++ ivolume) {
 				indexed_triangle_set repaired_its;
 				std::string repair_error;
-				bool repaired = Slic3r::fix_mesh_by_win10_sdk(volumes[ivolume]->mesh().its, repaired_its, on_progress,
-					[&canceled]() { return canceled.load(); }, &repair_error);
+				bool repaired = Slic3r::fix_mesh_by_win10_sdk(volumes[ivolume]->mesh().its, repaired_its, sdk_on_progress,
+					is_canceled, &repair_error);
 				if (!repaired) {
 					if (canceled)
 						throw RepairCanceledException();
@@ -485,24 +515,46 @@ bool fix_model_by_win10_sdk_gui(ModelObject &model_object, int volume_idx, GUI::
 				}
 				meshes_repaired.emplace_back(std::move(repaired_its));
 			}
+			// Two-phase to guarantee object-level all-or-nothing across volumes:
+			// first re-project every volume's paint into scratch buffers (read-only,
+			// cancelable), and only once ALL volumes succeed commit them. A cancel
+			// during the compute phase leaves every volume completely untouched, so
+			// a multi-volume repair reverts as a whole instead of half-updating.
+			std::vector<PaintKeepPrepared> prepared(volumes.size());
+			phase = RepairProgressPhase::Reproject;
 			for (size_t i = 0; i < volumes.size(); ++ i) {
-				volumes[i]->set_mesh_keep_paint(std::move(meshes_repaired[i])); // BBS: best-effort paint transfer
+				ivolume = i;
+				if (!volumes[i]->reproject_paint_keep(meshes_repaired[i], prepared[i],
+						reproject_on_progress, is_canceled)) {
+					canceled = true;
+					throw RepairCanceledException();
+				}
+				prepared[i].mesh = std::move(meshes_repaired[i]);
+			}
+			for (size_t i = 0; i < volumes.size(); ++ i) {
+				volumes[i]->commit_mesh_keep_paint(std::move(prepared[i]));
 				volumes[i]->calculate_convex_hull();
 				volumes[i]->invalidate_convex_hull_2d();
 				volumes[i]->set_new_unique_id();
 			}
 			model_object.invalidate_bounding_box();
-			-- ivolume;
+			phase = RepairProgressPhase::Reproject;
+			ivolume = volumes.empty() ? 0 : volumes.size() - 1;
 			on_progress(L("Repair finished"), 100);
 			success  = true;
 			finished = true;
 		} catch (RepairCanceledException & /* ex */) {
+			BOOST_LOG_TRIVIAL(warning) << current_exception_message();
 			canceled = true;
 			finished = true;
+			phase = RepairProgressPhase::Reproject;
+			ivolume = volumes.empty() ? 0 : volumes.size() - 1;
 			on_progress(L("Repair canceled"), 100);
 		} catch (std::exception &ex) {
 			success = false;
 			finished = true;
+			phase = RepairProgressPhase::Reproject;
+			ivolume = volumes.empty() ? 0 : volumes.size() - 1;
 			on_progress(ex.what(), 100);
 		}
 	});
@@ -517,9 +569,10 @@ bool fix_model_by_win10_sdk_gui(ModelObject &model_object, int volume_idx, GUI::
 		lock.unlock();
 		// decrease progress.percent value to avoid closing of the progress dialog
 		const int dialog_progress = progress_percent > 0 ? progress_percent - 1 : 0;
-		if (progress_dialog.WasCancelled() || !progress_dialog.Update(dialog_progress, msg_header + _(progress_message)))
+		const wxString stage_message = _(progress_message);
+		if (progress_dialog.WasCancelled() || !progress_dialog.Update(dialog_progress, percent_layout ? stage_message : msg_header + stage_message))
 			canceled = true;
-		else
+		else if (!percent_layout)
 			progress_dialog.Fit();
 		lock.lock();
 		condition.wait_for(lock, std::chrono::milliseconds(50), [&progress, &finished]{ return progress.updated || finished.load(); });
@@ -534,6 +587,28 @@ bool fix_model_by_win10_sdk_gui(ModelObject &model_object, int volume_idx, GUI::
 	}
 	worker_thread.join();
 	return !canceled;
+}
+
+} // namespace Slic3r
+
+#else /* HAS_WIN10SDK */
+
+#include "FixModelByWin10.hpp"
+#include "libslic3r/Win10ModelRepair.hpp"
+
+namespace Slic3r {
+
+bool is_windows10() { return false; }
+
+bool fix_model_by_win10_sdk_gui(ModelObject &, int, GUI::ProgressDialog &, const wxString &, std::string &) { return false; }
+
+bool is_win10_model_repair_available() { return false; }
+
+bool fix_mesh_by_win10_sdk(const indexed_triangle_set&, indexed_triangle_set&, Win10RepairProgressFn, Win10RepairCancelFn, std::string* error_message)
+{
+	if (error_message)
+		*error_message = "Windows 3D repair service is not available in this build.";
+	return false;
 }
 
 } // namespace Slic3r

@@ -11,8 +11,7 @@
 #include "WebViewDialog.hpp"
 #include "PartPlate.hpp"
 #include "ReleaseNote.hpp"
-
-#include <boost/log/trivial.hpp>
+#include "libslic3r/Log.hpp"
 
 #define TOPBAR_ICON_SIZE  18
 #define TOPBAR_TITLE_WIDTH  300
@@ -50,8 +49,9 @@ void BBLTopbarArt::DrawLabel(wxDC& dc, wxWindow* wnd, const wxAuiToolBarItem& it
     dc.SetTextForeground(*wxWHITE);
 #endif
 
-    int textWidth = 0, textHeight = 0;
-    dc.GetTextExtent(item.GetLabel(), &textWidth, &textHeight);
+    int textWidth = dc.GetTextExtent(item.GetLabel()).x;
+    wxFontMetrics fm = dc.GetFontMetrics();
+    int textHeight = fm.ascent + fm.descent;
 
     wxRect clipRect = rect;
     clipRect.width -= 1;
@@ -87,11 +87,9 @@ void BBLTopbarArt::DrawButton(wxDC& dc, wxWindow* wnd, const wxAuiToolBarItem& i
     if (m_flags & wxAUI_TB_TEXT)
     {
         dc.SetFont(m_font);
-        int tx, ty;
-
-        dc.GetTextExtent(wxT("ABCDHgj"), &tx, &textHeight);
-        textWidth = 0;
-        dc.GetTextExtent(item.GetLabel(), &textWidth, &ty);
+        wxFontMetrics fm = dc.GetFontMetrics();
+        textHeight = fm.ascent + fm.descent;
+        textWidth = dc.GetTextExtent(item.GetLabel()).x;
     }
 
     int bmpX = 0, bmpY = 0;

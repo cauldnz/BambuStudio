@@ -49,7 +49,6 @@ wxDECLARE_EVENT(EVT_SECONDARY_CHECK_RETRY, wxCommandEvent);
 wxDECLARE_EVENT(EVT_SECONDARY_CHECK_DONE, wxCommandEvent);
 wxDECLARE_EVENT(EVT_SECONDARY_CHECK_RESUME, wxCommandEvent);
 wxDECLARE_EVENT(EVT_UPDATE_NOZZLE, wxCommandEvent);
-wxDECLARE_EVENT(EVT_UPDATE_TEXT_MSG, wxCommandEvent);
 wxDECLARE_EVENT(EVT_ERROR_DIALOG_BTN_CLICKED, wxCommandEvent);
 
 class ReleaseNoteDialog : public DPIDialog
@@ -61,8 +60,16 @@ public:
     void on_dpi_changed(const wxRect &suggested_rect) override;
     void update_release_note(wxString release_note, std::string version);
 
+private:
+    void show_release_note();
+
+public:
     Label *    m_text_up_info{nullptr};
-    wxScrolledWindow *m_vebview_release_note {nullptr};
+    wxWebView *m_vebview_release_note {nullptr};
+
+private:
+    std::string m_mkdown_text;
+    bool        m_page_loaded{false};
 };
 
 class UpdatePluginDialog : public DPIDialog
@@ -263,11 +270,17 @@ public:
     void update_text(std::vector<ConfirmBeforeSendInfo> texts, bool enable_warning_clr = true);
     void on_show();
     void on_hide();
+    void set_not_show_again_config(const std::string& config_key, const std::string& config_value = "1")
+    {
+        show_again_config_text = config_key;
+        show_again_config_value = config_value;
+    }
     void update_btn_label(wxString ok_btn_text, wxString cancel_btn_text);
     void rescale();
     void on_dpi_changed(const wxRect& suggested_rect);
     void show_update_nozzle_button(bool show = false);
     void hide_button_ok();
+    void edit_ok_button_txt(const wxString& txt, bool switch_white = false);
     void edit_cancel_button_txt(const wxString& txt, bool switch_green = false);
     void disable_button_ok();
     void enable_button_ok();
@@ -282,9 +295,10 @@ protected:
     Button* m_button_ok;
     Button* m_button_cancel;
     Button* m_button_update_nozzle;
-    wxCheckBox* m_show_again_checkbox;
+    wxCheckBox* m_show_again_checkbox{ nullptr };
     bool not_show_again = false;
     std::string show_again_config_text = "";
+    std::string show_again_config_value = "1";
 };
 
 class InputIpAddressDialog : public DPIDialog
@@ -347,9 +361,8 @@ public:
     void on_check_ip_address_failed(wxCommandEvent& evt);
     void on_ok(wxMouseEvent& evt);
     void on_send_retry();
-    void update_test_msg_event(wxCommandEvent &evt);
-    void post_update_test_msg(std::weak_ptr<InputIpAddressDialog> w, wxString text, bool beconnect);
-    void workerThreadFunc(std::string str_ip, std::string str_access_code, std::string sn, std::string model_id);
+    static void workerThreadFunc(std::weak_ptr<InputIpAddressDialog> dialog, std::string str_ip,
+        std::string str_access_code, std::string sn, std::string model_id, int input_index);
     void OnTimer(wxTimerEvent& event);
     void on_text(wxCommandEvent& evt);
     void on_dpi_changed(const wxRect& suggested_rect) override;
@@ -382,7 +395,6 @@ wxDECLARE_EVENT(EVT_CLOSE_IPADDRESS_DLG, wxCommandEvent);
 wxDECLARE_EVENT(EVT_CHECKBOX_CHANGE, wxCommandEvent);
 wxDECLARE_EVENT(EVT_ENTER_IP_ADDRESS, wxCommandEvent);
 wxDECLARE_EVENT(EVT_CHECK_IP_ADDRESS_FAILED, wxCommandEvent);
-wxDECLARE_EVENT(EVT_CHECK_IP_ADDRESS_LAYOUT, wxCommandEvent);
 
 
 }} // namespace Slic3r::GUI

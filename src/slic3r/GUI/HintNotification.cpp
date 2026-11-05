@@ -3,8 +3,8 @@
 #include "format.hpp"
 #include "I18N.hpp"
 #include "GUI_ObjectList.hpp"
-#include "GLCanvas3D.hpp"
 #include "MainFrame.hpp"
+#include "Plater.hpp"
 #include "Tab.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "libslic3r/Utils.hpp"
@@ -19,12 +19,12 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/nowide/fstream.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/property_tree/ini_parser.hpp>
 
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/string.hpp>
 #include <cereal/types/vector.hpp>
+#include "libslic3r/Log.hpp"
 
 #define HINTS_CEREAL_VERSION 1
 // structure for writing used hints into binary file with version
@@ -455,25 +455,23 @@ void HintDatabase::load_hints_from_file(const boost::filesystem::path& path, std
 					// open preferences
 				}
 				else if (dict["hypertext_type"] == "preferences") {
-					std::string	page = dict["hypertext_preferences_page"];
-					std::string	item = dict["hypertext_preferences_item"];
-					HintData	hint_data{ id_string, key, text1, weight, was_displayed, hypertext_text, follow_text, disabled_tags, enabled_tags, false, documentation_link, img_url, internal_only, [page, item]() { wxGetApp().open_preferences(1, page); } };// 1 is to modify
+					HintData	hint_data{ id_string, key, text1, weight, was_displayed, hypertext_text, follow_text, disabled_tags, enabled_tags, false, documentation_link, img_url, internal_only, []() { wxGetApp().open_preferences(); } };
 					hints_vector.emplace_back(hint_data);
 				}
 				else if (dict["hypertext_type"] == "plater") {
 					std::string	item = dict["hypertext_plater_item"];
-					HintData	hint_data{ id_string, key, text1, weight, was_displayed, hypertext_text, follow_text, disabled_tags, enabled_tags, true, documentation_link, img_url, internal_only, [item]() { wxGetApp().plater()->canvas3D()->highlight_toolbar_item(item); } };
+					HintData	hint_data{ id_string, key, text1, weight, was_displayed, hypertext_text, follow_text, disabled_tags, enabled_tags, true, documentation_link, img_url, internal_only, [item]() { wxGetApp().plater()->highlight_toolbar_item(item); } };
 					hints_vector.emplace_back(hint_data);
 				}
 				else if (dict["hypertext_type"] == "gizmo") {
 					std::string	item = dict["hypertext_gizmo_item"];
-					HintData	hint_data{ id_string, key, text1, weight, was_displayed, hypertext_text, follow_text, disabled_tags, enabled_tags, true, documentation_link, img_url, internal_only, [item]() { wxGetApp().plater()->canvas3D()->highlight_gizmo(item); } };
+					HintData	hint_data{ id_string, key, text1, weight, was_displayed, hypertext_text, follow_text, disabled_tags, enabled_tags, true, documentation_link, img_url, internal_only, [item]() { wxGetApp().plater()->highlight_gizmo(item); } };
 					hints_vector.emplace_back(hint_data);
 				}
 				else if (dict["hypertext_type"] == "gallery") {
 					HintData	hint_data{ id_string, key, text1, weight, was_displayed, hypertext_text, follow_text, disabled_tags, enabled_tags, false, documentation_link, img_url, internal_only, []() {
 						// Deselect all objects, otherwise gallery wont show.
-						wxGetApp().plater()->canvas3D()->deselect_all();
+						wxGetApp().plater()->deselect_current_canvas();
 						//wxGetApp().obj_list()->load_shape_object_from_gallery(); }
 					} };
 					hints_vector.emplace_back(hint_data);
@@ -538,6 +536,7 @@ HintData* HintDatabase::get_hint(HintDataNavigation nav, bool is_helio)
 	}
 	catch (const std::exception&)
 	{
+		BOOST_LOG_TRIVIAL(warning) << current_exception_message();
 		return nullptr;
 	}
 

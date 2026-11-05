@@ -1,8 +1,13 @@
 #include "wgtFilaManagerStore.h"
 #include "libslic3r/Utils.hpp"
+#include "slic3r/GUI/GUI_App.hpp"
+
+#include "slic3r/GUI/DeviceManager.hpp"
+#include "slic3r/GUI/DeviceCore/DevManager.h"
+#include "slic3r/GUI/DeviceCore/DevFilaSystem.h"
+#include "slic3r/GUI/DeviceCore/DevExtruderSystem.h"
 
 #include <boost/filesystem.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/nowide/fstream.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
@@ -12,6 +17,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -44,7 +50,7 @@ nlohmann::json FilamentSpool::to_json() const
 {
     return nlohmann::json{
         {"spool_id",        spool_id},
-        {"setting_id",      setting_id},
+        {"setting_id",      filament_id},
         {"tag_uid",         tag_uid},
         {"tray_id_name",    tray_id_name},
         {"brand",           brand},
@@ -67,8 +73,84 @@ nlohmann::json FilamentSpool::to_json() const
         {"note",            note},
         {"favorite",        favorite},
         {"net_weight",      net_weight},
-        {"cloud_synced",    cloud_synced}
+        {"cloud_synced",    cloud_synced},
+        {"in_printer",      in_printer},
+        {"dev_id",          dev_id},
+        {"ams_sn",          ams_sn},
+        {"ams_id",          ams_id},
+        {"ams_type",        ams_type},
+        {"slot_id",         slot_id},
+        {"device_name",     device_name},
+        {"tray_label",      [this]() -> std::string {
+            if (ams_id < 0 || slot_id.empty()) return {};
+            try {
+                return DevFilaSystem::GetTrayNameByAmsSlotId(dev_id, ams_id, std::stoi(slot_id), (DevAmsType)ams_type);
+            } catch (...) {
+                BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+                return {};
+            }
+
+            return {};
+        }()}
     };
+}
+
+SoftMatchFilamentItem SoftMatchFilamentItem::from_json(const nlohmann::json& j)
+{
+    SoftMatchFilamentItem s;
+    auto get = [&](const char* key, auto& dst) {
+        if (j.contains(key)) j.at(key).get_to(dst);
+    };
+    get("id",              s.id);
+    get("createType",      s.create_type);
+    get("filamentVendor",  s.filament_vendor);
+    get("filamentType",    s.filament_type);
+    get("filamentName",    s.filament_name);
+    get("filamentId",      s.filament_id);
+    get("RFID",            s.rfid);
+    get("color",           s.color);
+    get("colorType",       s.color_type);
+    if (j.contains("colors") && j.at("colors").is_array())
+        j.at("colors").get_to(s.colors);
+    get("netWeight",       s.net_weight);
+    get("totalNetWeight",  s.total_net_weight);
+    get("note",            s.note);
+    get("trayIdName",      s.tray_id_name);
+    get("category",        s.category);
+    get("inPrinter",       s.in_printer);
+    get("devId",           s.dev_id);
+    get("amsSn",           s.ams_sn);
+    get("slotId",          s.slot_id);
+    if (j.contains("amsId") && j.at("amsId").is_number())
+        s.ams_id = j.at("amsId").get<int>();
+    if (j.contains("amsType") && j.at("amsType").is_number())
+        s.ams_type = j.at("amsType").get<int>();
+    if (j.contains("deviceName") && j.at("deviceName").is_string())
+        s.device_name = j.at("deviceName").get<std::string>();
+    get("depleted",        s.depleted);
+    return s;
+}
+
+SoftMatchPendingResponse SoftMatchPendingResponse::from_json(const nlohmann::json& j)
+{
+    SoftMatchPendingResponse r;
+    if (j.contains("hits") && j.at("hits").is_array()) {
+        for (const auto& item : j.at("hits"))
+            r.hits.push_back(SoftMatchFilamentItem::from_json(item));
+    }
+    if (j.contains("candidates") && j.at("candidates").is_array()) {
+        for (const auto& entry : j.at("candidates")) {
+            SoftMatchPendingCandidate c;
+            if (entry.contains("pendingId") && entry.at("pendingId").is_number())
+                c.pending_id = entry.at("pendingId").get<int>();
+            if (entry.contains("candidates") && entry.at("candidates").is_array()) {
+                for (const auto& cand : entry.at("candidates"))
+                    c.candidates.push_back(SoftMatchFilamentItem::from_json(cand));
+            }
+            r.candidates.push_back(std::move(c));
+        }
+    }
+    return r;
 }
 
 FilamentSpool FilamentSpool::from_json(const nlohmann::json& j)
@@ -78,7 +160,7 @@ FilamentSpool FilamentSpool::from_json(const nlohmann::json& j)
         if (j.contains(key)) j.at(key).get_to(dst);
     };
     get("spool_id",        s.spool_id);
-    get("setting_id",      s.setting_id);
+    get("setting_id",      s.filament_id);
     get("tag_uid",         s.tag_uid);
     get("tray_id_name",    s.tray_id_name);
     get("brand",           s.brand);
@@ -107,7 +189,20 @@ FilamentSpool FilamentSpool::from_json(const nlohmann::json& j)
     get("favorite",        s.favorite);
     get("net_weight",      s.net_weight);
     get("cloud_synced",    s.cloud_synced);
+    get("in_printer",      s.in_printer);
+    get("dev_id",          s.dev_id);
+    get("ams_sn",          s.ams_sn);
+    get("ams_id",          s.ams_id);
+    get("ams_type",        s.ams_type);
+    get("slot_id",         s.slot_id);
+    get("device_name",     s.device_name);
     return s;
+}
+
+nlohmann::json FilamentSpool::to_json_with_runtime() const
+{
+    // 在位字段已并入 to_json() 持久化，此处直接复用。
+    return to_json();
 }
 
 bool FilamentSpool::is_valid_tag_uid(const std::string& tag_uid)
@@ -128,64 +223,12 @@ std::string wgtFilaManagerStore::get_storage_path() const
 
 void wgtFilaManagerStore::load()
 {
-    std::string path = get_storage_path();
-    fs::path dir = fs::path(path).parent_path();
-    if (!fs::exists(dir))
-        fs::create_directories(dir);
-
-    if (!fs::exists(path)) return;
-
-    try {
-        boost::nowide::ifstream ifs(path);
-        nlohmann::json j;
-        ifs >> j;
-        m_spools.clear();
-        nlohmann::json spool_list = nlohmann::json::array();
-        if (j.is_array()) {
-            spool_list = j;
-        } else if (j.is_object()) {
-            if (j.contains("spools") && j["spools"].is_array())
-                spool_list = j["spools"];
-        }
-        if (spool_list.is_array()) {
-            for (auto& item : spool_list) {
-                FilamentSpool spool = FilamentSpool::from_json(item);
-                m_spools[spool.spool_id] = std::move(spool);
-            }
-        }
-        BOOST_LOG_TRIVIAL(info) << "[FilaManager] Loaded " << m_spools.size() << " spools";
-    } catch (const std::exception& e) {
-        BOOST_LOG_TRIVIAL(error) << "[FilaManager] Failed to load spools: " << e.what();
-    }
-
-    m_dirty = false;
+    // local persistence removed — store starts empty, populated by cloud pull after login
 }
 
 void wgtFilaManagerStore::save()
 {
-    std::string path = get_storage_path();
-    fs::path dir = fs::path(path).parent_path();
-    if (!fs::exists(dir))
-        fs::create_directories(dir);
-
-    nlohmann::json arr = nlohmann::json::array();
-    for (auto& [id, spool] : m_spools)
-        arr.push_back(spool.to_json());
-    nlohmann::json root = {
-        {"spools", arr}
-    };
-
-    std::string tmp = path + ".tmp";
-    {
-        boost::nowide::ofstream ofs(tmp);
-        ofs << root.dump(2);
-    }
-
-    boost::system::error_code ec;
-    fs::rename(tmp, path, ec);
-    if (ec)
-        BOOST_LOG_TRIVIAL(error) << "[FilaManager] Failed to save: " << ec.message();
-
+    // local persistence removed
     m_dirty = false;
 }
 
@@ -265,9 +308,11 @@ bool wgtFilaManagerStore::apply_patch(const std::string& spool_id, const nlohman
         if (!patch.contains(key)) return;
         const auto& v = patch.at(key);
         if (v.is_null()) return;
-        try { v.get_to(dst); } catch (...) {}
+        try { v.get_to(dst); } catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        }
     };
-    get_if("setting_id",      s.setting_id);
+    get_if("setting_id",      s.filament_id);
     get_if("brand",           s.brand);
     get_if("material_type",   s.material_type);
     get_if("series",          s.series);
@@ -337,10 +382,22 @@ const FilamentSpool* wgtFilaManagerStore::find_by_setting_and_color(
 {
     if (setting_id.empty()) return nullptr;
 
+    // 规范化 color 到不带 # 的 6 位大写 RRGGBB：
+    //   AMS 上报格式为 "RRGGBBAA"（8位无#），store 存储格式为 "#RRGGBB"（6位带#）。
+    auto normalize = [](const std::string& c) -> std::string {
+        std::string s = c;
+        if (!s.empty() && s[0] == '#') s = s.substr(1);
+        if (s.size() == 8) s = s.substr(0, 6);
+        for (auto& ch : s) ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
+        return s;
+    };
+
+    const std::string norm_color = normalize(color);
+
     const FilamentSpool* match = nullptr;
     int count = 0;
     for (auto& [id, spool] : m_spools) {
-        if (spool.setting_id == setting_id && spool.color_code == color) {
+        if (spool.filament_id == setting_id && normalize(spool.color_code) == norm_color) {
             match = &spool;
             ++count;
         }
@@ -350,12 +407,131 @@ const FilamentSpool* wgtFilaManagerStore::find_by_setting_and_color(
 
 // ---------- JSON for WebView ----------
 
+const FilamentSpool* wgtFilaManagerStore::find_by_slot(const std::string& dev_id,
+                                                       const std::string& ams_id,
+                                                       const std::string& slot_id) const
+{
+    if (dev_id.empty() || ams_id.empty() || slot_id.empty()) return nullptr;
+
+    const FilamentSpool* match = nullptr;
+    int count = 0;
+    for (auto& [id, spool] : m_spools) {
+        if (!spool.in_printer)          continue;
+        if (spool.dev_id  != dev_id)    continue;
+        if (spool.slot_id != slot_id)   continue;
+        if (spool.ams_id < 0)           continue;
+        if (std::to_string(spool.ams_id) != ams_id) continue;
+
+        match = &spool;
+        ++count;
+    }
+    return count == 1 ? match : nullptr;
+}
+
 nlohmann::json wgtFilaManagerStore::spools_to_json() const
 {
     nlohmann::json arr = nlohmann::json::array();
     for (auto& [id, spool] : m_spools)
-        arr.push_back(spool.to_json());
+        arr.push_back(spool.to_json_with_runtime());
     return arr;
+}
+
+static constexpr int MOUNT_HOLD_TICKS = 5;
+
+bool wgtFilaManagerStore::force_mount_spool(const std::string& spool_id,
+                                            const std::string& dev_id,
+                                            const std::string& dev_name,
+                                            int                ams_id,
+                                            int                ams_type,
+                                            const std::string& slot_id,
+                                            const std::string& ams_sn)
+{
+    auto it = m_spools.find(spool_id);
+    if (it == m_spools.end()) {
+        BOOST_LOG_TRIVIAL(warning) << "spool_id not found: " << spool_id;
+        return false;
+    }
+    FilamentSpool& s = it->second;
+    for (auto& [oid, ospool] : m_spools) {
+        if (oid == spool_id)                          continue;
+        if (!ospool.in_printer)                       continue;
+        if (ospool.dev_id != dev_id)                  continue;
+        if (ospool.ams_id != ams_id)                  continue;
+        if (ospool.slot_id != slot_id)                continue;
+        ospool.in_printer  = false;
+        ospool.dev_id.clear();
+        ospool.device_name.clear();
+        ospool.ams_sn.clear();
+        ospool.ams_id      = -1;
+        ospool.ams_type    = -1;
+        ospool.slot_id.clear();
+    }
+    s.in_printer  = true;
+    s.dev_id      = dev_id;
+    s.device_name = dev_name;
+    s.ams_id      = ams_id;
+    s.ams_type    = ams_type;
+    s.slot_id     = slot_id;
+    s.ams_sn      = ams_sn;
+    s.mount_hold_count = MOUNT_HOLD_TICKS;
+    set_dirty();
+    return true;
+}
+
+bool wgtFilaManagerStore::apply_mount_diff(
+    const std::string& dev_id,
+    const std::string& dev_name,
+    const std::map<std::string, MountUpdate>& present_now,
+    std::vector<std::string>* out_changed_ids,
+    std::vector<EjectedSlotSnapshot>* out_ejected)
+{
+    bool changed = false;
+    for (auto& [id, s] : m_spools) {
+        auto it = present_now.find(id);
+        const bool now_present  = (it != present_now.end());
+        const bool was_our_hold = (s.in_printer && s.dev_id == dev_id);
+
+        if (now_present) {
+            const MountUpdate& u = it->second;
+            const bool same_state =
+                   s.in_printer  == true
+                && s.dev_id      == dev_id
+                && s.ams_id      == u.ams_id
+                && s.ams_type    == u.ams_type
+                && s.slot_id     == u.slot_id
+                && s.ams_sn      == u.ams_sn
+                && s.device_name == dev_name;
+            if (!same_state) {
+                s.in_printer  = true;
+                s.dev_id      = dev_id;
+                s.device_name = dev_name;
+                s.ams_id      = u.ams_id;
+                s.ams_type    = u.ams_type;
+                s.slot_id     = u.slot_id;
+                s.ams_sn      = u.ams_sn;
+                changed = true;
+                if (out_changed_ids) out_changed_ids->push_back(id);
+            }
+            s.mount_hold_count = 0;
+        } else if (was_our_hold) {
+            if (s.mount_hold_count > 0) {
+                --s.mount_hold_count;
+                continue;
+            }
+            if (out_ejected)
+                out_ejected->push_back({id, s.ams_sn, s.ams_id, s.ams_type, s.slot_id});
+            s.in_printer  = false;
+            s.dev_id.clear();
+            s.device_name.clear();
+            s.ams_id      = -1;
+            s.ams_type    = -1;
+            s.slot_id.clear();
+            s.ams_sn.clear();
+            changed = true;
+            if (out_changed_ids) out_changed_ids->push_back(id);
+        }
+    }
+    return changed;
 }
 
 }} // namespace Slic3r::GUI

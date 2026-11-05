@@ -15,7 +15,8 @@
 //   - otherwise → flat single hex (fallback to `'#888'` only when no hex
 //     is available at all, never to obscure a bad input silently).
 
-import { canonicalizeHex, canonicalizeHexList } from './hex';
+import type { CSSProperties } from 'react';
+import { canonicalizeHex, canonicalizeHexList, hasPartialTransparency, isTransparentHex } from './hex';
 
 export interface ColorRenderInput {
   /**
@@ -52,12 +53,38 @@ function normalise(input: ColorRenderInput): NormalisedRenderInput {
 }
 
 /**
+ * CSS checkered pattern painted for fully-transparent colours (alpha byte
+ * == 0x00 in `#RRGGBBAA`). A transparent spool (e.g. Bambu PC
+ * "Transparent" `#00000000`, PETG "Clear" `#00000000`) must NOT render as
+ * solid black — the checkered pattern reads as "clear / no colour".
+ * Exported so SpoolColorChip (which builds its own DOM) reuses the exact
+ * same expression and the two paths can never drift out of sync.
+ */
+export const TRANSPARENT_CHECKERED_BG =
+  'repeating-conic-gradient(#ccc 0% 25%, #fff 0% 50%) 0 0 / 8px 8px';
+
+/**
+ * True when the colour to render is fully transparent. A single-colour
+ * spool carries its hex in `primaryHex` (cloud `color_code`) with an EMPTY
+ * `hexes`/`colors` array, so both sources must be checked — checking only
+ * `hexes[0]` was the bug that left transparent single spools rendering as
+ * `#000000` (black) after canonicalisation dropped the alpha byte.
+ */
+export function isTransparentRenderInput(input: ColorRenderInput): boolean {
+  return isTransparentHex(input.hexes?.[0]) || isTransparentHex(input.primaryHex);
+}
+
+/**
  * CSS `background` expression for a colour swatch / chip / preview bar.
  * Always returns a non-empty string so the caller can safely set
  * `style={{ background: cssBackgroundFor(...) }}` without conditional
  * fallback elsewhere.
  */
 export function cssBackgroundFor(input: ColorRenderInput): string {
+  // Fully-transparent colour → checkered pattern instead of solid black.
+  // Checked before canonicalisation because canonicalise drops the alpha
+  // byte (#00000000 → #000000), hiding the transparency.
+  if (isTransparentRenderInput(input)) return TRANSPARENT_CHECKERED_BG;
   const { hexes, primary, colorType } = normalise(input);
   if (hexes.length > 1) {
     if (colorType === 1) {
@@ -76,6 +103,47 @@ export function cssBackgroundFor(input: ColorRenderInput): string {
   }
   if (hexes.length === 1) return hexes[0];
   return primary || '#888';
+}
+
+/**
+ * Checkerboard tile pattern shared by partially-transparent swatches.
+ * Same 4-stop conic-gradient used by FilamentColorSwatch in the auto-refill
+ * feature so all translucent swatches in the app render identically.
+ */
+const CHECKER_PATTERN_TRANSLUCENT =
+  'conic-gradient(#d9d9d9 25%, #ffffff 0 50%, #d9d9d9 0 75%, #ffffff 0)';
+
+/**
+ * CSS background properties for a partially-transparent colour swatch.
+ * Layers the RGBA colour on top of a checkerboard so the chip reads as
+ * "translucent" rather than as a solid opaque fill — matching the C++
+ * prepare-page rendering (ImGuiWrapper::draw_single_color_swatch).
+ *
+ * The caller must spread the returned object into `style={{ ... }}`:
+ *   <span style={{ ...chipStyle, ...translucentBackground(rawHex) }} />
+ *
+ * `hex8` must be an 8-char `#RRGGBBAA` or `RRGGBBAA` value. Browsers
+ * supporting CSS Color Level 4 (all modern Chromium / WebView2) parse
+ * 8-char hex natively in `linear-gradient` colour stops.
+ */
+export function translucentBackground(hex8: string): CSSProperties {
+  const rgba = hex8.startsWith('#') ? hex8 : `#${hex8}`;
+  return {
+    backgroundImage: `linear-gradient(${rgba} 0%, ${rgba} 100%), ${CHECKER_PATTERN_TRANSLUCENT}`,
+    backgroundSize: '100% 100%, 8px 8px',
+  };
+}
+
+/**
+ * True when the primary colour input (before canonicalisation strips alpha)
+ * is partially transparent (alpha 1–254). Used by SpoolColorChip to gate
+ * the translucent-checkerboard rendering path.
+ */
+export function isPartiallyTransparentRenderInput(input: ColorRenderInput): boolean {
+  return (
+    hasPartialTransparency(input.hexes?.[0]) ||
+    hasPartialTransparency(input.primaryHex)
+  );
 }
 
 /**

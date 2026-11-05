@@ -68,6 +68,7 @@
 #define BBL_JSON_KEY_USE_DOUBLE_EXTRUDER_DEFAULT_TEXTURE  "use_double_extruder_default_texture"
 #define BBL_JSON_KEY_BOTTOM_TEXTURE_RECT        "bottom_texture_rect"
 #define BBL_JSON_KEY_BOTTOM_TEXTURE_RECT_LONGER  "bottom_texture_rect_longer"
+#define BBL_JSON_KEY_BOTTOM_TEXTURE_RECT_LONGER_IGNORE_LIST  "bottom_texture_rect_longer_ignore_list"
 #define BBL_JSON_KEY_MIDDLE_TEXTURE_RECT        "middle_texture_rect"
 #define BBL_JSON_KEY_RIGHT_ICON_OFFSET_BED      "right_icon_offset_bed"
 
@@ -76,6 +77,7 @@
 #define BBL_JSON_KEY_NOT_SUPPORT_BED_TYPE       "not_support_bed_type"
 #define BBL_JSON_KEY_MODEL_ID                   "model_id"
 #define BBL_JSON_KEY_SUPPORT_SIDE_PANEL_FAN     "support_side_panel_fan"
+#define BBL_JSON_KEY_RESOURCE_BIND_NAME          "resource_bind_name"
 
 //BBL: json path
 
@@ -102,7 +104,23 @@ extern ConfigFileType guess_config_file_type(const boost::property_tree::ptree &
 
 extern void extend_default_config_length(DynamicPrintConfig &config, const DynamicPrintConfig &inherit_config, const bool set_nil_to_default, const DynamicPrintConfig &defaults);
 
-const std::vector<std::string> &get_filament_orders();
+/**
+ * \brief Identity of a filament preset as far as its position in selection lists is concerned
+ */
+struct FilamentListKey
+{
+    std::string alias;  ///< display name, e.g. "Bambu PLA Basic"
+    std::string vendor; ///< filament_vendor; empty for user presets
+    std::string type;   ///< filament_type
+};
+
+/**
+ * \brief Strict weak "listed before" order for filament presets in selection lists
+ *
+ * Vendors are grouped, curated vendors first, then the rest by name. Within a curated vendor the
+ * curated aliases lead and everything else follows by name.
+ */
+bool filament_list_less(const FilamentListKey &l, const FilamentListKey &r);
 
 class VendorProfile
 {
@@ -130,6 +148,9 @@ public:
         std::vector<PrinterVariant> variants;
         std::vector<std::string>	default_materials;
         std::vector<std::string>    not_support_bed_types;
+        // Bed types that should keep default bottom texture position
+        // instead of applying bottom_texture_rect_longer.
+        std::vector<std::string>    bottom_texture_rect_longer_ignore_list;
         // Vendor & Printer Model specific print bed model & texture.
         std::string 			 	bed_model;
         std::string 				bed_texture;
@@ -144,6 +165,10 @@ public:
         std::string                 right_icon_offset_bed;
         std::string                 hotend_model;
         std::string                 support_side_panel_fan{ "true" };
+        // Optional per-printer-model suffix appended to the base thumbnail image
+        // name when looking up bed thumbnails (see Sidebar::get_cur_select_bed_image).
+        // Empty means "no override" and the default image name is used as-is.
+        std::string                 resource_bind_name;
         PrinterVariant*       variant(const std::string &name) {
             for (auto &v : this->variants)
                 if (v.name == name)
@@ -390,6 +415,10 @@ protected:
 bool is_compatible_with_print  (const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_print, const PresetWithVendorProfile &active_printer);
 bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_printer, const DynamicPrintConfig *extra_config);
 bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_printer);
+// BBS multi-diameter: a filament/print preset is treated as compatible when its compatible_printers list
+// references any of the given printer preset names. Used to keep presets bound to sibling nozzle-diameter
+// variants visible while mixed-diameter printing is active (diameters chosen via "set nozzle diameter").
+bool is_compatible_with_printer_names(const PresetWithVendorProfile &preset, const std::vector<std::string> &printer_names);
 
 enum class PresetSelectCompatibleType {
 	// Never select a compatible preset if the newly selected profile is not compatible.
@@ -579,6 +608,8 @@ public:
 	// where the "inherits" profile name is searched for in both m_presets and m_map_system_profile_renamed.
 	const Preset*	get_preset_parent(const Preset& child) const;
 	const Preset*	get_preset_base(const Preset& child) const;
+	// True when the inheritance chain roots in a Bambu Lab branded system filament preset.
+	bool            is_bbl_brand_filament(const Preset& preset) const;
 	// Return the selected preset including the user modifications.
     Preset&         get_edited_preset()         { return m_edited_preset; }
     const Preset&   get_edited_preset() const   { return m_edited_preset; }
@@ -682,6 +713,12 @@ public:
     }
     void            update_compatible(const PresetWithVendorProfile &active_printer, const PresetWithVendorProfile *active_print, PresetSelectCompatibleType select_other_if_incompatible)
         { this->update_compatible(active_printer, active_print, select_other_if_incompatible, [](const Preset&) -> int { return 0; }); }
+
+    // BBS multi-diameter: extra printer preset names (sibling nozzle-diameter variants selected via
+    // "set nozzle diameter") that are additionally accepted as compatible during the next
+    // update_compatible() pass. Empty (the default) preserves the original single-printer behavior.
+    void            set_extra_compatible_printers(const std::vector<std::string> &printer_names) { m_extra_compatible_printers = printer_names; }
+    void            clear_extra_compatible_printers() { m_extra_compatible_printers.clear(); }
 
     size_t          num_visible() const { return std::count_if(m_presets.begin(), m_presets.end(), [](const Preset &preset){return preset.is_visible;}); }
 
@@ -808,6 +845,14 @@ private:
 
     // Selected preset.
     size_t                  m_idx_selected;
+    // BBS multi-diameter: extra printer preset names accepted as compatible in update_compatible_internal().
+    std::vector<std::string> m_extra_compatible_printers;
+    // BBS multi-diameter: name of the printer preset used in the last update_compatible_internal() pass.
+    // Used to prefer the active-diameter variant when resolving an alias to a concrete preset.
+    std::string              m_active_printer_name;
+    // Persist whether the last compatibility pass was broadened. The temporary extra-printer list is
+    // cleared after that pass, but later alias lookups must retain the same disambiguation policy.
+    bool                     m_prefer_active_printer_alias = false;
     // Is the "- default -" preset suppressed?
     bool                    m_default_suppressed  = true;
     size_t                  m_num_default_presets = 0;

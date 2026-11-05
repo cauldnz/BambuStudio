@@ -19,6 +19,8 @@
 					"model_download": "enabled"
 				}
 			},
+			"default_extruder_count": 2,
+			"default_nozzle_count": 2,
 			"nozzle_temp_range": [ 0, 350 ],
 			"nozzle_replace_wiki": {
 				"zh": "https://wiki.bambulab.com/zh/h2/maintenance/replace-hotend",
@@ -51,6 +53,7 @@
 			"support_lidar_calibration": false,
 			"support_nozzle_offset_calibration": true,
 			"support_high_tempbed_calibration": true,
+			"support_high_tempbed_calibration_unload_tips": true,
 			"support_ai_monitoring": true,
 			"support_first_layer_inspect": false,
 			"support_save_remote_print_file_to_storage": true,
@@ -68,6 +71,7 @@
 			"support_user_first_setup_tpu_check_url": "https://e.bambulab.com/t?c=fwWqpBg37Liel92N"
 		},
 		"model_id": "O1D",
+		"sn_prefix": "094",
 		"subseries": [ "O1D-V2" ],
 		"support_wrapping_detection": true,
 		"auto_pa_cali_thumbnail_image": "fd_calibration_auto_multi_extruders",

@@ -2,10 +2,12 @@
 #include "ProjectTask.hpp"
 #include "Utils.hpp"
 #include "Print.hpp"
+#include "GCode/GCodeProcessor.hpp"
+#include "PrintConfig.hpp"
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
-#include <boost/log/trivial.hpp>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r { namespace MultiNozzleUtils {
 // ==================== 工具函数实现 ====================
@@ -25,6 +27,155 @@ std::vector<NozzleInfo> build_nozzle_list(std::vector<NozzleGroupInfo> nozzle_gr
         }
     }
     return ret;
+}
+
+// Build the nozzle list from the per-slot params (extruder_nozzle_count / _volume_type / _diameter /
+// _slot): group_id == physical slot index in input order (no volume-type reorder), empty slots become
+// placeholders, and N1X puts every nozzle on the single real extruder 0. Returns empty (caller falls
+// back) when the params are absent or inconsistent.
+std::vector<NozzleInfo> build_nozzle_list_from_extruder_nozzles(const PrintConfig &print_config)
+{
+    std::vector<NozzleInfo> ret;
+
+    const auto& counts = print_config.extruder_nozzle_count.values;
+    const auto& vtypes = print_config.extruder_nozzle_volume_type.values;
+    const auto& diams  = print_config.extruder_nozzle_diameter.values;
+    const auto& slots  = print_config.extruder_nozzle_slot.values;
+    if (counts.empty())
+        return ret;
+
+    int total = 0;
+    for (int c : counts)
+        total += c;
+    if (total <= 0 || static_cast<int>(vtypes.size()) != total)
+        return ret; // flat volume-type list must cover exactly the summed nozzle count
+
+    // Per-slot diameter / physical slot id when the flat lists match the summed nozzle count; otherwise
+    // fall back to the per-extruder nozzle_diameter / dense ordering.
+    const bool has_per_slot_diameter = (static_cast<int>(diams.size()) == total);
+    const bool has_slot_id           = (static_cast<int>(slots.size()) == total);
+
+    const bool single_ext_multi_nozzle = is_single_ext_multi_nozzle(print_config);
+
+    // List spans every physical slot so that group_id == index == physical slot.
+    int list_size = total;
+    if (has_slot_id) {
+        for (int s : slots)
+            list_size = std::max(list_size, s + 1);
+    }
+
+    const std::string default_diameter_str = print_config.nozzle_diameter.values.empty()
+        ? std::string() : format_diameter_to_str(print_config.nozzle_diameter.values.front());
+
+    // Pre-fill empty placeholders (group_id == index keeps the invariant that filament_nozzle_map
+    // values index nozzle_list directly).
+    ret.resize(list_size);
+    for (int i = 0; i < list_size; ++i) {
+        ret[i].diameter    = default_diameter_str;
+        ret[i].volume_type = nvtStandard;
+        ret[i].group_id    = i;
+        ret[i].extruder_id = 0;
+        ret[i].installed   = false;
+    }
+
+    int dense = 0;
+    size_t vi = 0;
+    for (size_t e = 0; e < counts.size(); ++e) {
+        const std::string ext_diameter_str = (e < print_config.nozzle_diameter.values.size())
+            ? format_diameter_to_str(print_config.nozzle_diameter.values[e]) : default_diameter_str;
+        for (int s = 0; s < counts[e]; ++s, ++vi, ++dense) {
+            const int idx = has_slot_id ? slots[vi] : dense;
+            if (idx < 0 || idx >= list_size)
+                return {}; // inconsistent slot id -> caller falls back
+            NozzleInfo& info = ret[idx];
+            info.diameter    = has_per_slot_diameter ? format_diameter_to_str(diams[vi]) : ext_diameter_str;
+            info.volume_type = NozzleVolumeType(vtypes[vi]);
+            info.group_id    = idx;
+            info.extruder_id = single_ext_multi_nozzle ? 0 : static_cast<int>(e);
+            info.installed   = true;
+        }
+    }
+    return ret;
+}
+
+std::vector<int> resolve_manual_nozzle_map_to_index(
+    const PrintConfig&               config,
+    const std::vector<unsigned int>& used_filaments,
+    const std::vector<int>&          filament_map_1based,
+    const std::vector<int>&          filament_volume_map,
+    const std::vector<int>&          filament_nozzle_key_map)
+{
+    // 阶段 1：构建与切片后端完全一致的喷嘴列表（group_id == 下标），保证转换出的下标可直接被后端消费。
+    const std::vector<NozzleInfo> nozzle_list = build_nozzle_list_from_extruder_nozzles(config);
+    if (nozzle_list.empty())
+        return {};
+    const int nozzle_cnt = (int) nozzle_list.size();
+
+    // 流量兼容判断：Hybrid 与任意流量兼容，否则要求流量类型相同。
+    auto is_volume_compatible = [](NozzleVolumeType nozzle_volume, int filament_volume) {
+        return nozzle_volume == nvtHybrid || filament_volume == (int) nvtHybrid || (int) nozzle_volume == filament_volume;
+    };
+
+    // 阶段 2：幂等判断——若每根用到的耗材的传入值都已能落到合法喷嘴（范围内、已安装、挤出机一致、
+    // 流量兼容），说明它已是下标语义，直接原样返回，重复调用不漂移；任一条不满足即视为旧分组 key。
+    auto already_nozzle_index = [&]() {
+        for (unsigned int filament_id : used_filaments) {
+            // 输入长度不一致，无法判定为合法下标。
+            if (filament_id >= filament_nozzle_key_map.size() || filament_id >= filament_map_1based.size() || filament_id >= filament_volume_map.size())
+                return false;
+            const int idx = filament_nozzle_key_map[filament_id];
+            if (idx < 0 || idx >= nozzle_cnt)                                                return false; // 越界 -> 只能是 key
+            const NozzleInfo& nozzle = nozzle_list[idx];
+            if (!nozzle.installed)                                                           return false; // 指向空槽 -> 只能是 key
+            if (nozzle.extruder_id != filament_map_1based[filament_id] - 1)                  return false; // 挤出机不匹配 -> 只能是 key
+            if (!is_volume_compatible(nozzle.volume_type, filament_volume_map[filament_id])) return false; // 流量不兼容 -> 只能是 key
+        }
+        return true; // 每根用到的耗材都能落到合法喷嘴 -> 已是下标语义
+    };
+    if (already_nozzle_index())
+        return filament_nozzle_key_map;
+
+    // 阶段 3：准备输出与查找表。
+    const size_t     filament_count = filament_nozzle_key_map.size();
+    std::vector<int> filament_to_nozzle_index(filament_count, 0); // 结果：每根耗材最终落到的喷嘴下标
+    std::vector<bool> nozzle_taken(nozzle_list.size(), false);    // 喷嘴是否已被占用（固定喷嘴一嘴一料）
+    std::map<int, int> key_to_nozzle_index;                       // 旧分组 key -> 已解析的喷嘴下标（同 key 复用）
+
+    // 阶段 4：逐根耗材，把旧“分组 key”解析成真实喷嘴下标。
+    for (unsigned int filament_id : used_filaments) {
+        if (filament_id >= filament_count || filament_id >= filament_map_1based.size() || filament_id >= filament_volume_map.size())
+            return {};
+
+        // 同一个 key 的耗材共用同一个喷嘴，直接复用已解析结果。
+        const int group_key = filament_nozzle_key_map[filament_id];
+        const int target_extruder    = filament_map_1based[filament_id] - 1; // 转 0-based；单挤出机恒为 0
+        const int target_volume_type = filament_volume_map[filament_id];
+        if (auto it = key_to_nozzle_index.find(group_key); it != key_to_nozzle_index.end()) {
+            const NozzleInfo& nozzle = nozzle_list[it->second];
+            if (nozzle.extruder_id != target_extruder || !is_volume_compatible(nozzle.volume_type, target_volume_type))
+                return {};
+            filament_to_nozzle_index[filament_id] = it->second;
+            continue;
+        }
+
+        // 新 key：按 (挤出机, 流量) 选第一个已安装、未占用且兼容的喷嘴。
+        int matched_nozzle = -1;
+        for (size_t idx = 0; idx < nozzle_list.size(); ++idx) {
+            const NozzleInfo& nozzle = nozzle_list[idx];
+            if (!nozzle.installed || nozzle_taken[idx])                      continue;
+            if (nozzle.extruder_id != target_extruder)                      continue;
+            if (!is_volume_compatible(nozzle.volume_type, target_volume_type)) continue;
+            matched_nozzle = (int) idx;
+            break;
+        }
+        if (matched_nozzle < 0) // 该组找不到可用喷嘴，判为失败让上层报错
+            return {};
+
+        nozzle_taken[matched_nozzle]      = true;
+        key_to_nozzle_index[group_key]    = matched_nozzle;
+        filament_to_nozzle_index[filament_id] = matched_nozzle;
+    }
+    return filament_to_nozzle_index;
 }
 
 std::vector<NozzleInfo> build_nozzle_list(double diameter, const std::vector<int>& filament_nozzle_map, const std::vector<int>& filament_volume_map, const std::vector<int>& filament_map)
@@ -63,7 +214,7 @@ std::vector<NozzleInfo> load_nozzle_infos_with_compatibility(
     });
 
     if(!has_nozzle_info && !has_valid_filament_info){
-        BOOST_LOG_TRIVIAL(warning)<<__FUNCTION__ << ": building nozzle list from filament map and volume types";
+        BOOST_LOG_TRIVIAL(warning)<< "building nozzle list from filament map and volume types";
 
         // Backward compatibility for older gcode.3mf:
         // - nozzle_diameter is always present and its size defines extruder count.
@@ -88,7 +239,7 @@ std::vector<NozzleInfo> load_nozzle_infos_with_compatibility(
     }
 
     if(!has_nozzle_info){
-        BOOST_LOG_TRIVIAL(info)<<__FUNCTION__ << ": building nozzle list from filament info";
+        BOOST_LOG_TRIVIAL(info)<< "building nozzle list from filament info";
         std::map<int, NozzleInfo> nozzle_map; // group_id->NozzleInfo
         for(auto& filament : filament_infos){
             int group_id = filament.group_id.front();
@@ -122,7 +273,7 @@ std::vector<NozzleInfo> load_nozzle_infos_with_compatibility(
 
     auto result = nozzle_infos;
     std::sort(result.begin(), result.end());
-    BOOST_LOG_TRIVIAL(info)<<__FUNCTION__ << ": using new 3mf format with " << result.size() << " nozzle infos.";
+    BOOST_LOG_TRIVIAL(info)<< "using new 3mf format with " << result.size() << " nozzle infos.";
     return result;
 }
 
@@ -159,7 +310,8 @@ static bool has_filament_mapped_to_multiple_nozzles(const std::vector<std::vecto
 std::optional<LayeredNozzleGroupResult> LayeredNozzleGroupResult::create(
     const std::vector<int>& filament_nozzle_map,
     const std::vector<NozzleInfo>& nozzle_list,
-    const std::vector<unsigned int>& used_filaments)
+    const std::vector<unsigned int>& used_filaments,
+    bool                             handle_nozzle_as_extruder)
 {
     if (filament_nozzle_map.empty() || nozzle_list.empty()) {
         return std::nullopt;
@@ -169,6 +321,7 @@ std::optional<LayeredNozzleGroupResult> LayeredNozzleGroupResult::create(
     result._default_filament_nozzle_map = filament_nozzle_map;
     result._nozzle_list = nozzle_list;
     result._used_filaments = used_filaments;
+    result.handle_nozzle_as_extruder = handle_nozzle_as_extruder;
 
     return result;
 }
@@ -177,7 +330,8 @@ std::optional<LayeredNozzleGroupResult> LayeredNozzleGroupResult::create(
     const std::vector<std::vector<int>>&          layer_filament_nozzle_maps,
     const std::vector<NozzleInfo>&                nozzle_list,
     const std::vector<unsigned int>&              used_filaments,
-    const std::vector<std::vector<unsigned int>>& layer_filament_sequences)
+    const std::vector<std::vector<unsigned int>>& layer_filament_sequences,
+    bool                                          handle_nozzle_as_extruder)
 {
     if (layer_filament_nozzle_maps.empty() || nozzle_list.empty()) {
         return std::nullopt;
@@ -189,6 +343,7 @@ std::optional<LayeredNozzleGroupResult> LayeredNozzleGroupResult::create(
     result._layer_filament_sequences   = layer_filament_sequences;
     result._nozzle_list                = nozzle_list;
     result._used_filaments             = used_filaments;
+    result.handle_nozzle_as_extruder   = handle_nozzle_as_extruder;
 
     if (!layer_filament_nozzle_maps.empty()) {
         result._default_filament_nozzle_map = layer_filament_nozzle_maps[0];
@@ -203,7 +358,8 @@ std::optional<LayeredNozzleGroupResult> LayeredNozzleGroupResult::create(
     const std::vector<int>&             filament_volume_map,
     const std::vector<int>&             filament_nozzle_map,
     const std::vector<std::map<NozzleVolumeType, int>> &nozzle_count,
-    float                                               diameter)
+    float                                               diameter,
+    bool                                                handle_nozzle_as_extruder)
 {
     std::vector<NozzleGroupInfo> nozzle_groups;
     for (size_t extruder_id = 0; extruder_id < nozzle_count.size(); ++extruder_id) {
@@ -249,7 +405,7 @@ std::optional<LayeredNozzleGroupResult> LayeredNozzleGroupResult::create(
         output_nozzle_map[filament_idx] = output_nozzle_idx;
     }
 
-    return create(output_nozzle_map, nozzle_list, used_filaments);
+    return create(output_nozzle_map, nozzle_list, used_filaments, handle_nozzle_as_extruder);
 }
 
 bool LayeredNozzleGroupResult::are_filaments_same_extruder(int filament_id1, int filament_id2, int layer_id) const
@@ -258,6 +414,9 @@ bool LayeredNozzleGroupResult::are_filaments_same_extruder(int filament_id1, int
     std::optional<NozzleInfo> nozzle_info2 = get_nozzle_for_filament(filament_id2, layer_id);
 
     if (!nozzle_info1 || !nozzle_info2) return false;
+
+    if (handle_nozzle_as_extruder)
+        return are_filaments_same_nozzle(filament_id1, filament_id2, layer_id);
 
     return nozzle_info1->extruder_id == nozzle_info2->extruder_id;
 }
@@ -890,8 +1049,8 @@ std::vector<int> find_optimal_physical_assignment(
     }
 
     if (timed_out) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
-            << ": timed out after " << max_ms << "ms"
+        BOOST_LOG_TRIVIAL(warning)
+            << "timed out after " << max_ms << "ms"
             << ", filament_count=" << count
             << ", group_count=" << group_count
             << ", returning best assignment found so far";
@@ -983,8 +1142,200 @@ std::optional<NozzleGroupInfo> NozzleGroupInfo::deserialize(const std::string &s
 
         return NozzleGroupInfo(diameter, volume_type, extruder_id, nozzle_count);
     } catch (const std::exception &) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
         return std::nullopt;
     }
+}
+
+// ==================== 按实际映射重算打印预估时间 ====================
+
+bool resolve_ams_load_unload(const std::vector<double>& loads,
+                             const std::vector<double>& unloads,
+                             int                        ams_type,
+                             float                      legacy_load,
+                             float                      legacy_unload,
+                             float&                     out_load,
+                             float&                     out_unload)
+{
+    out_load   = legacy_load;
+    out_unload = legacy_unload;
+    if (ams_type < 0)
+        return false;
+
+    const size_t idx = static_cast<size_t>(ams_type);
+    if (idx >= loads.size() || idx >= unloads.size()) {
+        BOOST_LOG_TRIVIAL(warning) << "ams_type=" << ams_type
+                                   << " is out of range of the AMS load/unload time table, "
+                                   << "fallback to legacy machine_load/unload_filament_time";
+        return false;
+    }
+
+    out_load   = static_cast<float>(loads[idx]);
+    out_unload = static_cast<float>(unloads[idx]);
+    return true;
+}
+
+namespace {
+
+// Internal-only: hardware topology and the fully-expanded recalc input.
+// Not exposed in the header — callers use the estimate_mapped_print_time overload
+// that builds this from the slice result + printer config.
+enum class Topology {
+    Unknown = 0,
+    SingleExtruderAms,
+    Selector,
+    ToolRack,
+};
+
+struct PrintTimeRecalcInput {
+    Topology topology{Topology::Unknown};
+    float    sliced_total_seconds{0.f};
+
+    // Filament ids in slice order; adjacent pairs drive change time.
+    std::vector<int> filament_change_sequence;
+
+    // Single AMS type assumed at slice time (must be >= 0 for SingleExtruderAms).
+    int sliced_ams_type{-1};
+
+    // Index == logical filament id; unused entries may be -1.
+    // Every filament id that appears in filament_change_sequence must be valid (>= 0).
+    std::vector<int> actual_ams_type_per_filament;
+
+    // Same printer-preset tables used when slicing (caller-supplied).
+    std::vector<double> ams_filament_load_times;
+    std::vector<double> ams_filament_unload_times;
+    float legacy_load{0.f};
+    float legacy_unload{0.f};
+};
+
+bool lookup_filament_ams_type(const std::vector<int>& types, int filament_id, int& out_type)
+{
+    if (filament_id < 0 || static_cast<size_t>(filament_id) >= types.size())
+        return false;
+    out_type = types[filament_id];
+    return out_type >= 0;
+}
+
+PrintTimeRecalcResult recalc_single_extruder_ams(const PrintTimeRecalcInput& in)
+{
+    PrintTimeRecalcResult r;
+    if (in.sliced_total_seconds < 0.f) {
+        r.reason = FailReason::InconsistentInput;
+        return r;
+    }
+    if (in.sliced_ams_type < 0 || in.ams_filament_load_times.empty() || in.ams_filament_unload_times.empty()) {
+        r.reason = FailReason::MissingTimeParams;
+        return r;
+    }
+
+    for (int fid : in.filament_change_sequence) {
+        int t = -1;
+        if (!lookup_filament_ams_type(in.actual_ams_type_per_filament, fid, t)) {
+            r.reason = FailReason::InvalidMapping;
+            return r;
+        }
+    }
+
+    float sliced_load   = 0.f;
+    float sliced_unload = 0.f;
+    resolve_ams_load_unload(in.ams_filament_load_times, in.ams_filament_unload_times, in.sliced_ams_type,
+                            in.legacy_load, in.legacy_unload, sliced_load, sliced_unload);
+
+    float sliced_change = 0.f;
+    float actual_change = 0.f;
+    const auto& seq = in.filament_change_sequence;
+    for (size_t i = 0; i + 1 < seq.size(); ++i) {
+        const int id_a = seq[i];
+        const int id_b = seq[i + 1];
+
+        int type_a = -1;
+        int type_b = -1;
+        lookup_filament_ams_type(in.actual_ams_type_per_filament, id_a, type_a);
+        lookup_filament_ams_type(in.actual_ams_type_per_filament, id_b, type_b);
+
+        sliced_change += sliced_unload + sliced_load;
+
+        float load_a_ignored   = 0.f;
+        float unload_a         = 0.f;
+        float load_b           = 0.f;
+        float unload_b_ignored = 0.f;
+        resolve_ams_load_unload(in.ams_filament_load_times, in.ams_filament_unload_times, type_a,
+                                in.legacy_load, in.legacy_unload, load_a_ignored, unload_a);
+        resolve_ams_load_unload(in.ams_filament_load_times, in.ams_filament_unload_times, type_b,
+                                in.legacy_load, in.legacy_unload, load_b, unload_b_ignored);
+        actual_change += unload_a + load_b;
+    }
+
+    r.gap_seconds = actual_change - sliced_change;
+    float total   = in.sliced_total_seconds + r.gap_seconds;
+    if (total < 0.f)
+        total = 0.f;
+    r.total_seconds = total;
+    r.reason        = FailReason::Ok;
+    return r;
+}
+
+PrintTimeRecalcInput build_input_from_slice(const GCodeProcessorResult& slice_result,
+                                            const DynamicPrintConfig&   printer_config,
+                                            const std::vector<int>&     actual_ams_type_per_filament)
+{
+    PrintTimeRecalcInput in;
+    in.topology                     = Topology::SingleExtruderAms;
+    in.actual_ams_type_per_filament = actual_ams_type_per_filament;
+
+    const size_t normal = static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal);
+    if (normal < slice_result.print_statistics.modes.size())
+        in.sliced_total_seconds = slice_result.print_statistics.modes[normal].time;
+
+    in.filament_change_sequence.reserve(slice_result.filament_change_sequence.size());
+    for (unsigned int fid : slice_result.filament_change_sequence)
+        in.filament_change_sequence.push_back(static_cast<int>(fid));
+
+    if (const auto* opt = printer_config.option<ConfigOptionInt>("default_ams_type"))
+        in.sliced_ams_type = opt->value;
+
+    in.ams_filament_load_times   = get_ams_load_times(printer_config);
+    in.ams_filament_unload_times = get_ams_unload_times(printer_config);
+
+    if (const auto* opt = printer_config.option<ConfigOptionFloat>("machine_load_filament_time"))
+        in.legacy_load = static_cast<float>(opt->value);
+    if (const auto* opt = printer_config.option<ConfigOptionFloat>("machine_unload_filament_time"))
+        in.legacy_unload = static_cast<float>(opt->value);
+
+    return in;
+}
+
+// Topology dispatch. P0: SingleExtruderAms only; other topologies fall back to the
+// sliced total time via UnsupportedTopology.
+PrintTimeRecalcResult estimate_mapped_print_time_impl(const PrintTimeRecalcInput& in)
+{
+    switch (in.topology) {
+    case Topology::SingleExtruderAms:
+        return recalc_single_extruder_ams(in);
+    case Topology::Selector:
+    case Topology::ToolRack:
+    case Topology::Unknown:
+    default: {
+        PrintTimeRecalcResult r;
+        r.reason = FailReason::UnsupportedTopology;
+        return r;
+    }
+    }
+}
+
+} // namespace
+
+PrintTimeRecalcResult estimate_mapped_print_time(const GCodeProcessorResult* slice_result,
+                                                 const DynamicPrintConfig*   printer_config,
+                                                 const std::vector<int>&     actual_ams_type_per_filament)
+{
+    PrintTimeRecalcResult r;
+    if (!slice_result || !printer_config) {
+        r.reason = FailReason::InconsistentInput;
+        return r;
+    }
+    return estimate_mapped_print_time_impl(
+        build_input_from_slice(*slice_result, *printer_config, actual_ams_type_per_filament));
 }
 
 }} // namespace Slic3r::MultiNozzleUtils

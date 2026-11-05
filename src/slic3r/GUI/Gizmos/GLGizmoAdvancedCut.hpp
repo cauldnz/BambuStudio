@@ -3,6 +3,7 @@
 
 #include "GLGizmoBase.hpp"
 #include "GLGizmoRotate.hpp"
+#include "FacetPicker.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/CutUtils.hpp"
 
@@ -13,6 +14,7 @@ struct CutConnectorAttributes;
 
 namespace GUI {
 enum class SLAGizmoEventType : unsigned char;
+struct Camera;
 
 namespace CommonGizmosDataObjects {
 class ObjectClipper;
@@ -21,8 +23,16 @@ class PartSelection
 {
 public:
     PartSelection() = default;
-    PartSelection(
-        const ModelObject *mo, const Transform3d &cut_matrix, int instance_idx, const Vec3d &center, const Vec3d &normal, const CommonGizmosDataObjects::ObjectClipper &oc);
+    // Planar-cut preview, CPU part only, so it can run on a worker thread. contour_pts and
+    // sla_shift_z are captured on the UI thread by the caller; this constructor touches neither
+    // the object clipper, the selection nor OpenGL. `progress` receives percent in [0, 96]
+    // (message is always null). A canceled build leaves valid() false.
+    PartSelection(const ModelObject *mo, const Transform3d &cut_matrix, int instance_idx, const Vec3d &center, const Vec3d &normal,
+                  const std::vector<Vec3d> &contour_pts, double sla_shift_z,
+                  const CutProgressCallback &progress = nullptr, const CutCancelCallback &cancel = nullptr);
+    // Second half of the planar build: uploads the preview meshes to the GPU. Must run on the
+    // UI thread with the GL context current. Returns false when the CPU build did not finish.
+    bool upload_glmodels();
     PartSelection(const ModelObject *mo, int instance_idx_in);
     ~PartSelection()
     {
@@ -42,8 +52,12 @@ public:
     };
     void         part_render(const Vec3d *cut_center, const Vec3d *normal);
     void         toggle_selection(const Vec2d &mouse_pos);
+    // Picks with a given camera, e.g. the one captured when a deferred click was made.
+    void         toggle_selection(const Vec2d &mouse_pos, const Camera &camera);
     void         toggle_selection(int id);
     void         turn_over_selection();
+    // True when the mouse ray hits a switchable cut part (tooltip hover only).
+    bool         is_mouse_over_part(const Vec2d &mouse_pos) const;
     ModelObject* model_object() { return m_model.objects.front(); }
     bool         valid() const { return m_valid; }
     bool         is_one_object() const;
@@ -65,7 +79,11 @@ private:
 
     std::vector<Vec3d>              m_contour_points; // Debugging
     std::vector<std::vector<Vec3d>> m_debug_pts;      // Debugging
-    void                            add_object(const ModelObject *object);
+    // sla_shift_known false reads the shift from the UI selection. The worker passes true.
+    void                            add_object(const ModelObject *object, double sla_shift_z = 0., bool sla_shift_known = false);
+    // MeshRaycaster hit test for cut-part preview meshes; -1 if no hit.
+    int                             pick_part_id(const Vec2d &mouse_pos) const;
+    int                             pick_part_id(const Vec2d &mouse_pos, const Camera &camera) const;
 };
 
 class GLGizmoAdvancedCut : public GLGizmoRotate3D
@@ -121,6 +139,9 @@ private:
 
     mutable Grabber m_move_z_grabber;
     mutable Grabber m_move_x_grabber;
+
+    // Pick-face mode: click a triangular facet of the model to set the cut plane.
+    FacetPicker m_facet_picker;
 
     bool m_connectors_editing{false};
     bool m_localized_cut_editing = true;
@@ -281,6 +302,10 @@ protected:
     }
 
 private:
+    // Set while a deferred perform_cut() is queued on the event loop, so holding the button down
+    // or clicking twice in one frame cannot enqueue a second cut.
+    bool m_perform_cut_requested { false };
+
     void perform_cut(const Selection& selection);
     bool can_perform_cut() const;
     void apply_connectors_in_model(ModelObject *mo, int &dowels_count);
@@ -300,6 +325,7 @@ private:
     void put_connectors_on_cut_plane(const Vec3d &cp_normal, double cp_offset);
     void update_plane_normal();
     void update_clipper();
+    void update_dovetail_preview_clip();
     // on render
     void render_cut_plane_and_grabbers();
     void on_render_rotate_gizmos();
@@ -307,6 +333,8 @@ private:
     void render_localized_cut_shadow();
     void render_clipper_cut();
     void render_cut_line();
+    // pick-face mode
+    bool apply_picked_facet();
 
     void clear_selection();
     void init_connector_shapes();
@@ -326,11 +354,25 @@ private:
     void flip_cut_plane();
     void update_plane_model();
     void init_picking_models();
+    bool has_valid_groove_shape() const;
     bool has_valid_groove() const;
     bool has_valid_contour() const;
     void reset_cut_by_contours();
     void render_flip_plane_button(bool disable_pred = false);
-    void process_contours();
+    // Planar mode: starts the background part-preview build for the first right-click at
+    // mouse_position. The flip is applied once the build finishes (poll_part_selection_job()).
+    void process_contours(const Vec2d &mouse_position);
+
+    // Background part-preview build. The card shows its progress and a cancel button once
+    // it runs past 1.5s; plane edits and right-clicks are locked while it is alive.
+    struct PartSelectionJob;
+    std::shared_ptr<PartSelectionJob> m_part_job;
+    bool is_part_job_running() const { return m_part_job != nullptr; }
+    // UI thread, inside the render pass: uploads and installs a finished preview.
+    void poll_part_selection_job();
+    // Drops the pending result. wait=true also joins the worker (used when the gizmo closes).
+    void cancel_part_selection_job(bool wait);
+    void render_part_job_progress();
     void toggle_model_objects_visibility(bool show_in_3d = false);
     void deal_connector_pos_by_type(Vec3d &pos, float &height, CutConnectorType, CutConnectorStyle, bool looking_forward, bool is_edit, const Vec3d &clp_normal);
     void update_bb();

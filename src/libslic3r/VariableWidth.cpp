@@ -83,7 +83,7 @@ ExtrusionMultiPath thick_polyline_to_multi_path(const ThickPolyline& thick_polyl
                 // (of the previous line) width is within the accepted tolerance
                 path.polyline.append(line.b);
             } else {
-                // we need to initialize a new line
+                path.overhang_degree = overhang;
                 multi_path.paths.emplace_back(std::move(path));
                 path = ExtrusionPath(role);
                 -- i;
@@ -98,7 +98,7 @@ ExtrusionMultiPath thick_polyline_to_multi_path(const ThickPolyline& thick_polyl
 }
 
 //BBS: new function to filter width to avoid too fragmented segments
-static ExtrusionPaths thick_polyline_to_extrusion_paths_2(const ThickPolyline& thick_polyline, ExtrusionRole role, const Flow& flow, const float tolerance)
+ExtrusionPaths thick_polyline_to_extrusion_paths_2(const ThickPolyline& thick_polyline, ExtrusionRole role, const Flow& flow, const float tolerance)
 {
     ExtrusionPaths paths;
     ExtrusionPath path(role);

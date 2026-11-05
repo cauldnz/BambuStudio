@@ -1,6 +1,7 @@
 #ifndef slic3r_GUI_App_hpp_
 #define slic3r_GUI_App_hpp_
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -14,7 +15,6 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/GUI/WebViewDialog.hpp"
 #include "slic3r/GUI/WebUserLoginDialog.hpp"
-#include "slic3r/GUI/BindDialog.hpp"
 #include "slic3r/GUI/HMS.hpp"
 #include "slic3r/GUI/fila_manager/wgtFilaManagerStore.h"
 #include "slic3r/GUI/fila_manager/wgtFilaManagerSync.h"
@@ -26,6 +26,7 @@
 #include "slic3r/GUI/UnsavedChangesDialog.hpp"
 #include "../Utils/PrintHost.hpp"
 #include "slic3r/GUI/GLEnums.hpp"
+#include "slic3r/Utils/VersionPolicyManager.hpp"
 
 #include <wx/app.h>
 #include <wx/timer.h>
@@ -38,6 +39,7 @@
 
 #include <mutex>
 #include <stack>
+#include "libslic3r/Log.hpp"
 
 #ifdef __APPLE__
 #include <IOKit/pwr_mgt/IOPMLib.h>
@@ -71,6 +73,7 @@ namespace Slic3r {
 
 class AppConfig;
 class FilamentColorCodeQuery;
+class GLShaderProgram;
 class PresetBundle;
 class PresetUpdater;
 class ModelObject;
@@ -94,11 +97,12 @@ class ParamsPanel;
 class NotificationManager;
 struct GUI_InitParams;
 class ParamsDialog;
-class HMSQuery;
+class HMSQueryMgr;
 class ModelMallDialog;
 class PingCodeBindDialog;
 class NetworkErrorDialog;
 class OpenGLManager;
+class PreferencesDialog;
 
 enum FileType
 {
@@ -192,6 +196,7 @@ public:
                 }
             }
             catch (...) {
+                BOOST_LOG_TRIVIAL(warning) << current_exception_message();
                 ;
             }
         }
@@ -225,6 +230,7 @@ public:
                 }
             }
             catch (...) {
+                BOOST_LOG_TRIVIAL(warning) << current_exception_message();
                 return -1;
             }
         }
@@ -253,6 +259,13 @@ struct TryLoadLastMachine
 
     boost::thread local_bind_thread;
 };
+
+enum class MonitorCtrlId {
+    NozzleTemp, BedTemp, ChamberTemp, AxisMove, Extrude,
+    PrintSpeed, Fan, Lamp, NozzleRack, SelectExtruder
+};
+
+enum class UepFamilyGate : int { Free = 0, ForceOn = 1, ForceOff = 2 };
 
 class GUI_App : public wxApp
 {
@@ -359,7 +372,7 @@ private:
     VersionInfo version_info;
     VersionInfo privacy_version_info;
     static std::string version_display;
-    HMSQuery    *hms_query { nullptr };
+    HMSQueryMgr *hms_query_mgr { nullptr };
     FilamentColorCodeQuery* m_filament_color_code_query{ nullptr };
 
     boost::thread    m_sync_update_thread;
@@ -376,6 +389,19 @@ private:
 #endif
 
     boost::thread    m_check_cert_thread;
+    boost::thread    m_minors_decisions_thread;
+    std::atomic<MinorDecision> m_remote_control_minor_decision{MinorDecision::Allow};
+    std::atomic<UepFamilyGate> m_uep_family_gate{UepFamilyGate::Free};
+    std::atomic<MinorDecision> m_access_maker_world{MinorDecision::Allow};
+    std::atomic<MinorDecision> m_access_maker_lab{MinorDecision::Allow};
+    std::atomic<MinorDecision> m_access_maker_supply{MinorDecision::Allow};
+    // The cloud-preset sync prompt is held back until the minors decisions return,
+    // so a force-logged-out minor account never sees it.
+    bool             m_minors_decisions_pending{false};
+    bool             m_sync_prompt_deferred{false};
+    // UEP (Join User Experience Program) decision is re-fetched when Preferences
+    // opens; the open dialog is tracked here so the result can refresh its checkbox.
+    PreferencesDialog* m_preferences_dialog{nullptr};
     TryLoadLastMachine m_load_last_machine;
 
 public:
@@ -410,6 +436,8 @@ public:
     wgtFilaManagerCloudSync*        fila_manager_cloud_sync()   { return m_fila_manager_cloud_sync; }
     wgtFilaManagerCloudDispatcher*  fila_manager_cloud_disp()   { return m_fila_manager_cloud_disp; }
     bool                            is_fila_manager_disabled() const { return m_disable_fila_manager; }
+    void notify_new_rfid_filament(const std::string& ams_id, const std::string& slot_id);
+    void open_new_official_filament_hint(const std::string& ams_id, const std::string& slot_id);
 #if !BBL_RELEASE_TO_PUBLIC
     void set_fila_debug_sink(std::function<void(const nlohmann::json&)> sink)
     {
@@ -423,7 +451,7 @@ public:
                              const std::string& title,
                              const std::string& summary,
                              const nlohmann::json& detail = nlohmann::json::object());
-    HMSQuery* get_hms_query() { return hms_query; }
+    HMSQueryMgr* get_hms_query_mgr() { return hms_query_mgr; }
     NetworkAgent* getAgent() { return m_agent; }
     FilamentColorCodeQuery* get_filament_color_code_query();
     bool is_editor() const { return m_app_mode == EAppMode::Editor; }
@@ -469,7 +497,13 @@ public:
     void            UpdateDlgDarkUI(wxDialog* dlg);
     void            UpdateFrameDarkUI(wxFrame* dlg);
     // update color mode for DataViewControl
-    void            UpdateDVCDarkUI(wxDataViewCtrl* dvc, bool highlited = false);
+    /**
+     * \brief Apply the dark-mode theme to a wxDataViewCtrl and its header.
+     * \param dvc         Control to theme.
+     * \param highlited   Use the highlighted dark background.
+     * \param header_font Optional header font; nullptr keeps the app's normal font.
+     */
+    void            UpdateDVCDarkUI(wxDataViewCtrl* dvc, bool highlited = false, const wxFont* header_font = nullptr);
     // update color mode for panel including all static texts controls
     void            UpdateAllStaticTextDarkUI(wxWindow* parent);
     void            init_fonts();
@@ -518,7 +552,11 @@ public:
     void            import_model(wxWindow *parent, wxArrayString& input_files) const;
     void            load_gcode(wxWindow* parent, wxString& input_file) const;
 
-    wxString        transition_tridid(int trid_id, std::optional<int> total_extruder_count = std::nullopt) const;
+    wxString        transition_tridid(int trid_id, std::optional<int> total_extruder_count = std::nullopt, MachineObject* obj = nullptr) const;
+    wxString        transition_tridid_legacy(int trid_id, std::optional<int> total_extruder_count = std::nullopt) const;
+    // Hotend-rack machines: own feeds are nozzle-scoped ("9" / "9-Ext"), while
+    // external AMS units keep their global letter code ("A1" / "HT-A").
+    wxString        transition_tridid_rack(int trid_id, MachineObject* obj) const;
     void            ShowUserGuide();
     void            ShowDownNetPluginDlg(bool post_login = false);
     void            ShowUserLogin(bool show = true);
@@ -529,6 +567,21 @@ public:
     void            get_login_info();
     void            sync_left_server_connect_status();
     bool            is_user_login();
+    bool            is_monitor_ctrl_blocked(MonitorCtrlId which);
+    bool            is_monitor_ctrl_force_disabled();
+    bool            is_uep_force_disabled();   // Join User Experience Program (Preferences): locked (allow/deny)
+    bool            is_uep_force_checked();    // Join User Experience Program: guardian-enabled (allow) -> checked
+    bool            is_maker_world_access_disabled();    // homepage: MakerWorld (Online Models) access gate (decision != Allow)
+    bool            is_maker_lab_access_disabled();      // homepage: MakerLab access gate (decision != Allow)
+    bool            is_maker_supply_access_disabled();   // homepage: Maker's Supply access gate (decision != Allow)
+    void            fetch_minors_decisions();
+    void            fetch_uep_decision();   // UEP-only fetch, triggered when Preferences opens
+    bool            apply_uep_gate(UepFamilyGate new_gate, bool force);
+    std::string     fetch_family_hub_signin_url();      // fetch child-registration key (needs valid token) and build the family-hub sign-in url; "" on failure
+    void            force_logout_uep_login_invalid(const std::string& signin_url);   // minor account not linked to a guardian -> force logout
+    void            set_preferences_dialog(PreferencesDialog* dlg) { m_preferences_dialog = dlg; }
+    void            refresh_monitor_ctrl_area_ui();
+    void            refresh_homepage_access_ui();
 
     void            request_user_login(int online_login = 0);
     void            request_user_handle(int online_login = 0);
@@ -560,6 +613,7 @@ public:
     void            check_update(bool show_tips, int by_user);
     void            check_new_version(bool show_tips = false, int by_user = 0);
     void            check_cert();
+    void            post_device_region();
     bool            process_network_msg(std::string dev_id, std::string msg);
     void            check_beta_version(bool show_tips_when_no_beta = false);
     void            request_new_version(int by_user);
@@ -587,12 +641,67 @@ public:
     void            report_consent(std::string expand);
     void            check_track_enable();
 
+    /**
+     * @brief Asks the cloud version policy about a check point.
+     *
+     * Only answers what the policy says. Showing a VersionPolicyDialog and
+     * deciding what its buttons do is left to the caller, since what a hit
+     * means differs per check point.
+     *
+     * @param point Check point to evaluate.
+     * @return The hits, if any. An empty result means the caller may carry on
+     *         silently, which is also what any failure below resolves to.
+     * @note Does not throw and performs no network I/O.
+     */
+    PolicyCheckResult check_version_policy(PolicyCheckPoint point);
+
+    /**
+     * @brief Shows the policy that matched at startup, if any.
+     *
+     * Quits the application on a block: such a version must not reach the
+     * workspace at all.
+     */
+    void            check_startup_version_policy();
+
+    /**
+     * @brief Shows the policy that guards slicing, if any.
+     *
+     * Call it on an explicit slice request, before any slicing work starts.
+     *
+     * @return true when slicing may go ahead: nothing matched, or the user
+     *         chose to continue through a warning. A block always returns false.
+     */
+    bool            check_slice_version_policy();
+
+    /**
+     * @brief Silent (no dialog) test of whether the current version is hard-blocked
+     *        from slicing by the cloud policy.
+     *
+     * Use it to short-circuit expensive pre-slice work (AMS sync checks, first-time
+     * tutorial popups) without raising the policy dialog. The single user-facing
+     * dialog is still raised by check_slice_version_policy() at the actual slice.
+     *
+     * @return true only when a BeforeSlice policy of severity "block" matches; a
+     *         warning-only match or no match returns false.
+     */
+    bool            is_slice_version_blocked();
+
+    /**
+     * @brief Shows the policy that guards printing, if any.
+     *
+     * Call it right before the send to printer dialog would come up.
+     *
+     * @return true when the dialog may come up: nothing matched, or the user
+     *         chose to continue through a warning. A block always returns false.
+     */
+    bool            check_send_print_version_policy();
+
     static bool     catch_error(std::function<void()> cb, const std::string& err);
 
     //for helio slice
     bool            is_helio_enable();
     static void     request_helio_pat(std::function<void(std::string)> func);
-    static void     request_helio_supported_data();
+    static void     request_helio_supported_data(bool force_refresh = false);
 	//static std::vector<Slic3r::HelioQuery::SupportedPrinters> get_helio_support_printer_model();
 
     void                                               persist_window_geometry(wxTopLevelWindow *window, bool default_maximized = false);
@@ -640,7 +749,7 @@ public:
     wxString 		current_language_code_safe() const;
     bool            is_localized() const { return m_wxLocale->GetLocale() != "English"; }
 
-    void            open_preferences(size_t open_on_tab = 0, const std::string& highlight_option = std::string());
+    void            open_preferences();
 
     void            report_consent_common(bool agree, std::string scene, std::string formID);
     virtual bool OnExceptionInMainLoop();
@@ -782,6 +891,11 @@ public:
 
     void update_log_sink_region();
 
+    // Apply a "severity_level" string (fatal/error/warning/info/debug/trace) to
+    // both the Boost.Log and wx logging verbosity, keeping them in sync. Single
+    // entry point used at init and by the preference combobox.
+    void set_severity_level(const std::string &level);
+
 private:
     int             updating_bambu_networking();
     bool            on_init_inner();
@@ -833,6 +947,7 @@ bool is_support_filament(int extruder_id, bool strict_check = true);
 bool is_soluble_filament(int extruder_id);
 // check if the filament for model is in the list
 bool has_filaments(const std::vector<string>& model_filaments);
+std::vector<bool> has_filament_groups(const std::vector<std::vector<string>> &model_filament_groups);
 
 static std::vector<wxLanguage> s_supported_languages = {
     wxLANGUAGE_ENGLISH,
@@ -852,7 +967,12 @@ static std::vector<wxLanguage> s_supported_languages = {
     wxLANGUAGE_UKRAINIAN,
     wxLANGUAGE_PORTUGUESE_BRAZILIAN,
     wxLANGUAGE_TURKISH,
-    wxLANGUAGE_POLISH
+    wxLANGUAGE_POLISH,
+    wxLANGUAGE_THAI,
+    wxLANGUAGE_ROMANIAN,
+    wxLANGUAGE_GREEK,
+    wxLANGUAGE_INDONESIAN,
+    wxLANGUAGE_VIETNAMESE
 };
 } // namespace GUI
 } // Slic3r

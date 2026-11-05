@@ -61,6 +61,18 @@ export function canonicalizeHexList(input: readonly (string | undefined | null)[
 }
 
 /**
+ * Returns true when the hex value represents a fully transparent colour
+ * (alpha byte == 0x00 in 8-char RRGGBBAA form). Used by SpoolColorChip to
+ * render a checkered pattern instead of a solid black chip.
+ */
+export function isTransparentHex(value: string | undefined | null): boolean {
+  const raw = (value ?? '').trim();
+  const withHash = raw.startsWith('#') ? raw : `#${raw}`;
+  if (!/^#[0-9A-Fa-f]{8}$/.test(withHash)) return false;
+  return withHash.slice(7, 9).toUpperCase() === '00';
+}
+
+/**
  * Multiset key used by reverse-lookup matchers. Order-independent and
  * case-independent (canonicalises first), so two SKUs that share a hex pair
  * but persist them in different orders compare equal.
@@ -70,4 +82,28 @@ export function canonicalizeHexList(input: readonly (string | undefined | null)[
  */
 export function hexMultisetKey(input: readonly (string | undefined | null)[] | undefined): string {
   return canonicalizeHexList(input).slice().sort().join(',');
+}
+
+/**
+ * Extract the alpha byte (0–255) from an 8-char hex string (`#RRGGBBAA` or
+ * `RRGGBBAA`). Returns 255 (fully opaque) when the input is shorter than 8
+ * hex digits or not a valid hex, so callers can treat missing-alpha as opaque.
+ */
+export function getAlphaByte(hex: string | undefined | null): number {
+  const raw = (hex ?? '').trim();
+  const withHash = raw.startsWith('#') ? raw : `#${raw}`;
+  if (!/^#[0-9A-Fa-f]{8}$/.test(withHash)) return 255;
+  return parseInt(withHash.slice(7, 9), 16);
+}
+
+/**
+ * Returns true when the hex value represents a partially-transparent colour
+ * (alpha byte in 1–254). Fully transparent (0x00) is handled by
+ * `isTransparentHex`; fully opaque (0xFF / 0xFE) is the normal case.
+ * Use this to decide whether to render a tinted-checkerboard swatch instead
+ * of a solid fill, matching the prepare-page (C++ ImGui) rendering.
+ */
+export function hasPartialTransparency(hex: string | undefined | null): boolean {
+  const a = getAlphaByte(hex);
+  return a > 0 && a < 255;
 }

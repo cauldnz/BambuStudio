@@ -13,8 +13,7 @@
 
 #include <wx/simplebook.h>
 #include <wx/dcgraph.h>
-
-#include <boost/log/trivial.hpp>
+#include "libslic3r/Log.hpp"
 
 
 namespace Slic3r { namespace GUI {
@@ -31,7 +30,6 @@ AMSControl::AMSControl(wxWindow *parent, wxWindowID id, const wxPoint &pos, cons
     , m_Humidity_tip_popup(AmsHumidityTipPopup(this))
     , m_percent_humidity_dry_popup(new uiAmsPercentHumidityDryPopup(this))
     , m_ams_introduce_popup(AmsIntroducePopup(this))
-    , m_ams_dry_ctr_win(new AMSDryCtrWin(this))
 {
     Slic3r::DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (dev) {
@@ -345,13 +343,10 @@ AMSControl::AMSControl(wxWindow *parent, wxWindowID id, const wxPoint &pos, cons
                 int humidity_value = info->humidity_display_idx;
                 if (humidity_value > 0 && humidity_value <= 5) { m_Humidity_tip_popup.set_humidity_level(humidity_value); }
                 m_Humidity_tip_popup.Popup();
-            } else if (obj && obj->is_support_remote_dry && (info->ams_type == DevAmsType::N3F || info->ams_type == DevAmsType::N3S)){
-                m_ams_dry_ctr_win->set_ams_id(info->ams_id);
-
+            } else if (obj && obj->is_support_remote_dry && (info->ams_type == DevAmsType::N3F || info->ams_type == DevAmsType::N3S || info->ams_type == DevAmsType::ZMULTI_A)){
                 wxPoint img_pos = ClientToScreen(wxPoint(0, 0));
-                wxPoint popup_pos(img_pos.x - m_ams_dry_ctr_win->GetSize().GetWidth() + FromDIP(150), img_pos.y - FromDIP(80));
-                m_ams_dry_ctr_win->Move(popup_pos);
-                m_ams_dry_ctr_win->ShowModal();
+                wxPoint popup_pos(img_pos.x - FromDIP(700) + FromDIP(150), img_pos.y - FromDIP(80));
+                AMSDryCtrWin::RunModal(this, info->ams_id, popup_pos);
             } else {
                 m_percent_humidity_dry_popup->Update(info);
 
@@ -372,11 +367,28 @@ void AMSControl::on_retry()
     post_event(wxCommandEvent(EVT_AMS_RETRY));
 }
 
+void AMSControl::dismiss_filament_hint(const std::string& ams_id, const std::string& slot_id)
+{
+    auto it = m_ams_item_list.find(ams_id);
+    if (it == m_ams_item_list.end() || !it->second) return;
+    auto libs = it->second->get_can_lib_list();
+    auto lib_it = libs.find(slot_id);
+    if (lib_it != libs.end() && lib_it->second)
+    lib_it->second->set_new_filament_hint(false);
+}
+
+void AMSControl::show_filament_hint(const std::string& ams_id, const std::string& slot_id)
+{
+    auto it = m_ams_item_list.find(ams_id);
+    if (it == m_ams_item_list.end() || !it->second) return;
+    auto libs = it->second->get_can_lib_list();
+    auto lib_it = libs.find(slot_id);
+    if (lib_it != libs.end() && lib_it->second)
+        lib_it->second->set_new_filament_hint(true);
+}
+
 AMSControl::~AMSControl()
 {
-    if (m_ams_dry_ctr_win) {
-        delete m_ams_dry_ctr_win;
-    }
 }
 
 std::string AMSControl::GetCurentAms() {
@@ -466,6 +478,7 @@ void AMSControl::AmsSelectedSwitch(wxCommandEvent& event) {
             }
         }
         catch (...){
+            BOOST_LOG_TRIVIAL(warning) << current_exception_message();
             ;
         }
     }
@@ -484,6 +497,7 @@ void AMSControl::AmsSelectedSwitch(wxCommandEvent& event) {
             }
         }
         catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << current_exception_message();
             ;
         }
     }
@@ -508,7 +522,7 @@ void AMSControl::EnableLoadFilamentBtn(bool enable, const std::string& ams_id, c
 {
     m_button_extruder_feed->Enable(enable);
     if (m_button_extruder_feed->GetToolTipText() != tips) {
-        BOOST_LOG_TRIVIAL(info) << "ams_id=" << ams_id << ", can_id=" << can_id << "  Set Load Filament Button ToolTip : " << tips.ToUTF8();
+        BOOST_LOG_TRIVIAL(info) << KV(log_key::ams_id, ams_id) << "can_id=" << can_id << "  Set Load Filament Button ToolTip : " << tips.ToUTF8();
         m_button_extruder_feed->SetToolTip(tips);
     }
 }
@@ -517,7 +531,7 @@ void AMSControl::EnableUnLoadFilamentBtn(bool enable, const std::string& ams_id,
 {
     m_button_extruder_back->Enable(enable);
     if (m_button_extruder_back->GetToolTipText() != tips) {
-        BOOST_LOG_TRIVIAL(info) << "ams_id=" << ams_id << ", can_id=" << can_id << "  Set Unload Filament Button ToolTip : " << tips.ToUTF8();
+        BOOST_LOG_TRIVIAL(info) << KV(log_key::ams_id, ams_id) << "can_id=" << can_id << "  Set Unload Filament Button ToolTip : " << tips.ToUTF8();
         m_button_extruder_back->SetToolTip(tips);
     }
 }
@@ -626,10 +640,6 @@ void AMSControl::msw_rescale()
 
     if (m_percent_humidity_dry_popup){
         m_percent_humidity_dry_popup->msw_rescale();
-    }
-
-    if (m_ams_dry_ctr_win) {
-        m_ams_dry_ctr_win->msw_rescale();
     }
 
     m_Humidity_tip_popup.msw_rescale();
@@ -825,6 +835,10 @@ void AMSControl::CreateAmsSingleNozzle(const std::string &series_name, const std
 
     //add ams data
     for (auto ams_info = m_ams_info.begin(); ams_info != m_ams_info.end(); ams_info++) {
+        if (ams_info->ams_type == DevAmsType::ZMULTI_A || ams_info->ams_type == DevAmsType::ZMULTI_B) {
+            continue;
+        }
+
         auto panel_pos = ams_info->GetDefaultPanelPos(s_extruder_count_single);
         if (m_ams_mixed && ams_info->ams_type == DevAmsType::AMS_LITE) {
             panel_pos = AMSPanelPos::RIGHT_PANEL;
@@ -1015,27 +1029,6 @@ void AMSControl::show_vams_kn_value(bool show)
     //m_vams_lib->show_kn_value(show);
 }
 
-void AMSControl::UpdateAmsDryControl(MachineObject* obj)
-{
-    if (!m_ams_dry_ctr_win->IsShown()) {
-        return;
-    }
-
-    if (!obj || !obj->GetFilaSystem()) {
-        m_ams_dry_ctr_win->Close();
-        return;
-    }
-
-    std::weak_ptr<DevFilaSystem> weak_fila_system = obj->GetFilaSystem();
-
-    if (auto locaked_fila_system = weak_fila_system.lock()) {
-        m_ams_dry_ctr_win->update(locaked_fila_system, obj);
-    } else {
-        m_ams_dry_ctr_win->Close();
-        return;
-    }
-}
-
 void AMSControl::UpdateAms(const std::string   &series_name,
                            const std::string   &printer_type,
                            std::vector<AMSinfo> ams_info,
@@ -1046,6 +1039,10 @@ void AMSControl::UpdateAms(const std::string   &series_name,
                            bool                 is_reset,
                            bool                 test)
 {
+    if (!IsShown()) {
+        return;
+    };
+
     if (!test){
         // update item
         bool fresh = false;
@@ -1093,7 +1090,7 @@ void AMSControl::UpdateAms(const std::string   &series_name,
             }
             std::string ams_id = ams_item.second->get_ams_id();
             AmsItem* cans = ams_item.second;
-            if (cans->get_ams_id() == std::to_string(VIRTUAL_TRAY_MAIN_ID) || cans->get_ams_id() == std::to_string(VIRTUAL_TRAY_DEPUTY_ID)) {
+            if (obj && obj->GetFilaSystem()->IsVirtualTrayId(ams_id)) {
                 for (auto ifo : m_ext_info) {
                     if (ifo.ams_id == ams_id) {
                         cans->Update(ifo);
@@ -1120,6 +1117,7 @@ void AMSControl::UpdateAms(const std::string   &series_name,
                 if (lib_it.second) { lib_it.second->set_view_only(view_only); }
             }
         }
+
 
         for (auto ams_prv : m_ams_preview_list) {
             std::string id = ams_prv.second->get_ams_id();
@@ -1386,6 +1384,7 @@ void AMSControl::AddAms(AMSinfo info, AMSPanelPos pos)
     m_simplebook_ams_arrow_left->Refresh();
     m_simplebook_ams_arrow_right->Refresh();
 
+    m_item_ids[(int)pos].push_back(info.ams_id);
 }
 
 //void AMSControl::AddExtraAms(AMSinfo info)
@@ -1437,7 +1436,6 @@ void AMSControl::AddAms(std::vector<AMSinfo> single_info,
     m_simplebook_ams_right->Refresh();
 
     for (const auto& info : single_info) {
-        m_item_ids[(int)pos].push_back(info.ams_id);
         m_item_ids[(int)pos].push_back(info.ams_id);
     }
 }
@@ -1653,12 +1651,12 @@ bool AMSControl::Enable(bool enable)
         item->Enable(enable);
     }
 
-    m_button_extruder_feed->Enable(enable);
-    m_button_extruder_back->Enable(enable);
-    m_button_auto_refill->Enable(enable);
-    m_button_ams_setting->Enable(enable);
+    if (m_button_extruder_feed) m_button_extruder_feed->Enable(enable);
+    if (m_button_extruder_back) m_button_extruder_back->Enable(enable);
+    if (m_button_auto_refill) m_button_auto_refill->Enable(enable);
+    if (m_button_ams_setting) m_button_ams_setting->Enable(enable);
 
-    m_filament_load_step->Enable(enable);
+    if (m_filament_load_step) m_filament_load_step->Enable(enable);
     return wxWindow::Enable(enable);
 }
 
@@ -1689,13 +1687,13 @@ void AMSControl::SetAmsStep(std::string ams_id, std::string canid, int extruder_
     try {
         can_index = atoi(canid.c_str());
     } catch (const std::exception& e) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "[dev][error] e=:" << e.what();
+        BOOST_LOG_TRIVIAL(error) << "[dev][error] e=:" << e.what();
         return;
     }
 
     bool in_same_page = ams->IsShown() && (ams->get_parent_book_index() == ams->get_parent_book()->GetSelection());/*ams->IsShown() maybe wrong*/
-    const auto& pos = ams->get_panel_pos();
-    const auto& left = (pos == AMSPanelPos::LEFT_PANEL);
+    auto pos = ams->get_panel_pos();
+    bool left = (pos == AMSPanelPos::LEFT_PANEL);
     const auto& model = ams->get_ams_model();
     auto length = -1;
     auto in_pair = IsInSlotPair(ams_id);
@@ -1753,6 +1751,9 @@ void AMSControl::SetAmsStep(std::string ams_id, std::string canid, int extruder_
         } else if (model == DevAmsType::AMS_LITE) {
             length = 206;
             in_same_page = true;
+            // AMS_LITE_MIXED on the right
+            left = false;
+            pos = AMSPanelPos::RIGHT_PANEL;
         }
     }
 

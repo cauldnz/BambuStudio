@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Spool } from './types';
 import { SpoolColorChip } from './SpoolColorChip';
-import { ENTRY_METHOD_LABELS, formatSpoolDisplayName } from './constants';
+import { formatSpoolDisplayName, formatSlotLocation, multiExternalDevIds } from './constants';
 import { cssBackgroundFor, colorNameWithHexLabel } from './colors';
+import useStore from '../../store/AppStore';
 
 interface Props {
   open: boolean;
@@ -16,6 +17,9 @@ interface Props {
 
 export function DetailDialog({ open, spool, filteredSpools, onClose, onEdit, onNavigate }: Props) {
   const { t } = useTranslation();
+
+  const allSpools = useStore((s) => s.filament.spools);
+  const multiExtDevIds = useMemo(() => multiExternalDevIds(allSpools), [allSpools]);
 
   // F4.10 parity: drag support for this dialog as well.
   const [dragOffset, setDragOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -134,17 +138,22 @@ export function DetailDialog({ open, spool, filteredSpools, onClose, onEdit, onN
         {/* Spool banner */}
         <div className="flex items-center gap-3 px-6">
           <div className="w-10 h-10 shrink-0 relative">
-            <SpoolColorChip colorCode={spool.color_code} colors={spool.colors} colorType={spool.color_type} />
+            <SpoolColorChip colorCode={spool.color_code} colors={spool.colors} colorType={spool.color_type} amsBadge={spool.in_printer === true} />
           </div>
           <div className="flex flex-col">
             <div className="flex items-center gap-1 text-sm font-medium text-fm-text-strong leading-[22px] [&>svg]:text-fm-text-secondary [&>svg]:shrink-0">
               {nameParts || '—'}
               <span className="inline-flex items-center justify-center px-1 h-4 rounded-sm bg-fm-input text-[11px] text-fm-text-secondary leading-4 empty:hidden">
-                {ENTRY_METHOD_LABELS[spool.entry_method] ? t(ENTRY_METHOD_LABELS[spool.entry_method]) : ''}
+                {spool.tag_uid && /[^0]/.test(spool.tag_uid) ? t('RFID') : ''}
               </span>
             </div>
             <div className="text-xs text-fm-text-secondary opacity-70 leading-[19px]">
               {spool.diameter || 1.75} mm｜{spool.color_name || '—'}
+              {spool.in_printer === true && (() => {
+                const multiExt = spool.dev_id ? multiExtDevIds.has(spool.dev_id) : false;
+                const loc = formatSlotLocation(spool.device_name, spool.ams_type, spool.slot_id, t, spool.tray_label, multiExt);
+                return loc ? <>｜{loc}</> : null;
+              })()}
             </div>
           </div>
         </div>

@@ -199,6 +199,7 @@ public:
         std::unique_ptr<Model> m_model;
 
         Selection::EMode m_mode;
+        int m_copy_volume_step{0};
 
     public:
         Clipboard();
@@ -214,6 +215,8 @@ public:
 
         Selection::EMode get_mode() const { return m_mode; }
         void set_mode(Selection::EMode mode) { m_mode = mode; }
+        int copy_volume_step() const { return m_copy_volume_step; }
+        void copy_volume_step_up() { ++m_copy_volume_step; }
     };
 
 private:
@@ -296,7 +299,13 @@ public:
     EMode get_mode() const { return m_mode; }
     void  set_mode(EMode mode);
 
-    int query_real_volume_idx_from_other_view(unsigned int object_idx, unsigned int instance_idx, unsigned int model_volume_idx);
+    // Cross-model selection mapping by stable part GUID (prepare <-> assembly independent models).
+    // Returns the first GLVolume in this selection's model whose backing ModelVolume matches part_guid
+    // (either its own part_guid or its assembly_src_guid). instance_idx picks the matching instance.
+    int query_real_volume_idx_by_part_guid(const std::string& part_guid, unsigned int instance_idx = 0);
+    // Map a GLVolume in source_model to a GLVolume index in this selection's model by stable part_guid.
+    // use_assembly_src_guid: true for assembly->prepare (prefer assembly_src_guid); false for prepare->assembly (part_guid only).
+    int query_real_volume_idx_from_other_model_volume(const GLVolume* source_volume, const Model& source_model, bool use_assembly_src_guid);
     void add(unsigned int volume_idx, bool as_single_selection = true, bool check_for_already_contained = false);
     void remove(unsigned int volume_idx);
 

@@ -183,6 +183,16 @@ void TextInput::SetTextColor(StateColor const& color)
     state_handler.update_binds();
 }
 
+void TextInput::SetReservedRightWidth(int width)
+{
+    if (width < 0)
+        width = 0;
+    if (m_reserved_right_width == width)
+        return;
+    m_reserved_right_width = width;
+    Refresh();
+}
+
 void TextInput::Rescale()
 {
     if (!this->icon.name().empty())
@@ -220,9 +230,13 @@ void TextInput::SetMinSize(const wxSize& size)
 
 void TextInput::DoSetSize(int x, int y, int width, int height, int sizeFlags)
 {
+    const wxSize oldSize = GetSize();
     wxWindow::DoSetSize(x, y, width, height, sizeFlags);
     if (sizeFlags & wxSIZE_USE_EXISTING) return;
     wxSize size = GetSize();
+    // The border/background/dropdown arrow are custom-painted from the full bounds; a partial
+    // erase on grow would leave the old right edge stale, so force a full repaint on any resize.
+    if (size != oldSize) Refresh();
     wxPoint textPos = {5, 0};
     if (this->icon.bmp().IsOk()) {
         wxSize szIcon = this->icon.GetBmpSize();
@@ -314,8 +328,8 @@ void TextInput::render(wxDC& dc)
             }
             if (align_right || align_center)
             {
-                if (pt.x + labelSize.x + 5 > size.x)
-                    text = wxControl::Ellipsize(text, dc, wxELLIPSIZE_END, size.x - pt.x - 5);
+                if (pt.x + labelSize.x + 5 + m_reserved_right_width > size.x)
+                    text = wxControl::Ellipsize(text, dc, wxELLIPSIZE_END, size.x - pt.x - 5 - m_reserved_right_width);
                 pt.y = (size.y - labelSize.y) / 2;
             }
             else
@@ -329,8 +343,8 @@ void TextInput::render(wxDC& dc)
         } else {
             wxSize textSize = text_ctrl->GetSize();
             if (align_right || align_center) {
-                if (pt.x + labelSize.x + 5 > size.x)
-                    text = wxControl::Ellipsize(text, dc, wxELLIPSIZE_END, size.x - pt.x - 5);
+                if (pt.x + labelSize.x + 5 + m_reserved_right_width > size.x)
+                    text = wxControl::Ellipsize(text, dc, wxELLIPSIZE_END, size.x - pt.x - 5 - m_reserved_right_width);
                 pt.y = (size.y - labelSize.y - static_tips_size.y - 8) / 2;
             } else {
                 pt.x += textSize.x;

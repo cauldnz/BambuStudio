@@ -16,16 +16,32 @@
 #include "libslic3r/Geometry.hpp"
 
 namespace Slic3r {
-// ---- ArrowSvgNote: one arrow + icon group ----
+// One SVG arrow ray: tip anchors to bound volumes' on-screen bbox center.
+// Multi-ray notes share one SVG icon: each ray's start+arrow_end_offset equals the
+// same absolute icon center; line tips attach to optimal points on that icon rect.
+struct ArrowSvgRay
+{
+    // The ModelVolumes this ray points at, recorded as (object_idx, volume_idx).
+    std::vector<std::pair<int, int>> bound_volumes{};
+    Vec2d arrow_start_offset{Vec2d::Zero()}; // offset from bound-volumes (or step) bbox screen center
+    Vec2d arrow_end_offset{Vec2d(80, -60)};  // offset from arrow start → shared SVG icon center
+
+    void to_json(nlohmann::json &j) const;
+    void from_json(const nlohmann::json &j);
+};
+
+// ---- ArrowSvgNote: one shared SVG icon + one or more rays (multi-part → multi-arrow) ----
 struct ArrowSvgNote
 {
     std::string svg_name{};
-    // The ModelVolumes this arrow is bound to, recorded as (object_idx, volume_idx)
-    std::vector<std::pair<int, int>> bound_volumes{};
-    Vec2d       arrow_start_offset{Vec2d::Zero()};   // offset from bound-volumes (or step) bbox screen center
-    Vec2d       arrow_end_offset{Vec2d(80, -60)};    // offset from arrow start position
-    Vec2d       label_size{Vec2d(56, 56)};
-    std::array<int, 4> color{0, 200, 80, 230};
+    // Shared icon size / tint for every ray of this note.
+    Vec2d              label_size{Vec2d(56, 56)};
+    // Default #3F82F0 (matches the blue swatch in the note color palette).
+    std::array<int, 4> color{63, 130, 240, 255};
+    // One ray per pointed part when created from a multi-selection. Always non-empty
+    // after from_json() (legacy single-arrow JSON is expanded into rays[0]).
+    // All rays share one SVG; rays[0] is the canonical icon-position owner.
+    std::vector<ArrowSvgRay> rays;
 
     void to_json(nlohmann::json &j) const;
     void from_json(const nlohmann::json &j);
@@ -38,9 +54,9 @@ struct TextLabelNote
     std::vector<std::pair<int, int>> bound_volumes{};
     Vec2d       pos_offset{Vec2d(60, -60)};
     Vec2d       size{Vec2d(160, 80)};
-    std::array<int, 4> color{38, 46, 48, 255};
-    // Alpha 217 (~0.85) keeps the historic semi-transparent white look used
-    std::array<int, 4> background_color{255, 255, 255, 255};
+    std::array<int, 4>               color{255, 255, 255, 255};
+    // Default #3F82F0 (matches the blue swatch in the note color palette).
+    std::array<int, 4> background_color{63, 130, 240, 255};
 
     void to_json(nlohmann::json &j) const;
     void from_json(const nlohmann::json &j);
@@ -52,7 +68,8 @@ struct CircleNote
     std::vector<std::pair<int, int>> bound_volumes{};
     Vec2d pos_offset{Vec2d(60, -60)};
     Vec2d size{Vec2d(80, 80)};
-    std::array<int, 4> color{0, 200, 80, 230};
+    // Default #3F82F0 (matches the blue swatch in the note color palette).
+    std::array<int, 4> color{63, 130, 240, 255};
 
     void to_json(nlohmann::json &j) const;
     void from_json(const nlohmann::json &j);
@@ -64,7 +81,8 @@ struct RectangleNote
     std::vector<std::pair<int, int>> bound_volumes{};
     Vec2d pos_offset{Vec2d(60, -60)};
     Vec2d size{Vec2d(80, 80)};
-    std::array<int, 4> color{0, 200, 80, 230};
+    // Default #3F82F0 (matches the blue swatch in the note color palette).
+    std::array<int, 4> color{63, 130, 240, 255};
 
     void to_json(nlohmann::json &j) const;
     void from_json(const nlohmann::json &j);
@@ -76,7 +94,8 @@ struct PlainArrowNote
     std::vector<std::pair<int, int>> bound_volumes{};
     Vec2d arrow_start_offset{Vec2d::Zero()};
     Vec2d arrow_end_offset{Vec2d(80, -60)};
-    std::array<int, 4> color{0, 200, 80, 230};
+    // Default #3F82F0 (matches the blue swatch in the note color palette).
+    std::array<int, 4> color{63, 130, 240, 255};
 
     void to_json(nlohmann::json &j) const;
     void from_json(const nlohmann::json &j);
@@ -87,8 +106,15 @@ struct PartNumberLabel
     int         object_idx{-1};
     int         volume_idx{-1};
     std::string part_name;
+    std::string part_guid;
     Vec2d       arrow_start_offset{Vec2d::Zero()};
     Vec2d       arrow_end_offset{Vec2d(60, -50)};
+    // Per-label visibility on the canvas / tree "标签" column. Closing the pill
+    // sets this false; the label entry is kept so the tree can show the off state.
+    bool        visible{true};
+    // Per-label explosion marker for the tree "Explosion" column. Live display still
+    // prefers GLVolume vs ModelVolume matrix compare; this flag is persisted/toggled.
+    bool        in_explosion_state{false};
 
     void to_json(nlohmann::json &j) const;
     void from_json(const nlohmann::json &j);
@@ -133,6 +159,9 @@ struct KeyFrame
     std::map<int, Geometry::Transformation>                  object_transformations;
     std::map<std::pair<int, int>, Geometry::Transformation>  volume_transformations;
     std::map<std::pair<int, int>, std::string>               volume_names;
+    // Stable ModelVolume::part_guid keyed like volume_transformations. Used to
+    // rebind poses after a prepare-side volume delete shifts volume_idx.
+    std::map<std::pair<int, int>, std::string>               volume_guids;
     AssemblyNote                                             assembly_note;
     LabelsShowType                                           labels_show_type{LabelsShowType::AutoRecommend};
     bool                                                     is_interpolation{false}; // no need to save
@@ -163,6 +192,7 @@ struct KeyFrame
         object_transformations = src.object_transformations;
         volume_transformations = src.volume_transformations;
         volume_names = src.volume_names;
+        volume_guids = src.volume_guids;
         assembly_note = src.assembly_note;
         labels_show_type = src.labels_show_type;
     }
@@ -195,11 +225,29 @@ struct AssembleSingleInfo : public AssembleBaseInfo
     void        from_json(const nlohmann::json &j) override;
 };
 
+// Folder kind stored in AssembleSub / AssemblyStepsTreeNode::is_final_assembly
+// (legacy JSON key kept for compatibility).
+// 0 = normal step, 1 = final assembly, 2 = overall preview.
+// Kind 2 is runtime UI-only: created once for interaction, never serialized.
+namespace AssemblyStepKind {
+constexpr int Normal         = 0;
+constexpr int FinalAssembly  = 1;
+constexpr int OverallPreview = 2;
+}
+
 struct AssembleSub : public AssembleBaseInfo
 {
     int id{-1};
     int step{0};
-    bool is_final_assembly{false};
+    // See AssemblyStepKind. Legacy bool JSON true maps to FinalAssembly (1).
+    // OverallPreview (2) is runtime UI-only and is never written to / read from JSON.
+    int is_final_assembly{AssemblyStepKind::Normal};
+    // Inheritance: source (parent) step id this step inherited from (-1 == none),
+    // resolved by id so it survives step reordering.
+    int inherited_from_step_id{-1};
+    // Stable ModelObject ids inherited from the parent step; these explode at
+    // Object granularity (never split into parts) in this step.
+    std::vector<size_t> inherited_object_ids;
     std::vector<std::shared_ptr<AssembleBaseInfo>> children;
     std::optional<std::unordered_map<std::string, bool>> assembly_tree_checked;
 
@@ -255,7 +303,14 @@ struct AssemblyStepsTreeNode
     int              object_idx{-1}; // valid when type == Object
     size_t           object_id{0};   // ModelObject id, stable across object index changes
     bool             visible{true};// per-object render visibility (drives GLVolume show/hide)
-    bool             is_final_assembly{false};
+    // See AssemblyStepKind. Legacy bool JSON true maps to FinalAssembly (1).
+    // OverallPreview (2) is runtime UI-only and is never written to / read from JSON.
+    int              is_final_assembly{AssemblyStepKind::Normal};
+    // Inheritance (Folder only): id of the parent step this step inherited from
+    // (-1 == none), plus the inherited ModelObject ids that must explode at
+    // Object granularity. See AssembleSub for the serialized counterparts.
+    int                 inherited_from_step_id{-1};
+    std::vector<size_t> inherited_object_ids;
     std::vector<int> children; // indices into nodes
     // Optional left-side assembly tree checkbox state for this step folder.
     std::optional<std::unordered_map<std::string, bool>> assembly_tree_checked;
@@ -278,8 +333,7 @@ struct AssemblyStepsTreeData
 
     // Runtime-only (NOT serialized): model object/volume id snapshot captured at the
     bool                                has_loaded_recorded_baseline{false};
-    std::set<size_t>                    loaded_recorded_objects;
-    std::set<std::pair<size_t, size_t>> loaded_recorded_volumes;
+    std::set<std::string> loaded_recorded_volumes;
 
     bool empty() const { return nodes.empty(); }
     void clear()
@@ -289,7 +343,6 @@ struct AssemblyStepsTreeData
         camera_ref_viewport_w = 0;
         camera_ref_viewport_h = 0;
         has_loaded_recorded_baseline = false;
-        loaded_recorded_objects.clear();
         loaded_recorded_volumes.clear();
     }
     std::string to_json_string() const;
@@ -339,5 +392,65 @@ private:
     int   m_camera_ref_viewport_w{0};
     int   m_camera_ref_viewport_h{0};
 };
+
+// Root key written into Metadata/assembly_step.json when the project is a qualified assembly.
+inline constexpr const char *kAssemblyStepsQualifiedKey = "qualified_assembly";
+
+// Keys in the CLI sidecar result.json. Values are the strings "true" or "false".
+inline constexpr const char *kQualifiedAssemblyResultKey = "qualified_assembly";
+inline constexpr const char *kNeedRewrite3mfResultKey = "need_rewrite_3mf";
+
+// True only when the last persisted non-preview step is final assembly.
+// Items stay in root order, so an earlier final-assembly step does not count.
+bool assembly_steps_json_last_step_is_final_assembly(const std::string &json_str);
+
+// Early files can put every model object on the last step without setting the
+// final-assembly flag. True when that last persisted step covers every model part.
+// object_idx matches `model`. When `assembly_model_json` is set, object_id is also
+// matched against the id stored on each assembly-model node. Restore assigns new ids.
+bool assembly_steps_json_last_step_covers_model(const std::string &json_str, const Model &model,
+                                                const std::string &assembly_model_json = {});
+
+// Set the last persisted step's is_final_assembly to FinalAssembly.
+// Returns json_str unchanged when it is empty, already final, or not valid JSON.
+std::string assembly_steps_json_mark_last_step_final_assembly(const std::string &json_str);
+
+// Copy of json_str with the root qualified-assembly flag set or removed.
+// Returns json_str unchanged when it is empty, already in the requested state, or not valid JSON.
+std::string assembly_steps_json_with_qualified_assembly(const std::string &json_str, bool qualified);
+
+// {"qualified_assembly":"true"|"false","need_rewrite_3mf":"true"|"false"}.
+std::string qualified_assembly_result_json(bool qualified, bool need_rewrite_3mf);
+
+// assembly_step.json versions below this are recomputed by --update-qualified-assembly.
+inline constexpr double kAssemblyStepsRecomputeBelowVersion = 1.2;
+
+struct AssemblyStepsFileMeta {
+    double version{0};
+    bool   has_qualified{false};
+    bool   qualified{false};
+};
+
+// version / qualified_assembly read from a raw assembly_step.json string.
+AssemblyStepsFileMeta assembly_steps_json_file_meta(const std::string &json_str);
+// True when the file should be recomputed. 1.2 itself is not recomputed.
+inline bool assembly_steps_version_needs_recompute(double version)
+{
+    return version < kAssemblyStepsRecomputeBelowVersion - 1e-3;
+}
+// Set the root version. Returns json_str unchanged when it already matches or is not valid JSON.
+std::string assembly_steps_json_with_version(const std::string &json_str, double version);
+
+// ---- Independent assembly model (object graph) JSON ----
+// Serialize / restore the assembly-view independent Model. Only the object/volume/instance structure +
+// per-volume part_guid / assembly_src_guid + frozen transforms + assemble transforms are stored; geometry
+// is NOT duplicated. On restore each volume references a prepare-side part via assembly_src_guid and the
+// mesh shared_ptr is rebound from `mesh_source` (matched by part_guid). Backs the standalone
+// Metadata/assembly_model.json 3mf section.
+std::string assembly_model_to_json_string(const Model &assembly_model);
+bool        assembly_model_from_json_string(const std::string &json_str,
+                                            Model             &out_assembly_model,
+                                            const Model       &mesh_source,
+                                            std::string       *error = nullptr);
 } // namespace Slic3r
 #endif // slic3r_OverviewlyJson_hpp_

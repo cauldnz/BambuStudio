@@ -13,6 +13,7 @@ function OnInit()
 
 	UpdateServerConnectFailTipVisible();
 	SendMsg_GetLoginInfo();
+	SendMsg_GetMenuAccess();
 	GotoMenu( 'home' );
 	$("#Login2").click(function() {
 		$("#DropdownWrapper").css("visibility", "visible");
@@ -151,6 +152,45 @@ function GotoMenu( strMenu )
 	}
 }
 
+function OnManualExternalLinkClick(evt)
+{
+	// Keep the row click (GotoMenu) for the in-app wiki view; this icon alone
+	// jumps to the same-region landing page in the system browser, mirroring
+	// wiki.html's own openAcademyUrl() region split (mainland goes to
+	// bambulab.cn, wiki.bambulab.com does not resolve correctly there).
+	if(evt && evt.stopPropagation) evt.stopPropagation();
+
+	let strRegion=GetQueryString("region");
+
+	let open_url;
+	if(strRegion=="CN")
+	{
+		open_url="https://bambulab.cn/zh-cn/support/academy/";
+	}
+	else
+	{
+		let strLang=GetQueryString("lang");
+		if(strLang==null)
+			strLang=localStorage.getItem(LANG_COOKIE_NAME);
+
+		let lang;
+		if(strLang!=null && strLang.includes('zh')) lang='zh';
+		else if(strLang!=null && strLang.includes('fr')) lang='fr-fr';
+		else if(strLang!=null && strLang.includes('de')) lang='de-de';
+		else if(strLang!=null && strLang.includes('es')) lang='es-mx';
+		else if(strLang!=null && strLang.includes('it')) lang='it-it';
+		else if(strLang!=null && strLang.includes('ja')) lang='ja-jp';
+		else if(strLang!=null && strLang.includes('ko')) lang='ko-kr';
+		else if(strLang!=null && strLang.includes('pt')) lang='pt-br';
+		else if(strLang!=null && strLang.includes('nl')) lang='nl-nl';
+		else lang='en';
+
+		open_url="https://bambulab.com/"+lang+"/support/academy/";
+	}
+
+	OpenUrlInLocalBrowser(open_url);
+}
+
 function ShowMenuNewTag(MenuName,nStatus)
 {
 	//alert(MenuName+" - "+nStatus);
@@ -224,6 +264,15 @@ function SendMsg_GetLoginInfo()
 	var tSend={};
 	tSend['sequence_id']=Math.round(new Date() / 1000);
 	tSend['command']="get_login_info";
+
+	SendWXMessage( JSON.stringify(tSend) );
+}
+
+function SendMsg_GetMenuAccess()
+{
+	var tSend={};
+	tSend['sequence_id']=Math.round(new Date() / 1000);
+	tSend['command']="homepage_leftmenu_access_get";
 
 	SendWXMessage( JSON.stringify(tSend) );
 }

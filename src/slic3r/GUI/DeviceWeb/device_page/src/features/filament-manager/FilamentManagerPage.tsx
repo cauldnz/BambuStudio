@@ -16,13 +16,25 @@ import './filament-manager.css';
 type TabMode = 'all' | 'ams';
 // 列表筛选项（label ↔ 本地字段 ↔ 云端字段）：
 //   Brand         brand          filamentVendor
-//   Filament Type material_type  filamentType   （类型大类，PLA / PETG / PA ...）
 //   Material Type series         filamentName   （完整名，PLA Basic / Support For PA/PET）
-type FilterKey = 'brand' | 'material_type' | 'series';
+type FilterKey = 'brand' | 'series';
 
 const FILTER_LABEL_KEYS: Record<FilterKey, string> = {
-  brand: 'Brand', material_type: 'Filament Type', series: 'Material Type',
+  brand: 'Brand', series: 'Material Type',
 };
+
+function spoolSearchText(spool: Spool): string {
+  return [
+    spool.brand,
+    spool.material_type,
+    spool.series,
+    spool.color_name,
+    spool.note,
+  ]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .join(' ')
+    .toLowerCase();
+}
 
 export function FilamentManagerPage() {
   const { t } = useTranslation();
@@ -79,6 +91,7 @@ export function FilamentManagerPage() {
   const [prefilledSpool, setPrefilledSpool] = useState<Partial<Spool> | null>(null);
   const [detailSpool, setDetailSpool]     = useState<Spool | null>(null);
   const [detailOpen, setDetailOpen]       = useState(false);
+  const [sortedSpools, setSortedSpools]   = useState<Spool[]>([]);
 
   // Custom confirm modal (replaces native `window.confirm()` which leaks the
   // page URL in its title bar when running inside a WebView2 host).
@@ -153,14 +166,12 @@ export function FilamentManagerPage() {
     let list = spools.filter((s) => s.status !== 'archived');
 
     // Tab filter
-    if (tab === 'ams') list = list.filter((s) => s.entry_method === 'ams_sync');
+    if (tab === 'ams') list = list.filter((s) => s.in_printer === true);
 
     // Search
     if (search.trim()) {
-      const kw = search.toLowerCase();
-      list = list.filter((s) =>
-        `${s.brand} ${s.material_type} ${s.series} ${s.color_name}`.toLowerCase().includes(kw)
-      );
+      const kw = search.trim().toLowerCase();
+      list = list.filter((s) => spoolSearchText(s).includes(kw));
     }
 
     // Filters
@@ -278,9 +289,9 @@ export function FilamentManagerPage() {
   }, [batchCreateSpools]);
 
   // AMS bridge callbacks for dialog
-  const handleFetchMachines = useCallback(async (): Promise<MachineItem[]> => {
-    await fetchMachines();
-    return useStore.getState().filament.machines;
+  const handleFetchMachines = useCallback(async (): Promise<{ machines: MachineItem[]; selectedDevId: string }> => {
+    const result = await fetchMachines();
+    return result;
   }, [fetchMachines]);
 
   const handleFetchAmsData = useCallback(async (
@@ -356,7 +367,7 @@ export function FilamentManagerPage() {
                       className={`px-[10px] py-1 h-7 rounded-md cursor-pointer text-xs text-fm-text-secondary flex items-center transition-colors duration-150 hover:bg-fm-hover ${tab === tb ? 'bg-fm-input text-fm-text-strong' : ''}`}
                       onClick={() => setTab(tb)}
                     >
-                      {tb === 'all' ? t('All') : 'AMS'}
+                      {tb === 'all' ? t('All') : t('In Printer')}
                     </div>
                   ))}
                 </div>
@@ -365,10 +376,10 @@ export function FilamentManagerPage() {
 
                 {/* Filters */}
                 <div className={`flex gap-2 ${!isLoggedIn ? 'opacity-40 pointer-events-none' : ''}`}>
-                  {(['brand', 'material_type', 'series'] as const).map((fk) => (
+                  {(['brand', 'series'] as const).map((fk) => (
                     <div key={fk} style={{ position: 'relative' }}>
                       <div
-                        className={`flex items-center gap-1 px-2 pl-[6px] py-[2px] h-6 rounded-md cursor-pointer text-sm text-fm-text-primary transition-colors duration-150 hover:bg-fm-hover ${filters[fk] ? 'bg-fm-brand/15 text-fm-brand font-medium' : ''}`}
+                        className={`flex items-center gap-1 px-2 pl-[6px] py-[2px] h-6 rounded-md cursor-pointer text-sm text-fm-text-primary transition-colors duration-150 hover:bg-fm-hover whitespace-nowrap ${filters[fk] ? 'bg-fm-brand/15 text-fm-brand font-medium' : ''}`}
                         onClick={(e) => { e.stopPropagation(); setOpenFilter(openFilter === fk ? null : fk); }}
                       >
                         {t(FILTER_LABEL_KEYS[fk])}
@@ -533,6 +544,7 @@ export function FilamentManagerPage() {
                   onAddSimilar={handleAddSimilar}
                   onEmptyAdd={handleOpenAddDialog}
                   onDelete={handleDelete}
+                  onSortedChange={setSortedSpools}
                 />
               )}
           </>
@@ -568,7 +580,7 @@ export function FilamentManagerPage() {
       <DetailDialog
         open={detailOpen}
         spool={detailSpool}
-        filteredSpools={filtered}
+        filteredSpools={sortedSpools.length > 0 ? sortedSpools : filtered}
         onClose={() => setDetailOpen(false)}
         onEdit={handleEditFromDetail}
         onNavigate={(id) => {
@@ -617,13 +629,13 @@ function FilterDropdown({ options, current, onSelect, onClose }: {
   return (
     <div className="absolute z-[100] bg-fm-sidebar border border-fm-border rounded-lg p-1 min-w-[120px] max-h-60 overflow-y-auto shadow-[0_4px_12px_rgba(0,0,0,0.4)]" onClick={(e) => e.stopPropagation()}>
       <div
-        className={`px-3 py-[6px] rounded-sm cursor-pointer text-xs text-fm-text-primary hover:bg-fm-hover ${!current ? 'bg-fm-brand/15 text-fm-brand font-medium' : ''}`}
+        className={`px-3 py-[6px] rounded-sm cursor-pointer text-xs text-fm-text-primary hover:bg-fm-hover whitespace-nowrap ${!current ? 'bg-fm-brand/15 text-fm-brand font-medium' : ''}`}
         onClick={() => onSelect('')}
       >{t('All')}</div>
       {options.map((v) => (
         <div
           key={v}
-          className={`px-3 py-[6px] rounded-sm cursor-pointer text-xs text-fm-text-primary hover:bg-fm-hover ${current === v ? 'bg-fm-brand/15 text-fm-brand font-medium' : ''}`}
+          className={`px-3 py-[6px] rounded-sm cursor-pointer text-xs text-fm-text-primary hover:bg-fm-hover whitespace-nowrap ${current === v ? 'bg-fm-brand/15 text-fm-brand font-medium' : ''}`}
           onClick={() => onSelect(v)}
         >{v}</div>
       ))}

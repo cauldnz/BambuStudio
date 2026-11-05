@@ -18,6 +18,11 @@ enum class LiftType {
     SpiralLift
 };
 
+enum class TemperatureCommandType {
+    Default,
+    LayerChange
+};
+
 class GCodeWriter {
 public:
     GCodeConfig config;
@@ -26,6 +31,7 @@ public:
     GCodeWriter() :
         multiple_extruders(false), m_curr_filament_extruder{ nullptr,nullptr },
         m_curr_extruder_id (-1),
+        m_current_process_config_idx(0),
         m_single_extruder_multi_material(false),
         m_last_acceleration(0), m_max_acceleration(0),
         m_last_jerk(0), m_max_jerk(0),
@@ -44,6 +50,8 @@ public:
     void                 apply_print_config(const PrintConfig &print_config);
     // Extruders are expected to be sorted in an increasing order.
     void                 set_extruders(std::vector<unsigned int> extruder_ids);
+    // Recompute which filaments have a hotend to themselves, based on config.filament_nozzle_map.
+    void                 update_exclusive_nozzles();
     const std::vector<Extruder>& extruders() const { return m_filament_extruders; }
     std::vector<unsigned int> extruder_ids() const {
         std::vector<unsigned int> out;
@@ -54,7 +62,8 @@ public:
     }
     std::string preamble();
     std::string postamble() const;
-    std::string set_temperature(unsigned int temperature, bool wait = false, int tool = -1) const;
+    std::string set_temperature(unsigned int temperature, bool wait = false, int tool = -1,
+                                TemperatureCommandType command_type = TemperatureCommandType::Default) const;
     std::string set_bed_temperature(int temperature, bool wait = false);
     std::string set_chamber_temperature(int temperature, bool wait = false);
     void set_acceleration(unsigned int acceleration);
@@ -109,8 +118,8 @@ public:
     // To be called by the main thread. It always emits the G-code, it does not remember the previous state.
     // Keeping the state is left to the CoolingBuffer, which runs asynchronously on another thread.
     std::string set_fan(unsigned int speed) const;
-    //BBS: set additional fan speed for BBS machine only
-    static std::string set_additional_fan(unsigned int speed);
+    //BBS: set the speed of one auxiliary part cooling fan, addressed by its M106 P index
+    static std::string set_additional_fan(int gcode_index, unsigned int speed);
     static std::string set_exhaust_fan(int speed,bool add_eol);
     //BBS
     void set_object_start_str(std::string start_string) { m_gcode_label_objects_start = start_string; }
@@ -125,12 +134,15 @@ public:
     void set_current_position_clear(bool clear) { m_is_current_pos_clear = clear; };
     bool is_current_position_clear() const { return m_is_current_pos_clear; };
     void set_is_bbl_printer(bool is_bbl_printer) { m_is_bbl_printer = is_bbl_printer; };
+    void set_avoid_z_descent_travel(bool v) { m_avoid_z_descent_travel = v; }
     //BBS:
     static const bool full_gcode_comment;
     //Radian threshold of slope for lazy lift and spiral lift;
     static const double slope_threshold;
 
 private:
+    // BBS: check whether a full spiral-lift circle stays inside the bed printable area.
+    bool        spiral_arc_within_bed(const Vec2d &center, double radius) const;
     std::string set_extrude_acceleration();
     std::string set_travel_acceleration();
     std::string set_travel_acceleration(bool use_short_travel_acceleration);
@@ -142,6 +154,7 @@ private:
     bool            m_single_extruder_multi_material;
     std::vector<Extruder*> m_curr_filament_extruder;
     int        m_curr_extruder_id;
+    size_t     m_current_process_config_idx;
     unsigned int    m_last_acceleration;
     // Limit for setting the acceleration, to respect the machine limits set for the Marlin firmware.
     // If set to zero, the limit is not in action.
@@ -162,9 +175,20 @@ private:
     //A example that of the first move, the m_pos is zero, but the real position of extruder doesn't
     //Pos must be clear after the first xyz travel move
     bool            m_is_current_pos_clear = false;
+    bool            m_avoid_z_descent_travel = false;
     //BBS: x, y offset for gcode generated
     double          m_x_offset{ 0 };
     double          m_y_offset{ 0 };
+    //BBS: bed printable-area bounding box (in plate/gcode coordinates) for spiral-lift boundary check
+    Vec2d           m_bed_min{ 0., 0. };
+    Vec2d           m_bed_max{ 0., 0. };
+    bool            m_bed_bbox_valid{ false };
+    //BBS: per-extruder printable-area bounding boxes (indexed by physical nozzle id). On multi-nozzle
+    // machines the left/right heads can reach different regions, so the spiral must stay inside the
+    // area of the head that performs the lift. Falls back to the whole-bed box above when missing.
+    std::vector<Vec2d> m_extruder_bed_min;
+    std::vector<Vec2d> m_extruder_bed_max;
+    std::vector<char>  m_extruder_bed_valid;
     double           m_current_speed{ 0 };
     bool            m_is_bbl_printer = false;
 

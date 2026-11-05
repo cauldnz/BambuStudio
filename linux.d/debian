@@ -31,7 +31,7 @@ REQUIRED_DEV_PACKAGES=(
     yasm
     libx264-dev
     libbz2-dev
-    # pyslic3r embedded runtime (BBS_PY_RUNTIME): CMakeLists.txt:798
+    # pyslic3r embedded runtime (BBS_PY_RUNTIME, see the BBS_PY_RUNTIME block in CMakeLists.txt)
     python3-dev
     pybind11-dev
 )

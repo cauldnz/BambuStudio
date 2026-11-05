@@ -9,11 +9,9 @@
 // ability to request new frame after finish rendering
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Plater.hpp"
-#include "slic3r/GUI/GLCanvas3D.hpp"
 
 #include "wx/fontenum.h"
-
-#include <boost/log/trivial.hpp>
+#include "libslic3r/Log.hpp"
 
 using namespace Slic3r;
 using namespace Slic3r::GUI;
@@ -161,7 +159,7 @@ void CreateFontImageJob::finalize(bool canceled, std::exception_ptr &)
     glsafe(::glBindTexture(target, no_texture_id));
 
     // show rendered texture
-    wxGetApp().plater()->canvas3D()->schedule_extra_frame(0);
+    wxGetApp().plater()->schedule_extra_frame(0);
 
     BOOST_LOG_TRIVIAL(info)
         << "Generate Preview font('" << m_input.font_name << "' id:" << m_input.index << ") "

@@ -3,12 +3,12 @@
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
+#include "slic3r/GUI/UIHelpers/ImGuiFilamentWidgets.hpp"
 #include "slic3r/GUI/Camera.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/BitmapCache.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
-#include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/GUI.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Model.hpp"
@@ -18,20 +18,8 @@
 
 namespace Slic3r::GUI {
 
-static inline void show_notification_extruders_limit_exceeded()
-{
-    wxGetApp()
-        .plater()
-        ->get_notification_manager()
-        ->push_notification(NotificationType::MmSegmentationExceededExtrudersLimit, NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
-                            GUI::format(_L("Filament count exceeds the maximum number that painting tool supports. only the "
-                                           "first %1% filaments will be available in painting tool."), GLGizmoMmuSegmentation::EXTRUDERS_LIMIT));
-}
-
 void GLGizmoMmuSegmentation::on_opening()
 {
-    if (wxGetApp().filaments_cnt() > int(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT))
-        show_notification_extruders_limit_exceeded();
 }
 
 void GLGizmoMmuSegmentation::on_shutdown()
@@ -239,13 +227,9 @@ void GLGizmoMmuSegmentation::set_painter_gizmo_data(const Selection &selection)
     ModelObject* model_object = m_c->selection_info()->model_object();
     int prev_extruders_count = int(m_extruders_colors.size());
     if (prev_extruders_count != wxGetApp().filaments_cnt()) {
-        if (wxGetApp().filaments_cnt() > int(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT))
-            show_notification_extruders_limit_exceeded();
-
         this->init_extruders_data();
         // Reinitialize triangle selectors because of change of extruder count need also change the size of GLIndexedVertexArray
-        if (prev_extruders_count != wxGetApp().filaments_cnt())
-            this->init_model_triangle_selectors();
+        this->init_model_triangle_selectors();
     } else if (wxGetApp().plater()->get_extruders_colors() != m_extruders_colors) {
         this->init_extruders_data();
         this->update_triangle_selectors_colors();
@@ -271,22 +255,28 @@ void GLGizmoMmuSegmentation::render_triangles(const Selection &selection) const
     glsafe(::glDisable(GL_CULL_FACE));
 
     const ModelObject *mo      = m_c->selection_info()->model_object();
+    // Selection can be empty transiently (e.g. right after an assembly-view undo/redo that jumped to a
+    if (mo == nullptr) {
+#if !BBL_RELEASE_TO_PUBLIC
+#ifdef _WIN32
+        __debugbreak();
+#endif
+#endif
+        return;
+    }
     int                mesh_id = -1;
+    int                volume_id = -1;
     for (const ModelVolume *mv : mo->volumes) {
+        ++volume_id;
         if (!mv->is_model_part())
             continue;
 
         ++mesh_id;
 
-        Transform3d trafo_matrix;
-        if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
-            // BBS: assembly view world matrix = instance_assemble * volume_assemble.
-            trafo_matrix = mo->instances[selection.get_instance_idx()]->get_assemble_transformation().get_matrix() * mv->get_assemble_transformation().get_matrix();
-            trafo_matrix.translate(mv->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) + mo->instances[selection.get_instance_idx()]->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
-        }
-        else {
-            trafo_matrix = mo->instances[selection.get_instance_idx()]->get_transformation().get_matrix()* mv->get_matrix();
-        }
+        // Reuse the scene GLVolume's world matrix (the assembly-view assemble transform and the explosion
+        // offset are already baked into GLVolume::world_matrix()), falling back to instance*volume when the
+        // GLVolume is missing. This keeps prepare/assembly views correct without hand-rolling the transform.
+        const Transform3d trafo_matrix = get_volume_world_matrix(selection, mo, mv, volume_id);
 
         bool is_left_handed = trafo_matrix.matrix().determinant() < 0.;
         if (is_left_handed)
@@ -336,20 +326,14 @@ void GLGizmoMmuSegmentation::render_triangles(const Selection &selection) const
     }
     if (m_tool_type == ToolType::BUCKET_FILL) {
         mesh_id = -1;
+        int volume_id = -1;
         for (const ModelVolume *mv : mo->volumes) {
+            ++volume_id;
             if (!mv->is_model_part()) continue;
 
             ++mesh_id;
             if (mesh_id != m_rr.mesh_id) { continue; }
-            Transform3d trafo_matrix;
-            if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
-                // BBS: assembly view world matrix = instance_assemble * volume_assemble.
-                trafo_matrix = mo->instances[selection.get_instance_idx()]->get_assemble_transformation().get_matrix() * mv->get_assemble_transformation().get_matrix();
-                trafo_matrix.translate(mv->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) +
-                                       mo->instances[selection.get_instance_idx()]->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
-            } else {
-                trafo_matrix = mo->instances[selection.get_instance_idx()]->get_transformation().get_matrix() * mv->get_matrix();
-            }
+            const Transform3d trafo_matrix = get_volume_world_matrix(selection, mo, mv, volume_id);
 
             bool is_left_handed = trafo_matrix.matrix().determinant() < 0.;
             if (is_left_handed) glsafe(::glFrontFace(GL_CW));
@@ -405,72 +389,6 @@ bool GLGizmoMmuSegmentation::on_key_down_select_tool_type(int keyCode) {
 std::string GLGizmoMmuSegmentation::get_icon_filename(bool is_dark_mode) const
 {
     return is_dark_mode ? "mmu_segmentation_dark.svg" : "mmu_segmentation.svg";
-}
-
-static void render_extruders_combo(const std::string                       &label,
-                                   const std::vector<std::string>          &extruders,
-                                   const std::vector<std::array<float, 4>> &extruders_colors,
-                                   size_t                                  &selection_idx,
-                                   const std::vector<GLGizmoMmuSegmentation::GradientInfo> &gradient_info = {})
-{
-    assert(!extruders_colors.empty());
-    assert(extruders_colors.size() == extruders_colors.size());
-
-    auto convert_to_imu32 = [](const std::array<float, 4> &color) -> ImU32 {
-        return IM_COL32(uint8_t(color[0] * 255.f), uint8_t(color[1] * 255.f), uint8_t(color[2] * 255.f), uint8_t(color[3] * 255.f));
-    };
-
-    auto draw_swatch = [&](ImVec2 p_min, ImVec2 p_max, size_t idx) {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        if (idx < gradient_info.size() && gradient_info[idx].is_gradient) {
-            ImU32 col_from = convert_to_imu32(gradient_info[idx].color_from);
-            ImU32 col_to   = convert_to_imu32(gradient_info[idx].color_to);
-            dl->AddRectFilledMultiColor(p_min, p_max, col_from, col_to, col_to, col_from);
-        } else {
-            dl->AddRectFilled(p_min, p_max, convert_to_imu32(extruders_colors[idx]));
-        }
-        dl->AddRect(p_min, p_max, IM_COL32_BLACK);
-    };
-
-    size_t selection_out = selection_idx;
-    ImGui::BeginGroup();
-    ImVec2 combo_pos = ImGui::GetCursorScreenPos();
-    if (ImGui::BeginCombo(label.c_str(), "")) {
-        for (size_t extruder_idx = 0; extruder_idx < std::min(extruders.size(), GLGizmoMmuSegmentation::EXTRUDERS_LIMIT); ++extruder_idx) {
-            ImGui::PushID(int(extruder_idx));
-            ImVec2 start_position = ImGui::GetCursorScreenPos();
-
-            if (ImGui::Selectable("", extruder_idx == selection_idx))
-                selection_out = extruder_idx;
-
-            ImGui::SameLine();
-            ImGuiStyle &style  = ImGui::GetStyle();
-            float       height = ImGui::GetTextLineHeight();
-            draw_swatch(start_position, ImVec2(start_position.x + height + height / 2, start_position.y + height), extruder_idx);
-
-            ImGui::SetCursorScreenPos(ImVec2(start_position.x + height + height / 2 + style.FramePadding.x, start_position.y));
-            ImGui::Text("%s", extruders[extruder_idx].c_str());
-            ImGui::PopID();
-        }
-
-        ImGui::EndCombo();
-    }
-
-    ImVec2      backup_pos = ImGui::GetCursorScreenPos();
-    ImGuiStyle &style      = ImGui::GetStyle();
-
-    ImGui::SetCursorScreenPos(ImVec2(combo_pos.x + style.FramePadding.x, combo_pos.y + style.FramePadding.y));
-    ImVec2 p      = ImGui::GetCursorScreenPos();
-    float  height = ImGui::GetTextLineHeight();
-
-    draw_swatch(p, ImVec2(p.x + height + height / 2, p.y + height), selection_idx);
-
-    ImGui::SetCursorScreenPos(ImVec2(p.x + height + height / 2 + style.FramePadding.x, p.y));
-    ImGui::Text("%s", extruders[selection_out].c_str());
-    ImGui::SetCursorScreenPos(backup_pos);
-    ImGui::EndGroup();
-
-    selection_idx = selection_out;
 }
 
 void GLGizmoMmuSegmentation::show_tooltip_information(float caption_max, float x, float y)
@@ -601,101 +519,24 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     if (wxGetApp().plater()->is_show_non_manifold_edges()) {
         m_imgui->text(_L("hit face") + ":" + std::to_string(m_rr.facet));
     }
-    {
-        m_imgui->text(m_desc.at("filaments"));
-        float text_offset = m_imgui->calc_text_size(m_desc.at("filaments")).x + m_imgui->scaled(1.5f);
-        ImGui::SameLine(text_offset);
-        float but1_offset = m_imgui->calc_button_size("+++").x;
-        ImGui::PushItemWidth(but1_offset);
-        std::wstring add_btn_name = (m_is_dark_mode ? ImGui::AddFilamentDarkIcon : ImGui::AddFilamentIcon) + boost::nowide::widen("");
-
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0);
-        ImGui::PushStyleColor(ImGuiCol_Button, m_is_dark_mode ? ImVec4(43 / 255.0f, 64 / 255.0f, 54 / 255.0f, 0.00f) : ImVec4(0.86f, 0.99f, 0.91f, 0.00f)); // r, g, b, a
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, m_is_dark_mode ? ImVec4(150 / 255.0f, 150 / 255.0f, 150 / 255.0f, 1.00f) : ImVec4(0.86f, 0.99f, 0.91f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, m_is_dark_mode ? ImVec4(43 / 255.0f, 64 / 255.0f, 54 / 255.0f, 1.00f) : ImVec4(0.86f, 0.99f, 0.91f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.00f, 0.68f, 0.26f, 1.00f));
-
-        if (ImGui::Button(into_u8(add_btn_name).c_str())) {
-            wxQueueEvent(wxGetApp().plater(), new SimpleEvent(EVT_ADD_FILAMENT));
-        }
-        ImGui::SameLine(text_offset + but1_offset);
-        ImGui::PushItemWidth(but1_offset);
-        std::wstring del_btn_name = (m_is_dark_mode ? ImGui::DeleteFilamentDarkIcon : ImGui::DeleteFilamentIcon) + boost::nowide::widen("");
-        if (ImGui::Button(into_u8(del_btn_name).c_str())) {
-            wxQueueEvent(wxGetApp().plater(), new SimpleEvent(EVT_DEL_FILAMENT));
-        }
-
-        ImGui::PopStyleColor(4);
-        ImGui::PopStyleVar(1);
-    }
+    m_imgui->text(m_desc.at("filaments"));
 
     float start_pos_x = ImGui::GetCursorPos().x;
-    const ImVec2 max_label_size = ImGui::CalcTextSize("99", NULL, true);
-    const float item_spacing = m_imgui->scaled(0.8f);
+    const ImVec2 filament_icon_size = ImGuiFilament::default_icon_size();
     size_t n_extruder_colors = std::min((size_t)EnforcerBlockerType::ExtruderMax, m_extruders_colors.size());
     for (int extruder_idx = 0; extruder_idx < n_extruder_colors; extruder_idx++) {
-        const std::array<float, 4> &extruder_color = m_extruders_colors[extruder_idx];
-        ImVec4 color_vec(extruder_color[0], extruder_color[1], extruder_color[2], extruder_color[3]);
-        std::string color_label = std::string("##extruder color ") + std::to_string(extruder_idx);
-        std::string item_text = std::to_string(extruder_idx + 1);
-        const ImVec2 label_size = ImGui::CalcTextSize(item_text.c_str(), NULL, true);
-
-        const ImVec2 button_size(max_label_size.x + m_imgui->scaled(0.5f),0.f);
-
         float button_offset = start_pos_x;
         if (extruder_idx % max_filament_items_per_line != 0) {
             button_offset += filament_item_width * (extruder_idx % max_filament_items_per_line);
             ImGui::SameLine(button_offset);
         }
 
-        // draw filament background
-        ImGuiColorEditFlags flags = ImGuiColorEditFlags_AlphaPreview | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoTooltip;
-        if (m_selected_extruder_idx != extruder_idx) flags |= ImGuiColorEditFlags_NoBorder;
-        #ifdef __APPLE__
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.00f, 0.68f, 0.26f, 1.00f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0);
-            bool color_picked = ImGui::ColorButton(color_label.c_str(), color_vec, flags, button_size);
-            ImGui::PopStyleVar(2);
-            ImGui::PopStyleColor(1);
-        #else
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.00f, 0.68f, 0.26f, 1.00f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0);
-            bool color_picked = ImGui::ColorButton(color_label.c_str(), color_vec, flags, button_size);
-            ImGui::PopStyleVar(2);
-            ImGui::PopStyleColor(1);
-        #endif
-        if (extruder_idx < (int)m_gradient_info.size() && m_gradient_info[extruder_idx].is_gradient) {
-            auto to_imu32 = [](const std::array<float, 4> &c) -> ImU32 {
-                return IM_COL32(uint8_t(c[0]*255.f), uint8_t(c[1]*255.f), uint8_t(c[2]*255.f), uint8_t(c[3]*255.f));
-            };
-            ImVec2 r_min = ImGui::GetItemRectMin();
-            ImVec2 r_max = ImGui::GetItemRectMax();
-            ImU32 col_from = to_imu32(m_gradient_info[extruder_idx].color_from);
-            ImU32 col_to   = to_imu32(m_gradient_info[extruder_idx].color_to);
-            ImGui::GetWindowDrawList()->AddRectFilledMultiColor(r_min, r_max, col_from, col_to, col_to, col_from);
-        }
+        if (ImGuiFilament::filament_icon_button(extruder_idx, filament_icon_size, m_selected_extruder_idx == extruder_idx))
+            m_selected_extruder_idx = extruder_idx;
+
         color_button_high = ImGui::GetCursorPos().y - color_button - 2.0;
-        if (color_picked) { m_selected_extruder_idx = extruder_idx; }
-
-        if (extruder_idx < 16 && ImGui::IsItemHovered()) m_imgui->tooltip(_L("Shortcut Key ") + std::to_string(extruder_idx + 1), max_tooltip_width);
-
-        // draw filament id
-        float gray = 0.299 * extruder_color[0] + 0.587 * extruder_color[1] + 0.114 * extruder_color[2];
-        ImGui::SameLine(button_offset + (button_size.x - label_size.x) / 2.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {10.0,15.0});
-        if (abs(color_vec.w - 1) < 0.01) {
-            if (gray * 255.f < 80.f)
-                ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), item_text.c_str());
-            else
-                ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), item_text.c_str());
-        }
-        else {//alpha
-            ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), item_text.c_str());
-        }
-
-        ImGui::PopStyleVar();
+        if (extruder_idx < 16 && ImGui::IsItemHovered())
+            m_imgui->tooltip(_L("Shortcut Key ") + std::to_string(extruder_idx + 1), max_tooltip_width);
     }
     //ImGui::NewLine();
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
